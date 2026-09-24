@@ -1,0 +1,1976 @@
+"""Azure Container Apps SDK client for provisioning OpenClaw instances.
+
+This module wraps the Azure SDK calls. In development/testing, set
+AZURE_MOCK=true to skip real Azure calls.
+"""
+
+from __future__ import annotations
+
+import logging
+import os
+from typing import Any
+
+from django.conf import settings
+
+logger = logging.getLogger(__name__)
+
+
+def _is_mock() -> bool:
+    return os.environ.get("AZURE_MOCK", "false").lower() == "true"
+
+
+def is_mock() -> bool:
+    """Public alias for `_is_mock()`.
+
+    Callers outside this module that need to refuse outright under mock
+    mode (rather than silently letting a `[MOCK] ...` no-op fall through
+    to a "success" message) should use this instead of importing the
+    private name.
+    """
+    return _is_mock()
+
+
+# Credential and container client are cached per process. Both are
+# thread-safe and cache/refresh their AAD tokens internally; constructing
+# them per call re-ran the IMDS token exchange (1-3s) inside request-path
+# operations like wake_container_app.
+_provisioner_credential = None
+_container_client = None
+
+
+def _get_provisioner_credential():
+    """Get credential for the provisioning identity (elevated permissions).
+
+    In production, uses the dedicated user-assigned managed identity.
+    In local dev, falls back to DefaultAzureCredential (Azure CLI login).
+    """
+    global _provisioner_credential
+    if _provisioner_credential is None:
+        from azure.identity import DefaultAzureCredential, ManagedIdentityCredential
+
+        client_id = str(getattr(settings, "AZURE_PROVISIONER_CLIENT_ID", "") or "").strip()
+        if client_id:
+            _provisioner_credential = ManagedIdentityCredential(client_id=client_id)
+        else:
+            _provisioner_credential = DefaultAzureCredential()
+    return _provisioner_credential
+
+
+_decrypt_broker_credential = None
+
+
+def _get_decrypt_broker_credential():
+    """Get credential for the decrypt-broker identity (unwrap-only).
+
+    Deliberately a SEPARATE cached identity from `_get_provisioner_credential`.
+    The provisioner's Azure RBAC role (`nbhd-kek-provisioner`) can create,
+    wrap, rotate, and soft-delete KEKs but is never granted `keys/unwrap/
+    action`; only the broker's role (`nbhd-kek-decrypt-broker`) can unwrap.
+    A compromised provisioner token can therefore mint or destroy keys but
+    can never read plaintext DEKs — that split is the whole point (T3
+    guarantee, encryption-at-rest directive). `unwrap_dek` is the only
+    caller; every other KEK operation uses `_get_provisioner_credential`.
+
+    In production, uses the dedicated `mi-nbhd-decrypt` managed identity via
+    `AZURE_DECRYPT_BROKER_CLIENT_ID`. In local dev, falls back to
+    DefaultAzureCredential (Azure CLI login) — same fallback shape as the
+    provisioner, but cached in its own module-level global so the two are
+    always distinct objects even when both fall back.
+    """
+    global _decrypt_broker_credential
+    if _decrypt_broker_credential is None:
+        from azure.identity import DefaultAzureCredential, ManagedIdentityCredential
+
+        client_id = str(getattr(settings, "AZURE_DECRYPT_BROKER_CLIENT_ID", "") or "").strip()
+        if client_id:
+            _decrypt_broker_credential = ManagedIdentityCredential(client_id=client_id)
+        else:
+            _decrypt_broker_credential = DefaultAzureCredential()
+    return _decrypt_broker_credential
+
+
+def get_container_client():
+    """Get Azure Container Apps API client (cached per process)."""
+    if _is_mock():
+        return None
+
+    global _container_client
+    if _container_client is None:
+        from azure.mgmt.appcontainers import ContainerAppsAPIClient
+
+        _container_client = ContainerAppsAPIClient(_get_provisioner_credential(), settings.AZURE_SUBSCRIPTION_ID)
+    return _container_client
+
+
+def get_identity_client():
+    """Get Azure Managed Identity client."""
+    if _is_mock():
+        return None
+
+    from azure.mgmt.msi import ManagedServiceIdentityClient
+
+    return ManagedServiceIdentityClient(_get_provisioner_credential(), settings.AZURE_SUBSCRIPTION_ID)
+
+
+def _build_container_secret(
+    secret_name: str,
+    *,
+    plain_value: str,
+    key_vault_secret_name: str,
+    identity_id: str,
+) -> dict[str, str]:
+    """Build Container Apps secret payload using Key Vault by default."""
+    backend = str(getattr(settings, "OPENCLAW_CONTAINER_SECRET_BACKEND", "keyvault") or "keyvault").strip().lower()
+    if backend == "keyvault":
+        vault_name = str(getattr(settings, "AZURE_KEY_VAULT_NAME", "") or "").strip()
+        kv_secret_name = str(key_vault_secret_name or "").strip()
+        if vault_name and kv_secret_name and identity_id:
+            return {
+                "name": secret_name,
+                "keyVaultUrl": f"https://{vault_name}.vault.azure.net/secrets/{kv_secret_name}",
+                "identity": identity_id,
+            }
+
+        logger.warning(
+            "Key Vault secret reference disabled for %s due to missing vault/secret/identity; "
+            "falling back to inline secret value",
+            secret_name,
+        )
+
+    return {"name": secret_name, "value": plain_value}
+
+
+def create_managed_identity(tenant_id: str) -> dict[str, str]:
+    """Create a User-Assigned Managed Identity for a tenant.
+
+    Returns dict with 'id', 'client_id', 'principal_id'.
+    """
+    if _is_mock():
+        logger.info("[MOCK] Created managed identity for tenant %s", tenant_id)
+        return {
+            "id": f"/mock/identity/{tenant_id}",
+            "client_id": f"mock-client-{tenant_id}",
+            "principal_id": f"mock-principal-{tenant_id}",
+        }
+
+    client = get_identity_client()
+    identity = client.user_assigned_identities.create_or_update(
+        resource_group_name=settings.AZURE_RESOURCE_GROUP,
+        resource_name=f"mi-nbhd-{str(tenant_id)[:20]}",
+        parameters={
+            "location": settings.AZURE_LOCATION,
+            "tags": {"tenant_id": str(tenant_id), "service": "nbhd-united"},
+        },
+    )
+    return {
+        "id": identity.id,
+        "client_id": identity.client_id,
+        "principal_id": identity.principal_id,
+    }
+
+
+def get_authorization_client():
+    """Get Azure Authorization Management client."""
+    if _is_mock():
+        return None
+
+    from azure.mgmt.authorization import AuthorizationManagementClient
+
+    return AuthorizationManagementClient(_get_provisioner_credential(), settings.AZURE_SUBSCRIPTION_ID)
+
+
+# Platform-shared secrets every tenant MI needs read access to. The
+# tenant-specific internal API key (`tenant-<uuid>-internal-key`, Phase 1b)
+# is added per-call by `provision_tenant`. Vault-scope grants used to let
+# any tenant MI read cross-cutting secrets (database-url, stripe-live-
+# secret-key, storage-account-key, qstash-*); per-secret RBAC keeps the
+# blast radius of an MI-token leak to just the names listed here plus the
+# tenant's own internal key.
+DEFAULT_TENANT_KV_SECRETS: tuple[str, ...] = (
+    "anthropic-api-key",
+    "openai-api-key",
+    "openrouter-api-key",
+    "brave-api-key",
+)
+
+
+def assign_key_vault_role(
+    principal_id: str,
+    secret_names: tuple[str, ...] | list[str] | None = None,
+) -> None:
+    """Grant 'Key Vault Secrets User' to identity, scoped per-secret.
+
+    `secret_names` defaults to `DEFAULT_TENANT_KV_SECRETS`. Pass an explicit
+    tuple/list to override (e.g. fleet migration that needs to cover legacy
+    bindings like `telegram-bot-token`). Each name gets its own role
+    assignment at `.../vaults/<vault>/secrets/<name>` scope.
+
+    Idempotent: deterministic uuid5 assignment names mean re-running on
+    already-granted secrets is a no-op (Azure returns 409, swallowed).
+    """
+    if _is_mock():
+        logger.info("[MOCK] Assigned Key Vault Secrets User to %s", principal_id)
+        return
+
+    import uuid
+
+    client = get_authorization_client()
+
+    vault_name = str(getattr(settings, "AZURE_KEY_VAULT_NAME", "") or "").strip()
+    if not vault_name:
+        raise ValueError("AZURE_KEY_VAULT_NAME is not configured")
+
+    # Well-known Azure built-in role ID for Key Vault Secrets User
+    KV_SECRETS_USER_ROLE = "4633458b-17de-408a-b874-0445c86b69e6"
+
+    if secret_names is None:
+        secret_names = DEFAULT_TENANT_KV_SECRETS
+
+    vault_scope = (
+        f"/subscriptions/{settings.AZURE_SUBSCRIPTION_ID}"
+        f"/resourceGroups/{settings.AZURE_RESOURCE_GROUP}"
+        f"/providers/Microsoft.KeyVault/vaults/{vault_name}"
+    )
+
+    from azure.mgmt.authorization.models import RoleAssignmentCreateParameters
+
+    for secret_name in secret_names:
+        scope = f"{vault_scope}/secrets/{secret_name}"
+        role_def_id = f"{scope}/providers/Microsoft.Authorization/roleDefinitions/{KV_SECRETS_USER_ROLE}"
+
+        # Deterministic UUID → idempotent (same identity + role + scope = same assignment name)
+        assignment_name = str(
+            uuid.uuid5(
+                uuid.NAMESPACE_URL,
+                f"{principal_id}:{KV_SECRETS_USER_ROLE}:{scope}",
+            )
+        )
+
+        try:
+            client.role_assignments.create(
+                scope=scope,
+                role_assignment_name=assignment_name,
+                parameters=RoleAssignmentCreateParameters(
+                    role_definition_id=role_def_id,
+                    principal_id=principal_id,
+                    principal_type="ServicePrincipal",
+                ),
+            )
+            logger.info("Assigned KV Secrets User to %s on %s/secrets/%s", principal_id, vault_name, secret_name)
+        except Exception as exc:
+            if hasattr(exc, "status_code") and exc.status_code == 409:
+                logger.info("KV role already assigned to %s for %s (idempotent)", principal_id, secret_name)
+            else:
+                raise
+
+
+def assign_acr_pull_role(principal_id: str) -> None:
+    """Assign 'AcrPull' to identity on the project container registry."""
+    if _is_mock():
+        logger.info("[MOCK] Assigned AcrPull to %s", principal_id)
+        return
+
+    import uuid
+
+    client = get_authorization_client()
+
+    acr_server = str(getattr(settings, "AZURE_ACR_SERVER", "") or "").strip()
+    if not acr_server:
+        raise ValueError("AZURE_ACR_SERVER is not configured")
+    # Extract registry name from server FQDN (e.g. "nbhdunited.azurecr.io" -> "nbhdunited")
+    acr_name = acr_server.split(".")[0]
+
+    # Well-known Azure built-in role ID for AcrPull
+    ACR_PULL_ROLE = "7f951dda-4ed3-4680-a7ca-43fe172d538d"
+
+    scope = (
+        f"/subscriptions/{settings.AZURE_SUBSCRIPTION_ID}"
+        f"/resourceGroups/{settings.AZURE_RESOURCE_GROUP}"
+        f"/providers/Microsoft.ContainerRegistry/registries/{acr_name}"
+    )
+    role_def_id = f"{scope}/providers/Microsoft.Authorization/roleDefinitions/{ACR_PULL_ROLE}"
+
+    assignment_name = str(
+        uuid.uuid5(
+            uuid.NAMESPACE_URL,
+            f"{principal_id}:{ACR_PULL_ROLE}:{scope}",
+        )
+    )
+
+    from azure.mgmt.authorization.models import RoleAssignmentCreateParameters
+
+    try:
+        client.role_assignments.create(
+            scope=scope,
+            role_assignment_name=assignment_name,
+            parameters=RoleAssignmentCreateParameters(
+                role_definition_id=role_def_id,
+                principal_id=principal_id,
+                principal_type="ServicePrincipal",
+            ),
+        )
+        logger.info("Assigned AcrPull to %s on %s", principal_id, acr_name)
+    except Exception as exc:
+        if hasattr(exc, "status_code") and exc.status_code == 409:
+            logger.info("AcrPull role already assigned to %s (idempotent)", principal_id)
+        else:
+            raise
+
+
+def store_tenant_internal_key_in_key_vault(tenant_id: str, plaintext_key: str) -> str:
+    """Store a tenant's internal API key in Azure Key Vault.
+
+    Uses naming convention: tenant-<uuid>-internal-key
+    Returns the KV secret name.
+    """
+    secret_name = f"tenant-{tenant_id}-internal-key"
+
+    if _is_mock():
+        logger.info("[MOCK] Stored tenant internal key in KV: %s", secret_name)
+        return secret_name
+
+    from azure.keyvault.secrets import SecretClient
+
+    vault_name = str(getattr(settings, "AZURE_KEY_VAULT_NAME", "") or "").strip()
+    if not vault_name:
+        raise ValueError("AZURE_KEY_VAULT_NAME is not configured")
+
+    vault_url = f"https://{vault_name}.vault.azure.net"
+    client = SecretClient(vault_url=vault_url, credential=_get_provisioner_credential())
+    client.set_secret(secret_name, plaintext_key)
+
+    logger.info("Stored tenant internal key in Key Vault: %s", secret_name)
+    return secret_name
+
+
+def read_key_vault_secret(secret_name: str) -> str | None:
+    """Read a secret value from Azure Key Vault.
+
+    Returns the secret value or None if not found / not configured.
+    """
+    if _is_mock():
+        logger.info("[MOCK] Read KV secret: %s", secret_name)
+        return None
+
+    from azure.keyvault.secrets import SecretClient
+
+    vault_name = str(getattr(settings, "AZURE_KEY_VAULT_NAME", "") or "").strip()
+    if not vault_name:
+        logger.warning("AZURE_KEY_VAULT_NAME not configured, cannot read secret %s", secret_name)
+        return None
+
+    try:
+        vault_url = f"https://{vault_name}.vault.azure.net"
+        client = SecretClient(vault_url=vault_url, credential=_get_provisioner_credential())
+        secret = client.get_secret(secret_name)
+        return secret.value
+    except Exception as exc:
+        logger.warning("Failed to read KV secret %s: %s", secret_name, exc)
+        return None
+
+
+# ---------------------------------------------------------------------------
+# Encryption-at-rest (Phase 1, dark): tenant KEK lifecycle.
+#
+# Lives in a SEPARATE vault (AZURE_KEY_VAULT_NAME) from the platform's
+# operational secrets (AZURE_KEY_VAULT_NAME) — AZURE_KEK_VAULT_NAME. Every
+# tenant gets one RSA-3072 key named ``kek-<tenant_id>`` (the tenant's own
+# UUID makes the name deterministic — no separate name↔tenant mapping needs
+# to be persisted by this module; PR2's ``tenant_deks`` table is the actual
+# system of record for wrapped DEKs + kek_version).
+#
+# Credential split is load-bearing: every operation here except `unwrap_dek`
+# uses `_get_provisioner_credential()` (create/wrap/rotate/delete — never
+# unwrap). Only `unwrap_dek` uses `_get_decrypt_broker_credential()`. This
+# means a compromised provisioner token can mint or destroy tenant keys but
+# can never read a plaintext DEK (T3 guarantee).
+# ---------------------------------------------------------------------------
+
+# Stateful mock KEK registry (AZURE_MOCK=true only) — real Key Vault is never
+# touched when mocked. Deliberately STATEFUL (not a deterministic derivation
+# from tenant_id) so tests can prove the T4 shred invariant end-to-end:
+# create -> wrap/unwrap round-trip -> begin_delete (soft delete, STILL
+# unwrappable — Key Vault's own recovery window) -> purge (irreversibly
+# removed) -> unwrap raises. A deterministic mock has no state to destroy and
+# cannot exercise that path at all.
+#
+# Shape: {tenant_id: {"key": bytes, "kek_version": str, "deleted": bool}}
+_MOCK_KEK_REGISTRY: dict[str, dict[str, Any]] = {}
+
+
+def _mock_kek_xor(data: bytes, key: bytes) -> bytes:
+    """Reversible XOR standing in for RSA wrap/unwrap in mock mode.
+
+    XOR is its own inverse, so `wrap_dek`/`unwrap_dek` can share this one
+    helper and round-trip without touching real Key Vault. `key` is the
+    tenant's mock KEK material from `_MOCK_KEK_REGISTRY`; repeating it over
+    `data` keeps this correct even if a future caller wraps something longer
+    than the key (Phase 1 DEKs are a fixed 32 bytes, so no repeat is
+    actually exercised today).
+    """
+    if not key:
+        return data
+    return bytes(b ^ key[i % len(key)] for i, b in enumerate(data))
+
+
+def create_tenant_kek(tenant_id: str) -> str:
+    """Create a tenant's RSA-3072 Key Encryption Key in the KEK vault.
+
+    Returns the kek_version. Uses the provisioner credential — creating a
+    key is a management operation, not a decrypt, so the provisioner (which
+    can never unwrap) is the right identity.
+    """
+    tid = str(tenant_id)
+
+    if _is_mock():
+        kek_version = "mock-v1"
+        _MOCK_KEK_REGISTRY[tid] = {"key": os.urandom(32), "kek_version": kek_version, "deleted": False}
+        logger.info("[MOCK] Created tenant KEK for tenant %s (version=%s)", tid, kek_version)
+        return kek_version
+
+    from azure.keyvault.keys import KeyClient
+
+    vault_name = str(getattr(settings, "AZURE_KEK_VAULT_NAME", "") or "").strip()
+    if not vault_name:
+        raise ValueError("AZURE_KEK_VAULT_NAME is not configured")
+
+    vault_url = f"https://{vault_name}.vault.azure.net"
+    key_name = f"kek-{tid}"
+    client = KeyClient(vault_url=vault_url, credential=_get_provisioner_credential())
+    created = client.create_rsa_key(key_name, size=3072)
+    kek_version = created.properties.version
+    logger.info("Created tenant KEK %s for tenant %s (version=%s)", key_name, tid, kek_version)
+    return kek_version
+
+
+def wrap_dek(tenant_id: str, dek: bytes) -> tuple[bytes, str]:
+    """Wrap a plaintext DEK under the tenant's KEK (RSA-OAEP-256).
+
+    Returns (wrapped_bytes, kek_version). Provisioner credential — wrap is
+    a one-way operation the provisioner is allowed to perform; only unwrap
+    is broker-only.
+    """
+    tid = str(tenant_id)
+
+    if _is_mock():
+        entry = _MOCK_KEK_REGISTRY.get(tid)
+        if entry is None:
+            raise LookupError(f"No KEK minted for tenant {tid} — call create_tenant_kek first")
+        wrapped = _mock_kek_xor(dek, entry["key"])
+        logger.info("[MOCK] Wrapped DEK for tenant %s (version=%s)", tid, entry["kek_version"])
+        return wrapped, entry["kek_version"]
+
+    from azure.keyvault.keys import KeyClient
+    from azure.keyvault.keys.crypto import KeyWrapAlgorithm
+
+    vault_name = str(getattr(settings, "AZURE_KEK_VAULT_NAME", "") or "").strip()
+    if not vault_name:
+        raise ValueError("AZURE_KEK_VAULT_NAME is not configured")
+
+    vault_url = f"https://{vault_name}.vault.azure.net"
+    key_name = f"kek-{tid}"
+    client = KeyClient(vault_url=vault_url, credential=_get_provisioner_credential())
+    crypto_client = client.get_cryptography_client(key_name)
+    result = crypto_client.wrap_key(KeyWrapAlgorithm.rsa_oaep_256, dek)
+    kek_version = result.key_id.rsplit("/", 1)[-1] if result.key_id else ""
+    logger.info("Wrapped DEK for tenant %s (version=%s)", tid, kek_version)
+    return result.encrypted_key, kek_version
+
+
+def unwrap_dek(tenant_id: str, wrapped: bytes) -> bytes:
+    """Unwrap a tenant's DEK — the ONE operation gated on the decrypt-broker
+    identity, never the provisioner.
+
+    Phase 1 has no KEK rotation yet, so this always targets the key's
+    current/latest version (no explicit kek_version routing). Multi-version
+    routing lands with Phase 5 rotation.
+
+    Raises if the tenant's KEK was purged (or never minted) — fail-closed,
+    never returns garbage.
+    """
+    tid = str(tenant_id)
+
+    if _is_mock():
+        entry = _MOCK_KEK_REGISTRY.get(tid)
+        if entry is None:
+            raise LookupError(f"Cannot unwrap DEK for tenant {tid} — KEK was purged or never minted")
+        if entry.get("deleted"):
+            # Real Key Vault disables crypto operations the instant a key is
+            # soft-deleted: the recovery window keeps the key RECOVERABLE, not
+            # usable. Unwrap only works again after `recover_kek`.
+            raise LookupError(f"Cannot unwrap DEK for tenant {tid} — KEK is soft-deleted (recover it first)")
+        unwrapped = _mock_kek_xor(wrapped, entry["key"])
+        logger.info("[MOCK] Unwrapped DEK for tenant %s", tid)
+        return unwrapped
+
+    from azure.keyvault.keys import KeyClient
+    from azure.keyvault.keys.crypto import KeyWrapAlgorithm
+
+    vault_name = str(getattr(settings, "AZURE_KEK_VAULT_NAME", "") or "").strip()
+    if not vault_name:
+        raise ValueError("AZURE_KEK_VAULT_NAME is not configured")
+
+    vault_url = f"https://{vault_name}.vault.azure.net"
+    key_name = f"kek-{tid}"
+    client = KeyClient(vault_url=vault_url, credential=_get_decrypt_broker_credential())
+    crypto_client = client.get_cryptography_client(key_name)
+    result = crypto_client.unwrap_key(KeyWrapAlgorithm.rsa_oaep_256, wrapped)
+    logger.info("Unwrapped DEK for tenant %s", tid)
+    return result.key
+
+
+def begin_delete_kek(tenant_id: str) -> None:
+    """Soft-delete a tenant's KEK (provisioner credential).
+
+    The key enters Key Vault's recovery window (soft-delete ON, 7 days per
+    the az-CLI pre-work): the key material stays RECOVERABLE (`recover_kek`)
+    until `purge_kek` is called, but crypto operations are disabled the moment
+    it's deleted — a soft-deleted key can neither wrap nor unwrap. Mock: marks
+    the registry entry deleted (so `unwrap_dek` now raises) while keeping the
+    material so `recover_kek` can restore it — mirroring real Key Vault, where
+    the grace window preserves recoverability, not usability.
+    """
+    tid = str(tenant_id)
+
+    if _is_mock():
+        entry = _MOCK_KEK_REGISTRY.get(tid)
+        if entry is not None:
+            entry["deleted"] = True
+        logger.info("[MOCK] Soft-deleted tenant KEK for tenant %s", tid)
+        return
+
+    from azure.keyvault.keys import KeyClient
+
+    vault_name = str(getattr(settings, "AZURE_KEK_VAULT_NAME", "") or "").strip()
+    if not vault_name:
+        raise ValueError("AZURE_KEK_VAULT_NAME is not configured")
+
+    vault_url = f"https://{vault_name}.vault.azure.net"
+    key_name = f"kek-{tid}"
+    client = KeyClient(vault_url=vault_url, credential=_get_provisioner_credential())
+    client.begin_delete_key(key_name).result()
+    logger.info("Soft-deleted tenant KEK %s for tenant %s (recovery window open)", key_name, tid)
+
+
+def recover_kek(tenant_id: str) -> None:
+    """Recover a soft-deleted KEK back to enabled state (provisioner credential).
+
+    The grace-window resurrection path: a tenant deprovisioned and then
+    re-provisioned inside Key Vault's 7-day recovery window gets the SAME KEK
+    back, so its existing wrapped DEK — and any ciphertext already under it —
+    stays decryptable. Only reachable while the key is soft-deleted-not-purged;
+    recovering an absent/purged key raises.
+
+    Needs the `keys/recover/action` dataAction on the provisioner role, in
+    addition to the create/rotate/delete/wrap it already holds.
+    """
+    tid = str(tenant_id)
+
+    if _is_mock():
+        entry = _MOCK_KEK_REGISTRY.get(tid)
+        if entry is None:
+            raise LookupError(f"Cannot recover KEK for tenant {tid} — already purged or never minted")
+        entry["deleted"] = False
+        logger.info("[MOCK] Recovered tenant KEK for tenant %s", tid)
+        return
+
+    from azure.keyvault.keys import KeyClient
+
+    vault_name = str(getattr(settings, "AZURE_KEK_VAULT_NAME", "") or "").strip()
+    if not vault_name:
+        raise ValueError("AZURE_KEK_VAULT_NAME is not configured")
+
+    vault_url = f"https://{vault_name}.vault.azure.net"
+    key_name = f"kek-{tid}"
+    client = KeyClient(vault_url=vault_url, credential=_get_provisioner_credential())
+    client.begin_recover_deleted_key(key_name).result()
+    logger.info("Recovered tenant KEK %s for tenant %s (restored from recovery window)", key_name, tid)
+
+
+def kek_liveness(tenant_id: str) -> str:
+    """Report whether a tenant's KEK is usable, recoverable, or gone.
+
+    Returns exactly one of:
+      - ``"live"``        — key exists and is enabled; wrap/unwrap work now.
+      - ``"recoverable"`` — key is soft-deleted but still inside the recovery
+                            window; `recover_kek` restores it (and its DEK).
+      - ``"absent"``      — key is purged or was never minted; any ciphertext
+                            wrapped under it is cryptographically unrecoverable.
+
+    Provisioner credential — a read/management op, never a decrypt. Only a
+    DEFINITIVE not-found maps to ``"absent"``; every other failure (throttle,
+    403, transient network) propagates. That distinction is load-bearing:
+    callers act DESTRUCTIVELY on ``"absent"`` (drop the stale DEK rows and
+    re-key), and must never do that to a KEK that is merely unreachable.
+
+    Needs `keys/read` (active + deleted) on the provisioner role.
+    """
+    tid = str(tenant_id)
+
+    if _is_mock():
+        entry = _MOCK_KEK_REGISTRY.get(tid)
+        if entry is None:
+            return "absent"
+        return "recoverable" if entry.get("deleted") else "live"
+
+    from azure.core.exceptions import ResourceNotFoundError
+    from azure.keyvault.keys import KeyClient
+
+    vault_name = str(getattr(settings, "AZURE_KEK_VAULT_NAME", "") or "").strip()
+    if not vault_name:
+        raise ValueError("AZURE_KEK_VAULT_NAME is not configured")
+
+    vault_url = f"https://{vault_name}.vault.azure.net"
+    key_name = f"kek-{tid}"
+    client = KeyClient(vault_url=vault_url, credential=_get_provisioner_credential())
+    try:
+        client.get_key(key_name)
+        return "live"
+    except ResourceNotFoundError:
+        pass
+    try:
+        client.get_deleted_key(key_name)
+        return "recoverable"
+    except ResourceNotFoundError:
+        return "absent"
+
+
+def purge_kek(tenant_id: str) -> None:
+    """Irreversibly purge a tenant's soft-deleted KEK — break-glass only.
+
+    This is the T4 shred primitive: once purged, every DEK ever wrapped
+    under this KEK becomes permanently unrecoverable (`unwrap_dek` raises
+    from this point on, for every epoch that used this key).
+
+    In prod, purge is gated by the `nbhd-kek-breakglass-purge` RBAC role,
+    which — unlike the provisioner and broker roles — has NO standing
+    assignment; it's JIT/interactive-granted only (az-CLI pre-work,
+    CONTINUITY_encryption-phase1.md §1). This function uses the provisioner
+    credential as a CODE STAND-IN for that role: the provisioner identity
+    does not actually carry `keys/purge/action` in prod, so calling this
+    without an active JIT grant 403s at the Azure layer regardless of what
+    this code does. Never wire this into an automated/scheduled path.
+    """
+    tid = str(tenant_id)
+
+    if _is_mock():
+        _MOCK_KEK_REGISTRY.pop(tid, None)
+        logger.info("[MOCK] Purged tenant KEK for tenant %s", tid)
+        return
+
+    from azure.keyvault.keys import KeyClient
+
+    vault_name = str(getattr(settings, "AZURE_KEK_VAULT_NAME", "") or "").strip()
+    if not vault_name:
+        raise ValueError("AZURE_KEK_VAULT_NAME is not configured")
+
+    vault_url = f"https://{vault_name}.vault.azure.net"
+    key_name = f"kek-{tid}"
+    # Break-glass stand-in — see docstring: prod authorization comes from a
+    # JIT role grant on this same identity, not from a different credential.
+    client = KeyClient(vault_url=vault_url, credential=_get_provisioner_credential())
+    client.purge_deleted_key(key_name)
+    logger.info("PURGED tenant KEK %s for tenant %s — IRREVERSIBLE", key_name, tid)
+
+
+def get_storage_client():
+    """Get Azure Storage Management client."""
+    if _is_mock():
+        return None
+
+    from azure.mgmt.storage import StorageManagementClient
+
+    return StorageManagementClient(_get_provisioner_credential(), settings.AZURE_SUBSCRIPTION_ID)
+
+
+def create_tenant_file_share(tenant_id: str) -> dict[str, str]:
+    """Create an Azure File Share for a tenant's workspace.
+
+    Returns dict with 'share_name' and 'account_name'.
+    """
+    share_name = f"ws-{str(tenant_id)[:20]}"
+    account_name = str(getattr(settings, "AZURE_STORAGE_ACCOUNT_NAME", "") or "").strip()
+
+    if _is_mock():
+        logger.info("[MOCK] Created file share %s for tenant %s", share_name, tenant_id)
+        return {"share_name": share_name, "account_name": account_name or "mock-storage"}
+
+    if not account_name:
+        raise ValueError("AZURE_STORAGE_ACCOUNT_NAME is not configured")
+
+    client = get_storage_client()
+    client.file_shares.create(
+        resource_group_name=settings.AZURE_RESOURCE_GROUP,
+        account_name=account_name,
+        share_name=share_name,
+        file_share={},
+    )
+    logger.info("Created file share %s in %s", share_name, account_name)
+    return {"share_name": share_name, "account_name": account_name}
+
+
+def download_config_from_file_share(tenant_id: str) -> bytes | None:
+    """Download openclaw.json from the tenant's Azure File Share.
+
+    Returns None if the file doesn't exist (e.g., never provisioned). Used
+    by the atomic fleet-bump path to snapshot the prior config before a
+    schema-crossing rewrite, so we can best-effort restore it if the
+    image push fails. See bump_openclaw_version_for_tenant in services.py.
+    """
+    share_name = f"ws-{str(tenant_id)[:20]}"
+
+    if _is_mock():
+        logger.info("[MOCK] download_config_from_file_share %s", share_name)
+        return None
+
+    account_name = str(getattr(settings, "AZURE_STORAGE_ACCOUNT_NAME", "") or "").strip()
+    if not account_name:
+        raise ValueError("AZURE_STORAGE_ACCOUNT_NAME is not configured")
+
+    from azure.core.exceptions import ResourceNotFoundError
+    from azure.storage.fileshare import ShareFileClient
+
+    storage_client = get_storage_client()
+    keys = storage_client.storage_accounts.list_keys(
+        settings.AZURE_RESOURCE_GROUP,
+        account_name,
+    )
+    account_key = keys.keys[0].value
+    account_url = f"https://{account_name}.file.core.windows.net"
+
+    file_client = ShareFileClient(
+        account_url=account_url,
+        share_name=share_name,
+        file_path="openclaw.json",
+        credential=account_key,
+    )
+    try:
+        return file_client.download_file().readall()
+    except ResourceNotFoundError:
+        return None
+
+
+# C0 control codepoints to strip from any text written to the file share —
+# every control byte except tab (0x09), newline (0x0A), CR (0x0D). A trailing
+# NUL run is the signature of the file-share corruption class (see
+# upload_config_to_file_share's docstring + the 2026-05-22 incident); NUL is
+# never valid in our JSON / markdown anyway, so we strip it anywhere.
+_SHARE_TEXT_STRIP = dict.fromkeys((c for c in range(0x20) if c not in (0x09, 0x0A, 0x0D)), None)
+
+
+def sanitize_share_text(content: str) -> str:
+    """Single source of truth for the file-share text-corruption guard.
+
+    Strips NUL bytes + C0 control junk (keeps tab/newline/CR). Every *text*
+    write to the SMB share routes through here (via ``_put_share_file``), so a
+    partial/padded write — or a corrupted read carried forward by a merge —
+    can never persist ``\\x00`` into a config or workspace file. Binary writes
+    deliberately bypass this.
+    """
+    if not content:
+        return content
+    return content.translate(_SHARE_TEXT_STRIP)
+
+
+def _put_share_file(
+    tenant_id: str,
+    file_path: str,
+    *,
+    text: str | None = None,
+    data: bytes | None = None,
+    ensure_dirs: bool = True,
+    skip_if_exists: bool = False,
+) -> None:
+    """The single chokepoint for every Azure File Share write.
+
+    Pass ``text=`` for text files (auto-sanitized via ``sanitize_share_text``)
+    or ``data=`` for binary (passed through untouched). Consolidates the
+    client/auth setup, parent-directory creation, skip-if-exists, and the
+    single atomic ``upload_file`` PUT (no tmp+rename — that race produced the
+    2026-05-22 null-byte corruption). Routing all writes through here means the
+    text sanitize can never be forgotten by a future writer.
+    """
+    if (text is None) == (data is None):
+        raise ValueError("_put_share_file requires exactly one of text= or data=")
+
+    share_name = f"ws-{str(tenant_id)[:20]}"
+
+    if _is_mock():
+        logger.info("[MOCK] Uploaded %s to file share %s", file_path, share_name)
+        return
+
+    account_name = str(getattr(settings, "AZURE_STORAGE_ACCOUNT_NAME", "") or "").strip()
+    if not account_name:
+        raise ValueError("AZURE_STORAGE_ACCOUNT_NAME is not configured")
+
+    from azure.core.exceptions import ResourceNotFoundError
+    from azure.storage.fileshare import ShareDirectoryClient, ShareFileClient
+
+    storage_client = get_storage_client()
+    keys = storage_client.storage_accounts.list_keys(settings.AZURE_RESOURCE_GROUP, account_name)
+    account_key = keys.keys[0].value
+    account_url = f"https://{account_name}.file.core.windows.net"
+
+    if skip_if_exists:
+        check_client = ShareFileClient(
+            account_url=account_url, share_name=share_name, file_path=file_path, credential=account_key
+        )
+        try:
+            check_client.get_file_properties()
+            logger.info("Skipping upload of %s to file share %s (already exists)", file_path, share_name)
+            return
+        except ResourceNotFoundError:
+            pass  # File missing — fall through and write it
+
+    if ensure_dirs:
+        parts = file_path.split("/")
+        for i in range(1, len(parts)):
+            dir_path = "/".join(parts[:i])
+            dir_client = ShareDirectoryClient(
+                account_url=account_url, share_name=share_name, directory_path=dir_path, credential=account_key
+            )
+            try:
+                dir_client.create_directory()
+            except Exception:
+                pass  # Already exists
+
+    payload = sanitize_share_text(text).encode("utf-8") if text is not None else data
+
+    file_client = ShareFileClient(
+        account_url=account_url, share_name=share_name, file_path=file_path, credential=account_key
+    )
+    file_client.upload_file(payload, length=len(payload))
+    logger.info("Uploaded %s (%d bytes) to file share %s", file_path, len(payload), share_name)
+
+
+def upload_config_to_file_share(tenant_id: str, config_json: str) -> None:
+    """Upload openclaw.json to the tenant's Azure File Share.
+
+    Uses a single ``upload_file(data, length=…)`` PUT — the same low-level
+    signature every other Azure file-share write in this codebase uses.
+
+    The previous implementation wrote to ``openclaw.json.tmp`` then called
+    ``rename_file("openclaw.json", overwrite=True)``. That trick *leaked*
+    the ``overwrite=`` kwarg through azure-storage-file-share 12.24+ /
+    azure-core 1.39+ / requests 2.32+ into ``requests.Session.request``
+    (which doesn't accept it), and concurrent workers competing for the
+    same ``.tmp`` file produced ``ResourceNotFoundError`` mid-rename —
+    leaving the target file allocated to the expected size but filled
+    with null bytes. The 2026-05-22 canary corruption (DB said success,
+    file on share was 7531 bytes of ``\\x00``) was this exact race.
+
+    Atomicity wasn't actually preserved by the rename trick either:
+    OpenClaw reads ``openclaw.json`` once at container startup, not on
+    every turn, so there is no in-flight reader to race. A single
+    ``upload_file`` PUT is already atomic at the HTTP layer. If it
+    raises, the calling ``update_tenant_config`` propagates the
+    exception, which ``apply_single_tenant_config_task`` catches and
+    *does not* advance ``config_version`` — so partial-write semantics
+    are preserved end-to-end without the rename dance.
+
+    Write-time validation gate (2026-07-05): every config-to-share write —
+    provision, ``update_tenant_config``, the hibernation defer path, and the
+    fleet-bump restore — funnels through here, so this is the one place to
+    guarantee a schema-invalid ``openclaw.json`` can never overwrite a tenant's
+    last-good file and brick its gateway on the next boot. On failure we log
+    loudly and raise WITHOUT writing, so the existing (good) file on the share
+    is preserved.
+    """
+    _assert_openclaw_config_safe_to_write(tenant_id, config_json)
+    _put_share_file(tenant_id, "openclaw.json", text=config_json, ensure_dirs=False)
+
+
+def _assert_openclaw_config_safe_to_write(tenant_id: str, config_json: str) -> None:
+    """Refuse to write an unparseable or schema-invalid ``openclaw.json``.
+
+    The faucet fix for the config-write-validation incident: a config whose
+    ``agents.defaults`` block fails OpenClaw's schema (``Invalid input``) makes
+    the gateway refuse to start, taking the tenant down until a human notices.
+    Validate the Django-owned blocks before the write; on any error keep the
+    last-good file on the share and raise so no caller silently advances
+    ``config_version``.
+    """
+    import json
+
+    from apps.orchestrator.config_validator import (
+        InvalidTenantConfigError,
+        assert_config_writable,
+    )
+
+    tid = str(tenant_id)[:8]
+    try:
+        config = json.loads(config_json)
+    except (ValueError, TypeError) as exc:
+        logger.error(
+            "REFUSING openclaw.json write for tenant %s — content is not valid JSON (%s). "
+            "Keeping the last-good config on the share.",
+            tid,
+            exc,
+        )
+        raise InvalidTenantConfigError(f"openclaw.json is not valid JSON: {exc}") from exc
+
+    try:
+        assert_config_writable(config)
+    except InvalidTenantConfigError as exc:
+        logger.error(
+            "REFUSING schema-invalid openclaw.json write for tenant %s — %s. "
+            "Keeping the last-good config on the share so the gateway stays bootable "
+            "(config-write-validation gate, 2026-07-05).",
+            tid,
+            exc,
+        )
+        raise
+
+
+def upload_workspace_file(
+    tenant_id: str,
+    file_path: str,
+    content: str,
+    *,
+    skip_if_exists: bool = False,
+) -> None:
+    """Upload a workspace file to the tenant's Azure File Share.
+
+    file_path is relative to the workspace root, e.g. 'workspace/AGENTS.md'.
+
+    When ``skip_if_exists`` is True, the upload is a no-op if the file already
+    exists on the share. Use this for files the agent owns after first seed
+    (SOUL.md, IDENTITY.md) so later config refreshes don't overwrite agent
+    edits — this matches the `[ ! -f ]` guards in `runtime/openclaw/entrypoint.sh`.
+    """
+    _put_share_file(tenant_id, file_path, text=content, ensure_dirs=True, skip_if_exists=skip_if_exists)
+
+
+def upload_workspace_file_binary(tenant_id: str, file_path: str, data: bytes) -> None:
+    """Upload a binary file to the tenant's Azure File Share.
+
+    file_path is relative to the workspace root, e.g. 'workspace/media/inbound/photo.jpg'.
+    Creates intermediate directories if needed.
+    """
+    _put_share_file(tenant_id, file_path, data=data, ensure_dirs=True)
+
+
+def download_workspace_file_binary(tenant_id: str, file_path: str) -> bytes | None:
+    """Read a workspace file from the tenant's Azure File Share as RAW BYTES.
+
+    file_path is relative to the workspace root, e.g.
+    'workspace/media/inbound/doc_ab12cd34.pdf'. Returns the file's bytes, or
+    None if the file does not exist.
+
+    The binary twin of ``download_workspace_file``: that helper decodes UTF-8
+    with ``errors="replace"``, which silently corrupts every non-text byte — so
+    it can never be used to read back a stored PDF/image. Used by the async PDF
+    extraction task (``apps.router.tasks``).
+    """
+    share_name = f"ws-{str(tenant_id)[:20]}"
+
+    if _is_mock():
+        logger.info("[MOCK] Binary download of %s from file share %s", file_path, share_name)
+        return None
+
+    account_name = str(getattr(settings, "AZURE_STORAGE_ACCOUNT_NAME", "") or "").strip()
+    if not account_name:
+        raise ValueError("AZURE_STORAGE_ACCOUNT_NAME is not configured")
+
+    from azure.core.exceptions import ResourceNotFoundError
+    from azure.storage.fileshare import ShareFileClient
+
+    storage_client = get_storage_client()
+    keys = storage_client.storage_accounts.list_keys(
+        settings.AZURE_RESOURCE_GROUP,
+        account_name,
+    )
+    account_key = keys.keys[0].value
+
+    file_client = ShareFileClient(
+        account_url=f"https://{account_name}.file.core.windows.net",
+        share_name=share_name,
+        file_path=file_path,
+        credential=account_key,
+    )
+    try:
+        return file_client.download_file().readall()
+    except ResourceNotFoundError:
+        return None
+
+
+def download_workspace_file(tenant_id: str, file_path: str) -> str | None:
+    """Read a workspace file from the tenant's Azure File Share.
+
+    file_path is relative to the workspace root, e.g. 'workspace/USER.md'.
+    Returns the file's UTF-8 decoded content, or None if the file does not
+    exist. Used by workspace_envelope to merge platform-managed regions into
+    files that may already contain agent-written content.
+    """
+    share_name = f"ws-{str(tenant_id)[:20]}"
+
+    if _is_mock():
+        logger.info("[MOCK] Download of %s from file share %s", file_path, share_name)
+        return None
+
+    account_name = str(getattr(settings, "AZURE_STORAGE_ACCOUNT_NAME", "") or "").strip()
+    if not account_name:
+        raise ValueError("AZURE_STORAGE_ACCOUNT_NAME is not configured")
+
+    from azure.core.exceptions import ResourceNotFoundError
+    from azure.storage.fileshare import ShareFileClient
+
+    storage_client = get_storage_client()
+    keys = storage_client.storage_accounts.list_keys(
+        settings.AZURE_RESOURCE_GROUP,
+        account_name,
+    )
+    account_key = keys.keys[0].value
+
+    file_client = ShareFileClient(
+        account_url=f"https://{account_name}.file.core.windows.net",
+        share_name=share_name,
+        file_path=file_path,
+        credential=account_key,
+    )
+    try:
+        downloader = file_client.download_file()
+        data = downloader.readall()
+    except ResourceNotFoundError:
+        return None
+    return data.decode("utf-8", errors="replace")
+
+
+def register_environment_storage(tenant_id: str) -> None:
+    """Register a tenant's file share with the Container Apps Environment."""
+    if _is_mock():
+        logger.info("[MOCK] Registered environment storage for tenant %s", tenant_id)
+        return
+
+    from azure.mgmt.appcontainers.models import (
+        AzureFileProperties,
+        ManagedEnvironmentStorage,
+        ManagedEnvironmentStorageProperties,
+    )
+
+    account_name = str(getattr(settings, "AZURE_STORAGE_ACCOUNT_NAME", "") or "").strip()
+    if not account_name:
+        raise ValueError("AZURE_STORAGE_ACCOUNT_NAME is not configured")
+
+    env_id = str(getattr(settings, "AZURE_CONTAINER_ENV_ID", "") or "").strip()
+    if not env_id:
+        raise ValueError("AZURE_CONTAINER_ENV_ID is not configured")
+    env_name = env_id.split("/")[-1]
+
+    storage_name = f"ws-{str(tenant_id)[:20]}"
+
+    # Get storage account key programmatically
+    storage_client = get_storage_client()
+    keys = storage_client.storage_accounts.list_keys(
+        settings.AZURE_RESOURCE_GROUP,
+        account_name,
+    )
+    account_key = keys.keys[0].value
+
+    container_client = get_container_client()
+    container_client.managed_environments_storages.create_or_update(
+        resource_group_name=settings.AZURE_RESOURCE_GROUP,
+        environment_name=env_name,
+        storage_name=storage_name,
+        storage_envelope=ManagedEnvironmentStorage(
+            properties=ManagedEnvironmentStorageProperties(
+                azure_file=AzureFileProperties(
+                    account_name=account_name,
+                    account_key=account_key,
+                    access_mode="ReadWrite",
+                    share_name=storage_name,
+                ),
+            ),
+        ),
+    )
+    logger.info("Registered environment storage %s for tenant %s", storage_name, tenant_id)
+
+
+def delete_tenant_file_share(tenant_id: str) -> None:
+    """Delete a tenant's file share and deregister from the environment."""
+    if _is_mock():
+        logger.info("[MOCK] Deleted file share for tenant %s", tenant_id)
+        return
+
+    storage_name = f"ws-{str(tenant_id)[:20]}"
+    account_name = str(getattr(settings, "AZURE_STORAGE_ACCOUNT_NAME", "") or "").strip()
+    env_id = str(getattr(settings, "AZURE_CONTAINER_ENV_ID", "") or "").strip()
+    env_name = env_id.split("/")[-1] if env_id else ""
+
+    # Deregister from environment first
+    if env_name:
+        try:
+            container_client = get_container_client()
+            container_client.managed_environments_storages.delete(
+                resource_group_name=settings.AZURE_RESOURCE_GROUP,
+                environment_name=env_name,
+                storage_name=storage_name,
+            )
+        except Exception:
+            logger.exception("Failed to deregister storage %s from environment", storage_name)
+
+    # Delete the file share
+    if account_name:
+        try:
+            storage_client = get_storage_client()
+            storage_client.file_shares.delete(
+                resource_group_name=settings.AZURE_RESOURCE_GROUP,
+                account_name=account_name,
+                share_name=storage_name,
+            )
+        except Exception:
+            logger.exception("Failed to delete file share %s", storage_name)
+
+
+def delete_managed_identity(tenant_id: str) -> None:
+    """Delete a tenant's Managed Identity."""
+    if _is_mock():
+        logger.info("[MOCK] Deleted managed identity for tenant %s", tenant_id)
+        return
+
+    client = get_identity_client()
+    try:
+        client.user_assigned_identities.delete(
+            resource_group_name=settings.AZURE_RESOURCE_GROUP,
+            resource_name=f"mi-nbhd-{str(tenant_id)[:20]}",
+        )
+    except Exception:
+        logger.exception("Failed to delete managed identity for %s", tenant_id)
+
+
+def create_container_app(
+    tenant_id: str,
+    container_name: str,
+    config_json: str,
+    identity_id: str,
+    identity_client_id: str,
+    workspace_env: dict[str, str] | None = None,
+    internal_api_key_kv_secret_name: str | None = None,
+    internal_api_key_plain_value: str | None = None,
+    openrouter_kv_secret_name: str | None = None,
+) -> dict[str, str]:
+    """Create an Azure Container App for an OpenClaw instance.
+
+    `internal_api_key_kv_secret_name` overrides the Key Vault secret name
+    that backs the container's `NBHD_INTERNAL_API_KEY` env var. New tenants
+    (Phase 1b, 2026-05-12) pass a per-tenant `tenant-<uuid>-internal-key`
+    so a compromised container's key can only authenticate as that tenant.
+    Defaults to the legacy shared secret (`AZURE_KV_SECRET_NBHD_INTERNAL_
+    API_KEY`) so existing tests and ops paths continue to work during the
+    fleet migration.
+
+    Returns dict with 'name' and 'fqdn'.
+    """
+    if _is_mock():
+        fqdn = f"{container_name}.internal.azurecontainerapps.io"
+        logger.info("[MOCK] Created container %s at %s", container_name, fqdn)
+        return {"name": container_name, "fqdn": fqdn}
+
+    internal_kv_secret = internal_api_key_kv_secret_name or settings.AZURE_KV_SECRET_NBHD_INTERNAL_API_KEY
+    internal_plain = (
+        internal_api_key_plain_value if internal_api_key_plain_value is not None else settings.NBHD_INTERNAL_API_KEY
+    )
+    # PR #1.6: per-tenant OR sub-key support. When the caller passes a
+    # per-tenant KV secret name we use that; otherwise fall back to the
+    # shared platform key. The container's secret-ref name
+    # ("openrouter-key") and env var name ("OPENROUTER_API_KEY") stay
+    # constant — only the KV binding changes.
+    openrouter_kv_secret = openrouter_kv_secret_name or settings.AZURE_KV_SECRET_OPENROUTER_API_KEY
+
+    client = get_container_client()
+    secrets = [
+        _build_container_secret(
+            "anthropic-key",
+            plain_value=settings.ANTHROPIC_API_KEY,
+            key_vault_secret_name=settings.AZURE_KV_SECRET_ANTHROPIC_API_KEY,
+            identity_id=identity_id,
+        ),
+        _build_container_secret(
+            "openai-key",
+            plain_value=settings.OPENAI_API_KEY,
+            key_vault_secret_name=settings.AZURE_KV_SECRET_OPENAI_API_KEY,
+            identity_id=identity_id,
+        ),
+        _build_container_secret(
+            "nbhd-internal-api-key",
+            plain_value=internal_plain,
+            key_vault_secret_name=internal_kv_secret,
+            identity_id=identity_id,
+        ),
+        _build_container_secret(
+            "brave-key",
+            plain_value=settings.BRAVE_API_KEY,
+            key_vault_secret_name=settings.AZURE_KV_SECRET_BRAVE_API_KEY,
+            identity_id=identity_id,
+        ),
+        _build_container_secret(
+            "openrouter-key",
+            plain_value=settings.OPENROUTER_API_KEY,
+            key_vault_secret_name=openrouter_kv_secret,
+            identity_id=identity_id,
+        ),
+    ]
+
+    container_app: dict[str, Any] = {
+        "location": settings.AZURE_LOCATION,
+        "managed_environment_id": settings.AZURE_CONTAINER_ENV_ID,
+        "identity": {
+            "type": "UserAssigned",
+            "user_assigned_identities": {identity_id: {}},
+        },
+        "properties": {
+            "configuration": {
+                "registries": [
+                    {
+                        "server": settings.AZURE_ACR_SERVER,
+                        "identity": identity_id,
+                    },
+                ],
+                "ingress": {
+                    "external": False,
+                    "targetPort": 8080,
+                    "transport": "http",
+                },
+                "secrets": secrets,
+            },
+            "template": {
+                "containers": [
+                    {
+                        "name": "openclaw",
+                        # Pin to the fleet's current image tag (CI sets the
+                        # OPENCLAW_IMAGE_TAG env var to a concrete SHA tag after
+                        # every deploy). ``:latest`` is NEVER pushed to ACR, so
+                        # hardcoding it here made every fresh container-create
+                        # fail with MANIFEST_UNKNOWN — a silent fleet-wide
+                        # new-tenant provisioning outage. Every other provision
+                        # path (tasks.py / services.py / hibernation.py) already
+                        # uses settings.OPENCLAW_IMAGE_TAG; this was the lone gap.
+                        "image": f"{settings.AZURE_ACR_SERVER}/nbhd-openclaw:{settings.OPENCLAW_IMAGE_TAG}",
+                        "resources": {"cpu": 0.5, "memory": "1.0Gi"},
+                        "env": [
+                            {"name": "ANTHROPIC_API_KEY", "secretRef": "anthropic-key"},
+                            {"name": "OPENAI_API_KEY", "secretRef": "openai-key"},
+                            {"name": "NBHD_INTERNAL_API_KEY", "secretRef": "nbhd-internal-api-key"},
+                            {"name": "OPENCLAW_GATEWAY_TOKEN", "secretRef": "nbhd-internal-api-key"},
+                            {"name": "BRAVE_API_KEY", "secretRef": "brave-key"},
+                            {"name": "OPENROUTER_API_KEY", "secretRef": "openrouter-key"},
+                            {"name": "NBHD_TENANT_ID", "value": str(tenant_id)},
+                            {"name": "NBHD_API_BASE_URL", "value": settings.API_BASE_URL},
+                            {"name": "OPENCLAW_CONFIG_JSON", "value": config_json},
+                            {"name": "AZURE_CLIENT_ID", "value": identity_client_id},
+                            # NODE_OPTIONS must be set explicitly here because
+                            # Container Apps caches Dockerfile ENV on first
+                            # provisioning and never re-reads it on image
+                            # updates. Keep this value in sync with the
+                            # `Dockerfile.openclaw` ENV NODE_OPTIONS — if a
+                            # new --require is added there, mirror it here.
+                            #
+                            # Note: `apply_single_tenant_config_task` and
+                            # `update_container_image` do NOT rewrite env
+                            # vars, so changes here only affect newly
+                            # provisioned tenants. Existing tenants need a
+                            # one-shot ops update if you change this.
+                            #
+                            # --require shims:
+                            #   suppress-chmod-eperm.js → swallows chmod EPERM
+                            #     on root-owned Azure volume mounts (essential
+                            #     for cron firing in 2026.5.7+).
+                            #   redact-stdout.js → wraps process.{stdout,
+                            #     stderr}.write to mask tenant content
+                            #     before it ships to shared Log Analytics.
+                            {
+                                "name": "NODE_OPTIONS",
+                                "value": (
+                                    "--max-old-space-size=512 "
+                                    "--dns-result-order=ipv4first "
+                                    "--no-network-family-autoselection "
+                                    "--require /opt/nbhd/suppress-chmod-eperm.js "
+                                    "--require /opt/nbhd/redact-stdout.js"
+                                ),
+                            },
+                            # Disable mDNS/bonjour — useless on Container Apps
+                            # and causes intermittent CIAO ANNOUNCEMENT CANCELLED
+                            # crashes on startup.
+                            {"name": "OPENCLAW_DISABLE_BONJOUR", "value": "1"},
+                            *[{"name": k, "value": v} for k, v in (workspace_env or {}).items()],
+                        ],
+                        "volumeMounts": [
+                            {"volumeName": "workspace", "mountPath": "/home/node/.openclaw"},
+                            {"volumeName": "sessions-scratch", "mountPath": "/home/node/.openclaw/agents"},
+                            # OpenClaw's bundled-channel installer copies files
+                            # with modes Azure File Share/SMB doesn't support
+                            # (EPERM on `.buildstamp` copy) and leaves a stale
+                            # lock dir that wedges across container restarts.
+                            # Shadowing this path with EmptyDir keeps the
+                            # install on ephemeral local storage.
+                            {
+                                "volumeName": "plugin-runtime-deps",
+                                "mountPath": "/home/node/.openclaw/plugin-runtime-deps",
+                            },
+                            # OpenClaw memory-core's SQLite FTS5 index. The
+                            # truth lives in MEMORY.md + memory/*.md on the
+                            # workspace share (line-based, SMB-safe). The
+                            # index is a rebuild-on-startup cache — put it
+                            # on local ephemeral storage so a container kill
+                            # mid-write can't corrupt the file (the SMB +
+                            # SQLite bug behind PR #525). The mount is
+                            # always present; whether OpenClaw actually
+                            # writes here is gated by per-tenant
+                            # ``experimental_memory_core_enabled`` (see
+                            # ``_build_memory_search_config``).
+                            {
+                                "volumeName": "index-cache",
+                                "mountPath": "/home/node/.openclaw/index",
+                            },
+                        ],
+                    },
+                ],
+                "volumes": [
+                    {
+                        "name": "workspace",
+                        "storageType": "AzureFile",
+                        "storageName": f"ws-{str(tenant_id)[:20]}",
+                    },
+                    {
+                        "name": "sessions-scratch",
+                        "storageType": "EmptyDir",
+                    },
+                    {
+                        "name": "plugin-runtime-deps",
+                        "storageType": "EmptyDir",
+                    },
+                    {
+                        "name": "index-cache",
+                        "storageType": "EmptyDir",
+                    },
+                ],
+                "scale": {
+                    "minReplicas": 1,
+                    "maxReplicas": 1,
+                    "rules": [
+                        {"name": "http-trigger", "http": {"metadata": {"concurrentRequests": "1"}}},
+                    ],
+                },
+            },
+        },
+    }
+
+    result = client.container_apps.begin_create_or_update(
+        settings.AZURE_RESOURCE_GROUP,
+        container_name,
+        container_app,
+    ).result()
+
+    # SDK v4 flattens the model — try direct attributes first, then nested .properties
+    try:
+        fqdn = result.configuration.ingress.fqdn
+    except AttributeError:
+        fqdn = ""
+    return {"name": container_name, "fqdn": fqdn}
+
+
+def update_container_internal_api_key_secret(
+    container_name: str,
+    identity_id: str,
+    kv_secret_name: str,
+) -> None:
+    """Rebind the `nbhd-internal-api-key` secret to a new Key Vault entry.
+
+    Used by Phase 1c fleet migration to point an existing tenant container
+    at its per-tenant `tenant-<uuid>-internal-key` instead of the shared
+    global `nbhd-internal-api-key`. Forces a new revision (via
+    revision_suffix bump) so Container Apps re-fetches the KV value —
+    a plain restart would keep the cached old value.
+    """
+    if _is_mock():
+        logger.info("[MOCK] Updated nbhd-internal-api-key secret for %s -> %s", container_name, kv_secret_name)
+        return
+
+    client = get_container_client()
+    app = client.container_apps.get(
+        settings.AZURE_RESOURCE_GROUP,
+        container_name,
+    )
+
+    # Replace the `nbhd-internal-api-key` secret entry with one bound to
+    # the per-tenant KV secret. Keep all other secrets untouched.
+    secrets = [s for s in (app.configuration.secrets or []) if _entry_name(s) != "nbhd-internal-api-key"]
+    secrets.append(
+        _build_container_secret(
+            "nbhd-internal-api-key",
+            plain_value="",
+            key_vault_secret_name=kv_secret_name,
+            identity_id=identity_id,
+        )
+    )
+    app.configuration.secrets = secrets
+
+    import hashlib
+    import time
+
+    # Force a new revision so the KV value is re-fetched (a no-op spec
+    # change otherwise leaves the cached old value in place).
+    app.template.revision_suffix = f"i{hashlib.sha256(f'iak-{int(time.time_ns())}'.encode()).hexdigest()[:6]}"
+
+    client.container_apps.begin_create_or_update(
+        settings.AZURE_RESOURCE_GROUP,
+        container_name,
+        app,
+    ).result()
+    logger.info(
+        "Updated nbhd-internal-api-key secret for %s -> %s (revision_suffix=%s)",
+        container_name,
+        kv_secret_name,
+        app.template.revision_suffix,
+    )
+
+
+def update_container_openrouter_key_secret(
+    container_name: str,
+    identity_id: str,
+    kv_secret_name: str,
+) -> None:
+    """Rebind the `openrouter-key` secret to a different Key Vault entry.
+
+    PR #1.6 backfill: an existing tenant container references the shared
+    ``openrouter-api-key`` secret by default; once the backfill command
+    has created the tenant's own OR sub-key and written it to KV at
+    ``<key_vault_prefix>-openrouter-key``, this helper rebinds the
+    container's ``openrouter-key`` ref to that per-tenant entry. Forces a
+    new revision so Container Apps re-fetches the KV value — a plain
+    restart would keep the cached old binding.
+
+    Mirrors ``update_container_internal_api_key_secret`` (the Phase 1c
+    pattern from 2026-05-12). Idempotent at the Azure layer; safe to call
+    repeatedly with the same kv_secret_name.
+    """
+    if _is_mock():
+        logger.info("[MOCK] Updated openrouter-key secret for %s -> %s", container_name, kv_secret_name)
+        return
+
+    client = get_container_client()
+    app = client.container_apps.get(
+        settings.AZURE_RESOURCE_GROUP,
+        container_name,
+    )
+
+    secrets = [s for s in (app.configuration.secrets or []) if _entry_name(s) != "openrouter-key"]
+    secrets.append(
+        _build_container_secret(
+            "openrouter-key",
+            plain_value="",
+            key_vault_secret_name=kv_secret_name,
+            identity_id=identity_id,
+        )
+    )
+    app.configuration.secrets = secrets
+
+    import hashlib
+    import time
+
+    app.template.revision_suffix = f"o{hashlib.sha256(f'ork-{int(time.time_ns())}'.encode()).hexdigest()[:6]}"
+
+    client.container_apps.begin_create_or_update(
+        settings.AZURE_RESOURCE_GROUP,
+        container_name,
+        app,
+    ).result()
+    logger.info(
+        "Updated openrouter-key secret for %s -> %s (revision_suffix=%s)",
+        container_name,
+        kv_secret_name,
+        app.template.revision_suffix,
+    )
+
+
+def update_container_env_var(
+    container_name: str,
+    env_name: str,
+    env_value: str,
+) -> None:
+    """Update a single environment variable on an existing Container App."""
+    if _is_mock():
+        logger.info("[MOCK] Updated %s on %s", env_name, container_name)
+        return
+
+    client = get_container_client()
+    app = client.container_apps.get(
+        settings.AZURE_RESOURCE_GROUP,
+        container_name,
+    )
+
+    for container in app.template.containers:
+        env_list = container.env or []
+        for env_entry in env_list:
+            if env_entry.name == env_name:
+                env_entry.value = env_value
+                break
+        else:
+            env_list.append({"name": env_name, "value": env_value})
+        container.env = env_list
+
+    client.container_apps.begin_create_or_update(
+        settings.AZURE_RESOURCE_GROUP,
+        container_name,
+        app,
+    ).result()
+    logger.info("Updated env var %s on container %s", env_name, container_name)
+
+
+def restart_container_app(container_name: str) -> None:
+    """Restart the active revision of a Container App."""
+    if _is_mock():
+        logger.info("[MOCK] Restarted container %s", container_name)
+        return
+
+    client = get_container_client()
+
+    app = client.container_apps.get(
+        settings.AZURE_RESOURCE_GROUP,
+        container_name,
+    )
+
+    import hashlib
+    import time
+
+    template = app.template
+    # Use a short, deterministic restart suffix so revision DNS labels stay < 64 chars.
+    template.revision_suffix = f"r{hashlib.sha256(f'{int(time.time())}'.encode()).hexdigest()[:6]}"
+
+    client.container_apps.begin_create_or_update(
+        settings.AZURE_RESOURCE_GROUP,
+        container_name,
+        app,
+    ).result()
+    logger.info("Restarted container app %s", container_name)
+
+
+def _entry_name(entry: Any) -> str | None:
+    """Extract `.name` from a Container Apps SDK Secret/EnvVar typed
+    object or a plain dict (we mix both in our spec lists)."""
+    if isinstance(entry, dict):
+        return entry.get("name")
+    return getattr(entry, "name", None)
+
+
+def apply_byo_credentials_to_container(tenant: Any) -> None:
+    """Reconcile the tenant container's BYO secret + env bindings, then
+    create a new revision so the Container Apps runtime picks up any
+    changed Key Vault references.
+
+    Per microsoft/azure-container-apps#856 a plain restart keeps cached
+    KV values; only revision creation triggers a re-fetch. Each call
+    here mutates `template.revision_suffix` (causing a new revision)
+    even when the cred state hasn't changed — that's intentional: the
+    user just pasted/disconnected and expects the change to take effect.
+
+    Phase 1 reconciliation, for Anthropic CLI subscription only:
+      - Active cred → add `CLAUDE_CODE_OAUTH_TOKEN` env (KV-backed)
+        AND remove the `ANTHROPIC_API_KEY` env binding (auth-precedence
+        shadowing — Anthropic's CLI ranks `ANTHROPIC_API_KEY` ABOVE
+        `CLAUDE_CODE_OAUTH_TOKEN`, so the platform key would win and
+        bill against API credits instead of the user's subscription).
+      - No active cred → ensure `ANTHROPIC_API_KEY` is restored
+        (re-bound to the existing `anthropic-key` secret) and
+        `CLAUDE_CODE_OAUTH_TOKEN` is removed.
+
+    Idempotent — safe to call repeatedly. No-op for tenants without a
+    container_id.
+    """
+    if _is_mock():
+        logger.info("[MOCK] Applied BYO credentials for tenant=%s", tenant.id)
+        return
+
+    if not tenant.container_id:
+        logger.warning(
+            "apply_byo_credentials_to_container skipped: tenant=%s has no container_id",
+            tenant.id,
+        )
+        return
+
+    # Late import to avoid circular import (byo_models -> orchestrator).
+    from apps.byo_models.models import BYOCredential
+
+    cred = (
+        tenant.byo_credentials.filter(
+            provider=BYOCredential.Provider.ANTHROPIC,
+            mode=BYOCredential.Mode.CLI_SUBSCRIPTION,
+        )
+        .exclude(status=BYOCredential.Status.ERROR)
+        .first()
+    )
+
+    client = get_container_client()
+    app = client.container_apps.get(
+        settings.AZURE_RESOURCE_GROUP,
+        tenant.container_id,
+    )
+
+    BYO_SECRET = "claude-code-oauth-token"
+    BYO_ENV = "CLAUDE_CODE_OAUTH_TOKEN"
+    PLATFORM_ENV = "ANTHROPIC_API_KEY"
+
+    # Reconcile secrets list — drop any stale BYO entry, optionally re-add.
+    secrets = [s for s in (app.configuration.secrets or []) if _entry_name(s) != BYO_SECRET]
+    if cred:
+        secrets.append(
+            _build_container_secret(
+                BYO_SECRET,
+                plain_value="",
+                key_vault_secret_name=cred.key_vault_secret_name,
+                identity_id=tenant.managed_identity_id,
+            )
+        )
+    app.configuration.secrets = secrets
+
+    # Reconcile env on the openclaw container.
+    for container in app.template.containers:
+        if container.name != "openclaw":
+            continue
+        env_list = [e for e in (container.env or []) if _entry_name(e) not in (BYO_ENV, PLATFORM_ENV)]
+        if cred:
+            env_list.append({"name": BYO_ENV, "secretRef": BYO_SECRET})
+        else:
+            env_list.append({"name": PLATFORM_ENV, "secretRef": "anthropic-key"})
+        container.env = env_list
+        break
+
+    import hashlib
+    import time
+
+    app.template.revision_suffix = f"b{hashlib.sha256(f'byo-{int(time.time_ns())}'.encode()).hexdigest()[:6]}"
+
+    client.container_apps.begin_create_or_update(
+        settings.AZURE_RESOURCE_GROUP,
+        tenant.container_id,
+        app,
+    ).result()
+    logger.info(
+        "Applied BYO credentials for tenant=%s container=%s (cli_active=%s)",
+        tenant.id,
+        tenant.container_id,
+        cred is not None,
+    )
+
+
+_PLUGIN_RUNTIME_DEPS_VOLUME = "plugin-runtime-deps"
+_PLUGIN_RUNTIME_DEPS_PATH = "/home/node/.openclaw/plugin-runtime-deps"
+
+# OpenClaw memory-core's SQLite FTS5 index. Markdown lives on the share
+# (line-based, SMB-safe); the index is a rebuild-on-startup cache so it
+# belongs on local ephemeral storage. See ``_build_memory_search_config``
+# in config_generator for the corresponding openclaw.json shape.
+_INDEX_CACHE_VOLUME = "index-cache"
+_INDEX_CACHE_PATH = "/home/node/.openclaw/index"
+
+
+def _ensure_empty_dir_mount_in_template(app, volume_name: str, mount_path: str) -> bool:
+    """Mutate a Container App template in place to include an EmptyDir
+    volume + mount on the ``openclaw`` container.
+
+    Idempotent — returns True if the template was modified, False if both
+    the volume and mount were already present. Caller is responsible for
+    persisting the change.
+
+    Single helper for every ephemeral-storage shadow we've needed so far
+    (plugin-runtime-deps to dodge SMB chmod-EPERM, index-cache to keep
+    SQLite off SMB). The shape is the same; only the names differ.
+    """
+    from azure.mgmt.appcontainers.models import Volume, VolumeMount
+
+    template = app.template
+    volumes = list(template.volumes or [])
+    volume_names = {v.name for v in volumes}
+
+    modified = False
+
+    if volume_name not in volume_names:
+        volumes.append(Volume(name=volume_name, storage_type="EmptyDir"))
+        template.volumes = volumes
+        modified = True
+
+    for container in template.containers:
+        if container.name != "openclaw":
+            continue
+        mounts = list(container.volume_mounts or [])
+        if not any(m.volume_name == volume_name for m in mounts):
+            mounts.append(VolumeMount(volume_name=volume_name, mount_path=mount_path))
+            container.volume_mounts = mounts
+            modified = True
+        break
+
+    return modified
+
+
+def _ensure_plugin_runtime_deps_in_template(app) -> bool:
+    """Mutate a Container App template in place to include the
+    plugin-runtime-deps EmptyDir mount on the openclaw container.
+    """
+    return _ensure_empty_dir_mount_in_template(app, _PLUGIN_RUNTIME_DEPS_VOLUME, _PLUGIN_RUNTIME_DEPS_PATH)
+
+
+def _ensure_index_cache_in_template(app) -> bool:
+    """Mutate a Container App template in place to include the
+    index-cache EmptyDir mount on the openclaw container.
+    """
+    return _ensure_empty_dir_mount_in_template(app, _INDEX_CACHE_VOLUME, _INDEX_CACHE_PATH)
+
+
+def ensure_plugin_runtime_deps_mount(container_name: str) -> bool:
+    """Idempotently add the plugin-runtime-deps EmptyDir mount to an
+    existing Container App.
+
+    OpenClaw's bundled-channel installer hits EPERM when copying
+    `.buildstamp` onto an Azure File Share (SMB doesn't support the
+    file modes Node uses) and leaves a stale runtime-deps lock that
+    wedges across container restarts. Mounting EmptyDir at the install
+    target keeps the install on ephemeral local storage.
+
+    Returns True if a new revision was created, False if the mount was
+    already present (no-op).
+    """
+    if _is_mock():
+        logger.info("[MOCK] Ensured plugin-runtime-deps mount on %s", container_name)
+        return False
+
+    client = get_container_client()
+    app = client.container_apps.get(
+        settings.AZURE_RESOURCE_GROUP,
+        container_name,
+    )
+
+    if not _ensure_plugin_runtime_deps_in_template(app):
+        return False
+
+    client.container_apps.begin_create_or_update(
+        settings.AZURE_RESOURCE_GROUP,
+        container_name,
+        app,
+    ).result()
+    logger.info("Added plugin-runtime-deps EmptyDir mount to %s", container_name)
+    return True
+
+
+def update_container_image(container_name: str, image: str) -> None:
+    """Update the container image of an existing Container App.
+
+    This triggers a new revision, effectively restarting the container.
+    Also ensures the plugin-runtime-deps EmptyDir mount is present so
+    image bumps roll out the volume fix in the same revision.
+    """
+    import hashlib
+
+    if _is_mock():
+        logger.info("[MOCK] Updated image to %s on %s", image, container_name)
+        return
+
+    client = get_container_client()
+    app = client.container_apps.get(
+        settings.AZURE_RESOURCE_GROUP,
+        container_name,
+    )
+
+    for container in app.template.containers:
+        if container.name == "openclaw":
+            container.image = image
+            break
+
+    _ensure_plugin_runtime_deps_in_template(app)
+    _ensure_index_cache_in_template(app)
+
+    # Generate a unique revision suffix from the image tag to avoid
+    # "revision with suffix already exists" errors.
+    # Azure limits suffix to 64 chars and requires lowercase alphanumeric + hyphens.
+    tag = image.rsplit(":", 1)[-1] if ":" in image else "latest"
+    suffix = hashlib.sha256(tag.encode()).hexdigest()[:6]
+    app.template.revision_suffix = f"u{suffix}"
+
+    client.container_apps.begin_create_or_update(
+        settings.AZURE_RESOURCE_GROUP,
+        container_name,
+        app,
+    ).result()
+    logger.info("Updated image to %s on %s (revision suffix: u%s)", image, container_name, suffix)
+
+
+def scale_container_app(container_name: str, *, min_replicas: int, max_replicas: int) -> None:
+    """Scale an Azure Container App by activating/deactivating revisions.
+
+    Azure Consumption plan doesn't support minReplicas=0 via scale config,
+    so we use revision deactivation to hibernate (stop all replicas, zero cost)
+    and revision activation to wake up.
+
+    Use min=0, max=0 to hibernate (deactivate all active revisions).
+    Use min=1, max=1 to wake (activate the latest revision).
+    """
+    if _is_mock():
+        logger.info("[MOCK] Scaled %s to min=%d max=%d", container_name, min_replicas, max_replicas)
+        return
+
+    client = get_container_client()
+    rg = settings.AZURE_RESOURCE_GROUP
+
+    if min_replicas == 0 and max_replicas == 0:
+        # Hibernate: deactivate all active revisions
+        hibernate_container_app(container_name)
+    else:
+        # Wake: activate the latest revision
+        wake_container_app(container_name)
+
+
+def _is_already_in_requested_state(exc) -> bool:
+    """True if an Azure revisions 409 means the revision is already in the
+    requested active/inactive state — i.e. the activate/deactivate is a no-op
+    and should be treated as success.
+
+    Azure folds the whole 409 Conflict family for the Container Apps revisions
+    API into ``ResourceExistsError``, so we match the specific
+    ``RevisionAlreadyInRequestedState`` code (or its message) rather than
+    swallowing every 409 — a different conflict (e.g. another operation in
+    progress) must still propagate.
+    """
+    code = getattr(getattr(exc, "error", None), "code", "") or ""
+    if code == "RevisionAlreadyInRequestedState":
+        return True
+    msg = str(exc).lower()
+    return "already active" in msg or "already inactive" in msg or "already in requested state" in msg
+
+
+def hibernate_container_app(container_name: str) -> None:
+    """Hibernate a container by deactivating all active revisions.
+
+    The container app and its config/data are preserved.
+    Zero replicas run = zero compute cost.
+    """
+    if _is_mock():
+        logger.info("[MOCK] Hibernated %s", container_name)
+        return
+
+    from azure.core.exceptions import ResourceExistsError
+
+    client = get_container_client()
+    rg = settings.AZURE_RESOURCE_GROUP
+
+    revisions = list(client.container_apps_revisions.list_revisions(rg, container_name))
+    active_revs = [r for r in revisions if r.active]
+
+    deactivated = 0
+    for rev in active_revs:
+        try:
+            client.container_apps_revisions.deactivate_revision(rg, container_name, rev.name)
+            deactivated += 1
+        except ResourceExistsError as exc:
+            # Stale list read: the revision is already inactive — the desired end
+            # state. Don't let it abort hibernation, or hibernate_idle_tenant
+            # returns False and the tenant is left awake with no cron-wake armed
+            # (the mirror of the wake-side stale-read bug, canary 148ccf1c).
+            if not _is_already_in_requested_state(exc):
+                raise
+            logger.info("Hibernate %s — revision %s already inactive", container_name, rev.name)
+
+    logger.info("Hibernated %s — deactivated %d revision(s)", container_name, deactivated)
+
+
+def wake_container_app(container_name: str) -> None:
+    """Wake a hibernated container by activating the latest revision.
+
+    Finds the most recently created revision and activates it.
+    Container starts within ~30 seconds.
+    """
+    if _is_mock():
+        logger.info("[MOCK] Woke %s", container_name)
+        return
+
+    from azure.core.exceptions import ResourceExistsError
+
+    client = get_container_client()
+    rg = settings.AZURE_RESOURCE_GROUP
+
+    revisions = list(client.container_apps_revisions.list_revisions(rg, container_name))
+    if not revisions:
+        raise RuntimeError(f"No revisions found for {container_name}")
+
+    # Find the latest revision
+    latest = max(revisions, key=lambda r: r.created_time)
+
+    if latest.active:
+        logger.info("Wake %s — latest revision %s already active", container_name, latest.name)
+        return
+
+    try:
+        client.container_apps_revisions.activate_revision(rg, container_name, latest.name)
+    except ResourceExistsError as exc:
+        # Azure raises RevisionAlreadyInRequestedState (409) when the revision is
+        # already active. The ``latest.active`` pre-check above can read a stale
+        # revision list (the control plane lags the live state, or a concurrent
+        # wake won the race), so we still reach activate_revision on an
+        # already-active revision. "Already active" IS the desired end state, so
+        # treat it as success. Letting it propagate wedges the poller drain:
+        # wake_hibernated_tenant's except clause never clears ``hibernated_at``,
+        # so every retry re-enters the 404→wake branch and crashes again — the
+        # message never delivers and never hits the attempt cap, an infinite
+        # silent loop (canary 148ccf1c, 2026-06-25).
+        #
+        # Azure maps the whole 409 Conflict family for the revisions API to
+        # ResourceExistsError, so only swallow the already-active condition — a
+        # genuinely different 409 (e.g. another operation in progress) must
+        # propagate so wake_hibernated_tenant returns False and the drain takes
+        # its bounded failure path instead of falsely reporting a wake.
+        if not _is_already_in_requested_state(exc):
+            raise
+        logger.info("Wake %s — revision %s already active (idempotent activate)", container_name, latest.name)
+        return
+    logger.info("Woke %s — activated revision %s", container_name, latest.name)
+
+
+def delete_container_app(container_name: str) -> None:
+    """Delete an Azure Container App."""
+    if _is_mock():
+        logger.info("[MOCK] Deleted container %s", container_name)
+        return
+
+    client = get_container_client()
+    try:
+        client.container_apps.begin_delete(
+            settings.AZURE_RESOURCE_GROUP,
+            container_name,
+        ).result()
+    except Exception:
+        logger.exception("Failed to delete container %s", container_name)
+        raise
+
+
+def list_tenant_container_app_names() -> list[str]:
+    """Return the names of every ``oc-*`` tenant Container App in the RG.
+
+    Used by the orphan reaper to diff live containers against DB tenants.
+    Returns ``[]`` in mock mode.
+    """
+    if _is_mock():
+        return []
+
+    client = get_container_client()
+    names: list[str] = []
+    for app in client.container_apps.list_by_resource_group(settings.AZURE_RESOURCE_GROUP):
+        name = getattr(app, "name", "") or ""
+        if name.startswith("oc-"):
+            names.append(name)
+    return names
+
+
+def container_app_has_active_revision(container_name: str) -> bool:
+    """Return True if the container app has at least one active revision.
+
+    An active revision means the container is awake (consuming compute). The
+    orphan reaper uses this to report which orphans were awake before
+    hibernating them. Returns False in mock mode.
+    """
+    if _is_mock():
+        return False
+
+    client = get_container_client()
+    revisions = client.container_apps_revisions.list_revisions(
+        settings.AZURE_RESOURCE_GROUP,
+        container_name,
+    )
+    return any(getattr(rev, "active", False) for rev in revisions)

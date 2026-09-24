@@ -1,0 +1,1311 @@
+export type TenantStatus =
+  | "pending"
+  | "provisioning"
+  | "active"
+  | "suspended"
+  | "deprovisioning"
+  | "deleted";
+
+export type TenantTier = "starter";
+
+export interface TenantUser {
+  id: string;
+  username: string;
+  email: string;
+  display_name: string;
+  language: string;
+  telegram_chat_id: number | null;
+  telegram_username: string;
+}
+
+export interface FreeModelOffer {
+  active: boolean;
+  model_id: string;
+  display_name: string;
+  fallback_model_id: string;
+  fallback_display_name: string;
+  activated_at: string | null;
+  last_transition_reason: string;
+  health: {
+    is_reachable: boolean | null;
+    is_free: boolean | null;
+    last_checked_at: string | null;
+  };
+}
+
+export interface Tenant {
+  id: string;
+  user: TenantUser;
+  status: TenantStatus;
+  model_tier: TenantTier;
+  has_active_subscription: boolean;
+  is_trial: boolean;
+  trial_ends_at: string | null;
+  trial_days_remaining: number | null;
+  container_id: string;
+  container_fqdn: string;
+  messages_today: number;
+  messages_this_month: number;
+  tokens_this_month: number;
+  estimated_cost_this_month: string;
+  monthly_token_budget: number;
+  monthly_cost_budget: string;
+  preferred_model: string;
+  applied_model: string;
+  applied_model_at: string | null;
+  // The model actually in effect right now (rolling free-offer default
+  // included). Use this — not a static DEFAULT_MODEL — for the Active badge
+  // when the user hasn't explicitly picked a model.
+  effective_model: string;
+  free_model_offer: FreeModelOffer;
+  task_model_preferences: Record<string, string>;
+  last_message_at: string | null;
+  provisioned_at: string | null;
+  config_refreshed_at: string | null;
+  config_version: number;
+  pending_config_version: number;
+  hibernated_at: string | null;
+  created_at: string;
+  pending_deletion: boolean;
+  deletion_scheduled_at: string | null;
+  platform_budget_exceeded: boolean;
+  constellation_enabled: boolean;
+  finance_enabled: boolean;
+  // Platform-level availability of Gravity (finance). False when paused for
+  // privacy (GRAVITY_ENABLED off server-side) — hides the tab + enable toggle.
+  gravity_available: boolean;
+  fuel_enabled: boolean;
+  core_enabled: boolean;
+  byo_models_enabled: boolean;
+  friends_enabled: boolean;
+}
+
+// Core (mindfulness) pillar — generated guided meditations.
+export type MeditationStatus = "pending" | "rendering" | "ready" | "delivered" | "failed";
+
+export interface MeditationSession {
+  id: string;
+  date: string; // YYYY-MM-DD
+  status: MeditationStatus;
+  title: string;
+  theme: string;
+  voice: string;
+  model: string;
+  guidance_text: string;
+  audio_url: string; // absolute; serve_meditation_audio is unauthenticated
+  ogg_url: string;
+  duration_ms: number | null;
+  ambient_bed: string;
+  error: string; // populated when status === "failed" — a short reason
+  user_feedback: string; // "" | "liked" | "disliked" | "skipped"
+  feedback_note: string;
+  feedback_at: string | null;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface CoreComposeResponse {
+  meditation_id: string;
+  status: MeditationStatus;
+}
+
+export interface CoreSettingsResponse {
+  core_enabled: boolean;
+  core_profile_status: string | null;
+  restart_required: boolean;
+}
+
+export type CoreOnboardingStatus = "pending" | "in_progress" | "completed" | "declined";
+
+export interface CoreProfile {
+  id: string;
+  onboarding_status: CoreOnboardingStatus;
+  preferred_voice: string;
+  preferred_duration_minutes: number;
+  ambient_bed_enabled: boolean;
+  daily_cron_enabled: boolean;
+  preferred_time: string;
+  additional_context: string;
+  created_at: string;
+  updated_at: string;
+}
+
+// Bring-your-own subscription credentials
+export type BYOProvider = "anthropic" | "openai";
+export type BYOMode = "api_key" | "cli_subscription";
+export type BYOStatus = "pending" | "verified" | "expired" | "error";
+
+export interface BYOCredential {
+  id: string;
+  provider: BYOProvider;
+  mode: BYOMode;
+  status: BYOStatus;
+  last_verified_at: string | null;
+  last_error: string;
+  created_at: string;
+}
+
+export interface BYOConnectRequest {
+  provider: BYOProvider;
+  mode: BYOMode;
+  token: string;
+}
+
+export interface BYOConnectResponse {
+  id: string;
+  provider: BYOProvider;
+  mode: BYOMode;
+  status: BYOStatus;
+  last_verified_at: string | null;
+  last_error: string;
+  created_at: string;
+}
+
+export interface RefreshConfigStatus {
+  can_refresh: boolean;
+  last_refreshed: string | null;
+  cooldown_seconds: number;
+  status: string;
+  has_pending_update: boolean;
+  container_image_tag: string | null;
+  latest_image_tag: string | null;
+  image_outdated: boolean;
+}
+
+export interface ProvisioningStatus {
+  tenant_id: string;
+  user_id: string;
+  status: TenantStatus;
+  container_id: string;
+  container_fqdn: string;
+  has_container_id: boolean;
+  has_container_fqdn: boolean;
+  provisioned_at: string | null;
+  created_at: string;
+  updated_at: string;
+  ready?: boolean;
+}
+
+export interface Integration {
+  id: string;
+  provider: "google" | "reddit" | "sautai";
+  status: "active" | "expired" | "revoked" | "error";
+  provider_email: string;
+  scopes: string[];
+  connected_at: string;
+  updated_at: string;
+}
+
+// sautai account link (Phase 0.5). GET returns status; POST connect returns it
+// with status:"connected". The raw connect key is exchanged server-side and
+// never stored.
+export interface SautaiLinkStatus {
+  linked: boolean;
+  email: string;
+  linked_at: string | null;
+}
+
+export interface SautaiLinkConnectResponse extends SautaiLinkStatus {
+  status: "connected";
+}
+
+export interface AuthUser {
+  id: string;
+  email: string;
+  username: string;
+  apple_linked: boolean;
+  display_name: string;
+  language: string;
+  timezone: string;
+  location_city: string;
+  location_lat: number | null;
+  location_lon: number | null;
+  telegram_chat_id: number | null;
+  telegram_username: string;
+  line_user_id: string | null;
+  line_display_name: string;
+  preferred_channel: "telegram" | "line";
+  tenant: Tenant | null;
+}
+
+export interface DashboardData {
+  tenant: {
+    id: string;
+    status: string;
+    model_tier: string;
+    provisioned_at: string | null;
+  };
+  usage: {
+    messages_today: number;
+    messages_this_month: number;
+    tokens_this_month: number;
+    estimated_cost_this_month: string;
+    monthly_token_budget: number;
+    total_input_tokens: number;
+    total_output_tokens: number;
+    total_cost: string;
+  };
+  connections: Array<{
+    provider: string;
+    provider_email: string;
+    connected_at: string;
+  }>;
+}
+
+export interface UsageRecord {
+  id: string;
+  event_type: string;
+  input_tokens: number;
+  output_tokens: number;
+  model_used: string;
+  cost_estimate: string;
+  created_at: string;
+}
+
+export interface UsageModelBreakdown {
+  model: string;
+  display_name: string;
+  input_tokens: number;
+  output_tokens: number;
+  cost: number;
+  count: number;
+}
+
+export interface UsageBudgetSummary {
+  tenant_tokens_used: number;
+  tenant_token_budget: number;
+  tenant_estimated_cost: number;
+  tenant_cost_used: number;
+  tenant_cost_budget: number;
+  budget_percentage: number;
+  global_spent: number;
+  global_remaining: number | null;
+}
+
+export interface UsageSummary {
+  period: {
+    start: string;
+    end: string;
+  };
+  total_input_tokens: number;
+  total_output_tokens: number;
+  total_tokens: number;
+  total_cost: number;
+  message_count: number;
+  by_model: UsageModelBreakdown[];
+  budget: UsageBudgetSummary;
+  // True monthly cost to run the assistant (AI usage + fully-loaded infra).
+  // Additive/optional so older API responses still typecheck.
+  llm_cost?: number;
+  infra_cost?: number;
+  infra_source?: string;
+  true_total_cost?: number;
+  infra_breakdown?: {
+    container: number;
+    database_share: number;
+    storage_share: number;
+    platform_share: number;
+  };
+}
+
+export interface TransparencyData {
+  period: {
+    start: string;
+    end: string;
+  };
+  subscription_price: number;
+  your_actual_cost: number;
+  platform_infra: number;
+  surplus: number;
+  donation_amount: number;
+  donation_enabled: boolean;
+  donation_percentage: number;
+  message_count: number;
+  model_rates: Array<{
+    model: string;
+    display_name: string;
+    input_per_million: number;
+    output_per_million: number;
+  }>;
+  infra_breakdown: {
+    container: number;
+    database_share: number;
+    storage_share: number;
+    platform_share: number;
+    total: number;
+    source?: string;
+  };
+  explanation: string;
+}
+
+// Journal (legacy structured entries)
+/** @deprecated Use DailyNote types instead. */
+export type JournalEntryEnergy = "low" | "medium" | "high";
+
+/** @deprecated Use DailyNote types instead. */
+export interface JournalEntry {
+  id: string;
+  date: string;
+  mood: string;
+  energy: JournalEntryEnergy;
+  wins: string[];
+  challenges: string[];
+  reflection: string;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface NoteTemplateSection {
+  slug: string;
+  title: string;
+  content: string;
+  source?: string;
+}
+
+export interface NoteTemplate {
+  id: string;
+  slug: string;
+  name: string;
+  sections: NoteTemplateSection[];
+  is_default: boolean;
+  source: string;
+  created_at: string;
+  updated_at: string;
+}
+
+// Weekly Reviews
+export type WeekRating = "thumbs-up" | "thumbs-down" | "meh";
+
+export interface WeeklyReview {
+  id: string;
+  week_start: string;
+  week_end: string;
+  mood_summary: string;
+  top_wins: string[];
+  top_challenges: string[];
+  lessons: string[];
+  week_rating: WeekRating;
+  intentions_next_week: string[];
+  created_at: string;
+  updated_at: string;
+}
+
+// Working Hours (heartbeat window)
+export interface WorkingHoursConfig {
+  enabled: boolean;
+  start_hour: number;
+  window_hours: number;
+  feature_tips: boolean;
+}
+
+// Cron Jobs (OpenClaw Gateway scheduled tasks)
+export interface CronJobSchedule {
+  kind: string;
+  expr: string;
+  tz: string;
+}
+
+export interface CronJobPayload {
+  kind: string;
+  message: string;
+}
+
+export interface CronJobDelivery {
+  mode: string;
+  channel?: string;
+  to?: string;
+}
+
+export interface CronJob {
+  jobId?: string;
+  name: string;
+  schedule: CronJobSchedule;
+  // Always "isolated" under the universal isolation model. Kept on the type
+  // for back-compat with the gateway response shape (legacy jobs may still
+  // report "main" until they are recreated).
+  sessionTarget: string;
+  // Deprecated alongside sessionTarget. May still appear on legacy jobs.
+  wakeMode?: string;
+  payload: CronJobPayload;
+  delivery: CronJobDelivery;
+  enabled: boolean;
+  // Whether this task pushes a Phase 2 sync into the main session after it
+  // runs (only fires if the run actually sent the user a message). Default
+  // is true. Derived server-side from the message body's Phase 2 marker.
+  foreground?: boolean;
+}
+
+// Pending one-off reminder (schedule.kind === "at"). Lives only in the
+// gateway — auto-deletes after firing. Surfaced through a separate API
+// endpoint from CronJob so the canonical-tenant recurring read stays
+// Postgres-only.
+export interface PendingReminder {
+  jobId?: string;
+  name: string;
+  firesAtMs: number | null;
+  schedule: CronJobSchedule;
+  payload: CronJobPayload;
+  delivery: CronJobDelivery;
+}
+
+export interface PendingRemindersResponse {
+  jobs: PendingReminder[];
+  soft_cap: number;
+  stale: boolean;
+}
+
+export type AutomationKind = "daily_brief" | "weekly_review";
+export type AutomationStatus = "active" | "paused";
+export type AutomationScheduleType = "daily" | "weekly";
+
+export interface Automation {
+  id: string;
+  kind: AutomationKind;
+  status: AutomationStatus;
+  timezone: string;
+  schedule_type: AutomationScheduleType;
+  schedule_time: string;
+  schedule_days: number[];
+  quiet_hours_start: string | null;
+  quiet_hours_end: string | null;
+  last_run_at: string | null;
+  next_run_at: string;
+  created_at: string;
+  updated_at: string;
+}
+
+// Journal v2 Documents
+export type DocumentKind = "daily" | "weekly" | "monthly" | "goal" | "project" | "tasks" | "ideas" | "memory";
+
+export interface DocumentResponse {
+  id: string;
+  kind: DocumentKind;
+  slug: string;
+  title: string;
+  markdown: string;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface DocumentListItem {
+  id: string;
+  kind: DocumentKind;
+  slug: string;
+  title: string;
+  updated_at: string;
+}
+
+export interface SidebarSection {
+  kind: string;
+  label: string;
+  items: Array<{
+    slug: string;
+    title: string;
+    updated_at: string | null;
+  }>;
+}
+
+export type AutomationRunStatus = "pending" | "running" | "succeeded" | "failed" | "skipped";
+export type AutomationTriggerSource = "manual" | "schedule";
+
+export interface AutomationRun {
+  id: string;
+  automation: string;
+  tenant: string;
+  status: AutomationRunStatus;
+  trigger_source: AutomationTriggerSource;
+  scheduled_for: string;
+  started_at: string | null;
+  finished_at: string | null;
+  idempotency_key: string;
+  input_payload: Record<string, unknown>;
+  result_payload: Record<string, unknown>;
+  error_message: string;
+  created_at: string;
+  updated_at: string;
+}
+
+
+export interface Lesson {
+  id: number;
+  text: string;
+  context: string;
+  tags: string[];
+  cluster_id: number | null;
+  cluster_label: string;
+  source_type: string;
+  source_ref: string;
+  status: "pending" | "approved" | "dismissed";
+  suggested_at: string;
+  approved_at: string | null;
+  created_at: string;
+}
+
+export interface ConstellationNode {
+  id: number;
+  text: string;
+  context?: string;
+  tags: string[];
+  cluster_id: number | null;
+  cluster_label: string;
+  source_type?: string;
+  source_ref?: string;
+  x: number | null;
+  y: number | null;
+  created_at: string;
+}
+
+export interface ConstellationEdge {
+  source: number;
+  target: number;
+  similarity: number;
+  connection_type: string;
+}
+
+export interface ConstellationData {
+  nodes: ConstellationNode[];
+  edges: ConstellationEdge[];
+  affinity_edges: ConstellationEdge[];
+  clusters: { id: number; label: string; count: number; tags: string[] }[];
+}
+
+// Graph view types (Neo4j-style constellation)
+export type GraphNodeKind = "Lesson" | "Cluster" | "Evidence" | "Tag";
+export type GraphRelType = "IN_CLUSTER" | "SIMILAR_TO" | "EVIDENCED_BY" | "TAGGED_WITH" | "REFINES";
+
+export interface GraphNode {
+  id: string | number;
+  kind: GraphNodeKind;
+  label: string;
+  color?: string;
+  text?: string;
+  context?: string;
+  tags?: string[];
+  source_type?: string;
+  source_ref?: string;
+  created_at?: string;
+  cluster_id?: number;
+  weight?: number;
+  constellation?: string;
+  theme?: string;
+  /** Cluster only: member count (drives the hover card). */
+  count?: number;
+  /** Backend PCA projection of the lesson embedding — the semantic layout seed. */
+  x?: number | null;
+  y?: number | null;
+}
+
+export interface GraphEdge {
+  source: string | number;
+  target: string | number;
+  type: GraphRelType;
+  similarity?: number;
+}
+
+export interface GraphData {
+  nodes: GraphNode[];
+  edges: GraphEdge[];
+  kindColors: Record<GraphNodeKind, string>;
+  relColors: Record<GraphRelType, string>;
+}
+
+// Horizons
+export interface HorizonsGoal {
+  id: string;
+  title: string;
+  slug: string;
+  preview: string;
+  markdown?: string;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface HorizonsPendingExtraction {
+  id: string;
+  kind: "goal" | "task";
+  text: string;
+  confidence: string;
+  source_date: string | null;
+  created_at: string;
+}
+
+export interface HorizonsWeeklyPulse {
+  week_start: string;
+  week_end: string;
+  week_rating: WeekRating;
+  top_win: string | null;
+}
+
+export interface HorizonsMomentumDay {
+  date: string;
+  message_count: number;
+  has_journal: boolean;
+}
+
+export interface HorizonsWeeklyDocument {
+  id: string;
+  title: string;
+  slug: string;
+  week_start: string;
+  week_end: string;
+  preview: string;
+  markdown: string;
+  updated_at: string;
+}
+
+export type AssistantInsightStatus = "open" | "confirmed" | "refuted" | "expired";
+
+export interface HorizonsAssistantInsight {
+  id: string;
+  pillar: string;
+  topic_slug: string | null;
+  topic_display_name: string | null;
+  statement: string;
+  status: AssistantInsightStatus;
+  confidence: number;
+  created_at: string;
+  last_confirmed_at: string | null;
+}
+
+export interface HorizonsTopicSignal {
+  pillar: string;
+  topic_slug: string;
+  topic_display_name: string;
+  sample_size: number;
+  confirmed: number;
+  refuted: number;
+  has_goal: boolean;
+  register_offset: number;
+  register_scope: "topic" | "pillar" | null;
+}
+
+export type NorthStarStatus = "proposed" | "confirmed" | "evolving" | "retired";
+
+export interface HorizonsNorthStar {
+  id: string;
+  // "purpose" → a Purpose row (confirm/retire via the purposes API);
+  // "extraction" → a nightly purpose-hypothesis card (approve/dismiss via the
+  // extractions API). The frontend branches confirm/reject on this.
+  source: "purpose" | "extraction";
+  statement: string;
+  pillars: string[];
+  status: NorthStarStatus;
+  origin: string;
+  created_at: string;
+}
+
+export interface HorizonsData {
+  north_star: HorizonsNorthStar[];
+  goals: HorizonsGoal[];
+  pending_extractions: HorizonsPendingExtraction[];
+  weekly_pulse: HorizonsWeeklyPulse[];
+  weekly_documents: HorizonsWeeklyDocument[];
+  mood_trend: { date: string; mood: string; energy: string }[];
+  momentum: HorizonsMomentumDay[];
+  current_streak: number;
+  assistant_insights: HorizonsAssistantInsight[];
+  topic_signals: HorizonsTopicSignal[];
+}
+
+// ── Finance ──────────────────────────────────────────────────────────
+export interface FinanceAccount {
+  id: string;
+  account_type: string;
+  nickname: string;
+  current_balance: string;
+  original_balance: string | null;
+  interest_rate: string | null;
+  minimum_payment: string | null;
+  credit_limit: string | null;
+  due_day: number | null;
+  is_active: boolean;
+  is_debt: boolean;
+  payoff_progress: number | null;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface FinanceTransaction {
+  id: string;
+  account: string;
+  account_nickname: string;
+  transaction_type: string;
+  amount: string;
+  description: string;
+  date: string;
+  created_at: string;
+}
+
+export interface PayoffPlanScheduleEntry {
+  month: number;
+  accounts: { nickname: string; balance: string; payment: string }[];
+  total_remaining: string;
+}
+
+export interface PayoffPlan {
+  id: string;
+  strategy: string;
+  monthly_budget: string;
+  total_debt: string;
+  total_interest: string;
+  payoff_months: number;
+  payoff_date: string;
+  schedule_json: PayoffPlanScheduleEntry[];
+  is_active: boolean;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface FinanceSnapshot {
+  id: string;
+  date: string;
+  total_debt: string;
+  total_savings: string;
+  total_payments_this_month: string;
+  accounts_json: { nickname: string; type: string; balance: string }[];
+  created_at: string;
+}
+
+export interface FinanceDashboardData {
+  total_debt: string;
+  total_savings: string;
+  total_minimum_payments: string;
+  debt_account_count: number;
+  savings_account_count: number;
+  accounts: FinanceAccount[];
+  active_plan: PayoffPlan | null;
+  snapshots: FinanceSnapshot[];
+  recent_transactions: FinanceTransaction[];
+}
+
+// -- Fuel (Workout Tracking) --
+
+export type WorkoutCategory =
+  | "strength"
+  | "cardio"
+  | "hiit"
+  | "calisthenics"
+  | "mobility"
+  | "sport"
+  | "other";
+
+export type WorkoutStatus =
+  | "done"
+  | "planned"
+  | "rest"
+  | "in_progress"
+  | "skipped"
+  | "rescheduled";
+
+export type WorkoutSource = "user" | "assistant" | "template";
+
+export interface FuelWorkout {
+  id: string;
+  date: string;
+  scheduled_at: string | null;
+  window_start_at: string | null;
+  window_end_at: string | null;
+  status: WorkoutStatus;
+  source: WorkoutSource;
+  original_workout: string | null;
+  skip_reason: string;
+  category: WorkoutCategory;
+  activity: string;
+  duration_minutes: number | null;
+  rpe: number | null;
+  notes: string;
+  notes_thread: { at: string; who: string; text: string }[];
+  detail_json: Record<string, unknown>;
+  version?: number;
+  edit_lock_until?: string | null;
+  edit_lock_owner?: string;
+  last_edited_by_user_at?: string | null;
+  plan_id?: string | null;
+  plan_name?: string | null;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface WorkoutStub {
+  id: string;
+  date: string;
+  scheduled_at: string | null;
+  category: WorkoutCategory;
+  activity: string;
+  status: WorkoutStatus;
+  duration_minutes: number | null;
+  rpe: number | null;
+}
+
+export interface CalendarDay {
+  date: string;
+  workouts: WorkoutStub[];
+}
+
+export interface BodyWeightEntry {
+  id: string;
+  date: string;
+  weight_kg: string;
+  created_at: string;
+}
+
+export interface WorkoutTemplate {
+  id: string;
+  name: string;
+  category: WorkoutCategory;
+  activity: string;
+  duration_minutes: number | null;
+  detail_json: Record<string, unknown>;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface PersonalRecord {
+  id: string;
+  exercise_name: string;
+  category: WorkoutCategory;
+  value: string;
+  previous_value: string | null;
+  metric: string;
+  display: string;
+  date: string;
+  created_at: string;
+}
+
+export interface FuelGoal {
+  id: string;
+  exercise_name: string;
+  metric: string;
+  target_value: string;
+  target_date: string | null;
+  achieved_at: string | null;
+  created_at: string;
+}
+
+export interface RestingHeartRateEntry {
+  id: string;
+  date: string;
+  bpm: number;
+  created_at: string;
+}
+
+export interface SleepEntry {
+  id: string;
+  date: string;
+  duration_hours: string;
+  quality: number | null;
+  notes: string;
+  created_at: string;
+}
+
+export type FuelOnboardingStatus = "pending" | "in_progress" | "completed" | "declined";
+
+export type DistanceUnit = "km" | "mi";
+
+export interface FuelProfile {
+  id: string;
+  onboarding_status: FuelOnboardingStatus;
+  fitness_level: string;
+  goals: string[];
+  limitations: string[];
+  equipment: string[];
+  days_per_week: number | null;
+  additional_context: string;
+  distance_unit: DistanceUnit;
+  created_at: string;
+  updated_at: string;
+}
+
+// Personal Access Tokens (Connected Apps)
+export type PATScope = "sessions:write" | "sessions:read";
+
+export interface PersonalAccessToken {
+  id: string;
+  name: string;
+  token_prefix: string;
+  scopes: PATScope[];
+  last_used_at: string | null;
+  expires_at: string | null;
+  revoked_at: string | null;
+  created_at: string;
+}
+
+export interface PATCreateRequest {
+  name: string;
+  scopes?: PATScope[];
+  expires_in_days?: number;
+}
+
+export interface PATCreateResponse {
+  id: string;
+  name: string;
+  token: string;
+  token_prefix: string;
+  scopes: PATScope[];
+  expires_at: string | null;
+  created_at: string;
+  warning: string;
+}
+
+// ── Journal current-status projection (GET /api/v1/journal/status/) ──────
+// Live "as of now" state derived from the canonical typed models + the
+// finance event ledger. Obligations are recurring-payment status folded
+// per calendar month — see apps/journal/status_projection.py.
+export type ObligationStatus = "paid" | "partial" | "unpaid";
+
+export interface JournalObligation {
+  account_id: string;
+  nickname: string;
+  minimum_payment: string;
+  paid_amount: string;
+  due_date: string;
+  period: string;
+  period_status: ObligationStatus;
+  overdue: boolean;
+}
+
+export interface JournalStatusTask {
+  id: string;
+  title: string;
+  status: string;
+  due_date: string | null;
+  pillar: string;
+}
+
+export interface JournalStatusGoal {
+  id: string;
+  title: string;
+  status: string;
+  target_date: string | null;
+  pillar: string;
+}
+
+export interface JournalStatus {
+  as_of: string;
+  typed_lifecycle: boolean;
+  finance_enabled: boolean;
+  open_tasks: JournalStatusTask[];
+  active_goals: JournalStatusGoal[];
+  obligations: JournalObligation[];
+}
+
+// ── Prepaid credit ─────────────────────────────────────────────────────────
+export interface CreditPack {
+  id: string;
+  label: string;
+  price_display: string; // what the user pays, e.g. "$6.00"
+  credit_display: string; // usable credit granted, e.g. "$5"
+}
+
+export interface CreditLedgerEntry {
+  kind: "grant" | "debit" | "reversal" | "adjustment";
+  amount: string; // signed USD
+  description: string;
+  created_at: string;
+}
+
+export interface CreditsResponse {
+  purchased_credit: string; // remaining prepaid balance (USD)
+  included_budget: string; // monthly included allowance cap (USD)
+  included_used: string; // included allowance spent this month (USD)
+  included_remaining: string | null; // null = unlimited
+  packs: CreditPack[];
+  recent_entries: CreditLedgerEntry[];
+}
+
+// ── Neighborhood (Friends) ───────────────────────────────────────────────────
+// Addressed only by friendship_id — the backend never returns a neighbor's
+// tenant_id (see apps/friends/views.py _wave_result / list_neighborhood).
+export type NeighborStatus = "pending" | "accepted" | "declined" | "blocked" | "revoked";
+
+export interface NeighborProfile {
+  handle: string;
+  display_name: string;
+  bio: string;
+  avatar_hue: number; // 0-359
+}
+
+export interface Neighbor {
+  friendship_id: string;
+  display_name: string;
+  handle: string;
+  avatar_hue: number;
+  status: NeighborStatus;
+  since: string;
+}
+
+export interface PendingWave {
+  friendship_id: string;
+  display_name: string;
+  handle: string;
+  avatar_hue: number;
+  note: string;
+  created_at: string;
+}
+
+export interface NeighborhoodData {
+  profile: NeighborProfile | null;
+  neighbors: Neighbor[];
+  pending_incoming: PendingWave[];
+  pending_outgoing: PendingWave[];
+}
+
+// Response shape shared by the accept/decline/block and unfriend endpoints.
+export interface FriendshipStatusResult {
+  friendship_id: string;
+  status: NeighborStatus;
+}
+
+// POST /api/v1/friends/waves/ response — the other party's public profile +
+// the resulting edge status (200 if it resolved an existing edge, e.g. waving
+// back accepts immediately; 201 if a new pending wave was created).
+export interface WaveResult {
+  friendship_id: string;
+  status: NeighborStatus;
+  display_name: string;
+  handle: string;
+  avatar_hue: number;
+}
+
+export interface FriendInvite {
+  token: string;
+  url: string;
+  expires_at: string;
+  max_uses: number;
+  uses: number;
+}
+
+// ── Neighborhood shares (PR2) ────────────────────────────────────────────────
+// The propose → scrub → preview → approve → publish pipeline. Every share is
+// addressed by friendship_id + lesson id (see the header note above) — never
+// a raw tenant id. Since PR7, the audience can ALSO be a circle: friendship_id
+// is null and audience is null for a circle-targeted share (the backend's
+// pending-shares list doesn't yet surface a circle_id — see CircleDetail
+// below; `circle_id` is typed here so the frontend lights up the moment it
+// does, with zero further changes).
+export interface PendingShare {
+  id: string;
+  lesson_id: number;
+  lesson_preview: string;
+  proposed_by: string;
+  friendship_id: string | null;
+  circle_id?: string | null;
+  audience: string | null;
+  created_at: string;
+}
+
+// What the neighbor will actually see, already redacted. `residuals_banner`
+// is the exact caution copy the backend wants shown next to it — always
+// render this value rather than hardcoding the copy here, so wording changes
+// server-side don't need a frontend redeploy.
+export interface SharePreview {
+  redacted_text: string;
+  redacted_context: string;
+  audience: string;
+  residuals_banner: string;
+}
+
+// ── Wormholes & warp (PR3) ────────────────────────────────────────────────────
+// A wormhole gate = one accepted neighbor with ≥1 spark shared to me. Placement
+// is deterministic client-side from a stable hash of friendship_id (never stored
+// server-side). `new_since_last_visit` drives the "new" glow + chime.
+export interface Wormhole {
+  friendship_id: string;
+  display_name: string;
+  handle: string | null;
+  avatar_hue: number; // 0-359 — tints the gate + the friend galaxy
+  spark_count: number;
+  new_since_last_visit: number;
+}
+
+// A star in a neighbor's SHARED constellation. Distinct from GalaxyStar: the id
+// is a NAMESPACED string (`f:<friendship_id>:<shared_lesson_id>`), it carries no
+// game state / journal / tutoring fields, and the raw shared_lesson_id is
+// surfaced so "bring it home" can POST adopt without re-parsing the id.
+export interface FriendStar {
+  id: string;
+  shared_lesson_id: string;
+  text: string;
+  tags: string[];
+  cluster_id: number | null;
+  cluster_label: string;
+  star_stage: "proto" | "ignited" | "radiant" | "supernova";
+  x: number | null;
+  y: number | null;
+}
+
+export interface FriendGalaxyData {
+  stars: FriendStar[];
+  edges: never[]; // omitted for MVP (one less leak surface)
+  clusters: { id: number; label: string; count: number; tags: string[] }[];
+}
+
+// POST /api/v1/friends/shares/<id>/adopt/ — the souvenir lands as a PENDING
+// lesson in MY tenant. 201 on create, 200 on an idempotent repeat.
+export interface AdoptResult {
+  lesson_id: number;
+  status: string;
+  created: boolean;
+}
+
+// ── Absorbed items (PR4) ──────────────────────────────────────────────────
+// A neighbor's spark the tenant's assistant pulled into its own context
+// (e.g. via agent tooling). Surfaced for transparency + a manual purge.
+export interface AbsorbedItem {
+  id: string;
+  source_kind: string;
+  source_id: string;
+  from_handle: string | null;
+  label: string;
+  absorbed_at: string;
+}
+
+// ── Friend chat (PR5) ──────────────────────────────────────────────────────
+// 1:1 threads between accepted neighbors, addressed by thread_id — never a
+// raw tenant_id. See apps/friends/views.py chat endpoints.
+export interface ChatThread {
+  thread_id: string;
+  friendship_id: string | null;
+  display_name: string;
+  handle: string | null;
+  avatar_hue: number;
+  unread: number;
+  last_message: string;
+  last_message_at: string | null;
+  muted: boolean;
+  agent_absorb_enabled: boolean;
+}
+
+export interface ChatMessage {
+  public_id: string;
+  seq: number;
+  text: string;
+  mine: boolean;
+  created_at: string;
+}
+
+export interface ChatPage {
+  messages: ChatMessage[];
+  next_cursor: string | null;
+}
+
+// ── Missions (PR6) ────────────────────────────────────────────────────────
+// Shared goals between accepted neighbors — product name "Mission" (design
+// §2.9). The crew projection is built entirely from control-plane data (never
+// a cross-tenant Task scan); each member's own contribution stays a LOCAL
+// journal.Task on their side. See apps/friends/projection.py.
+export type MissionStatus = "active" | "achieved" | "abandoned" | "expired";
+
+// {metric, unit, cadence, value} — every field optional; a mission can be
+// created with no target at all (a plain "show up together" mission).
+export interface MissionTarget {
+  metric?: string;
+  unit?: string;
+  cadence?: "daily" | "weekly" | string;
+  value?: number;
+}
+
+export interface MissionSummary {
+  mission_id: string;
+  title: string;
+  status: MissionStatus;
+  target: MissionTarget;
+  target_date: string | null;
+  my_commitment: string;
+  version: number;
+}
+
+// One row in a mission's crew projection — handle is null if that member
+// never set a NeighborProfile handle. `showed_up`/`window_days` is the
+// filled-proportion the progress bar renders (window_days is 7 for a daily
+// cadence mission, 28 for weekly — see projection.py).
+export interface MissionMember {
+  handle: string | null;
+  showed_up: number;
+  window_days: number;
+  streak: number;
+  last_activity: string | null;
+  next_step: string | null;
+  commitment: string;
+  is_creator: boolean;
+}
+
+export interface MissionDetail {
+  mission_id: string;
+  title: string;
+  status: MissionStatus;
+  cadence: string;
+  window_days: number;
+  target: MissionTarget;
+  members: MissionMember[];
+  overall_pct: number;
+  description: string;
+  version: number;
+  my_commitment: string;
+  my_role: "owner" | "member";
+}
+
+// An agent-proposed Mission task for the tenant's OWN human (design §2.10) —
+// approving mints the member's own local journal.Task; the agent never writes
+// another human's task.
+export interface PendingGoalAction {
+  id: string;
+  mission_id: string;
+  mission_title: string;
+  suggested: {
+    title: string;
+    description: string;
+    due_date: string | null;
+  };
+  created_at: string;
+}
+
+// ── Circles (PR7) ────────────────────────────────────────────────────────
+// A named group of accepted neighbors, built ON edges (design §2.11): you
+// join only via invite code or by being waved in by a member you're already
+// neighbors with. See apps/friends/circles.py.
+export type CircleRole = "admin" | "member";
+
+export interface CircleSummary {
+  circle_id: string;
+  name: string;
+  hue: number; // 0-359
+  member_count: number;
+  my_role: CircleRole;
+  // Only populated when my_role === "admin" — null for a plain member.
+  invite_code: string | null;
+}
+
+export interface CircleMember {
+  handle: string | null;
+  display_name: string;
+  avatar_hue: number;
+  role: CircleRole;
+  is_me: boolean;
+}
+
+export interface CircleDetail {
+  circle_id: string;
+  name: string;
+  description: string;
+  hue: number;
+  members: CircleMember[];
+  my_role: CircleRole;
+  // Drives the SAME 1:1 Messages pane, keyed by this id — never a second
+  // chat implementation. Null only if the circle's thread somehow didn't
+  // get created (shouldn't happen via create_circle, but the backend can
+  // still return null — see apps/friends/circles.py get_circle_detail).
+  thread_id: string | null;
+  invite_code: string | null;
+}
+
+export interface CircleJoinResult {
+  circle_id: string;
+  status: string;
+}
+
+export interface CircleLeaveResult {
+  circle_id: string;
+  status: string;
+  purged: boolean;
+}

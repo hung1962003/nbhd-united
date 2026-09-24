@@ -1,0 +1,33 @@
+"""Backfill onboarding_complete=True for existing active tenants.
+
+Prevents existing users from being funneled through onboarding again.
+"""
+
+from django.db import migrations
+
+
+def backfill_onboarding(apps, schema_editor):
+    Tenant = apps.get_model("tenants", "Tenant")
+    # Mark existing active tenants as "complete" with step=0.
+    # The re-introduction logic detects onboarding_complete=True + step=0
+    # with default profile data and triggers a friendly re-intro flow.
+    updated = Tenant.objects.filter(
+        status="active",
+        onboarding_complete=False,
+    ).update(onboarding_complete=True, onboarding_step=5)
+    if updated:
+        print(f"\n  Backfilled onboarding_complete=True for {updated} active tenants")
+
+
+def reverse_backfill(apps, schema_editor):
+    pass  # No meaningful reverse
+
+
+class Migration(migrations.Migration):
+    dependencies = [
+        ("tenants", "0014_onboarding_fields"),
+    ]
+
+    operations = [
+        migrations.RunPython(backfill_onboarding, reverse_backfill),
+    ]

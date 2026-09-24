@@ -1,0 +1,36 @@
+{
+  "id": "nbhd-insights-tools",
+  "name": "NBHD Insights Tools",
+  "description": "Trajectory + memory-of-insights + graduated-voice tools for the assistant baseline. Phase 1 read tools: history / snapshot / compare. Phase 2 baseline + write-side: baseline / list / record / confirm / refute. Phase 3 graduated voice: signals / voice_pref_set / voice_pref_list. Phase 1 supports pillar=gravity only.",
+  "contracts": {
+    "tools": [
+      "nbhd_insights_history",
+      "nbhd_insights_snapshot",
+      "nbhd_insights_compare",
+      "nbhd_insights_baseline",
+      "nbhd_insights_list",
+      "nbhd_insights_record",
+      "nbhd_insights_confirm",
+      "nbhd_insights_refute",
+      "nbhd_insights_signals",
+      "nbhd_insights_voice_pref_set",
+      "nbhd_insights_voice_pref_list"
+    ]
+  },
+  "configSchema": {
+    "type": "object",
+    "additionalProperties": false,
+    "properties": {
+      "apiBaseUrl": {
+        "type": "string",
+        "description": "Override NBHD API base URL. Defaults to NBHD_API_BASE_URL env var."
+      },
+      "requestTimeoutMs": {
+        "type": "number",
+        "minimum": 1000,
+        "maximum": 60000,
+        "description": "HTTP timeout for NBHD runtime endpoint requests."
+      }
+    }
+  }
+}

@@ -1,0 +1,130 @@
+from django.urls import path
+
+from .document_views import (
+    DocumentAppendView,
+    DocumentClearView,
+    DocumentDetailView,
+    DocumentListCreateView,
+    SidebarTreeView,
+    TodayView,
+)
+from .extraction_views import NightlyExtractionView
+from .lifecycle_views import (
+    GoalAbandonView,
+    GoalAchieveView,
+    GoalDetailView,
+    GoalListCreateView,
+    TaskCompleteView,
+    TaskDetailView,
+    TaskListCreateView,
+    TaskReopenView,
+)
+from .purpose_views import (
+    PurposeDetailView,
+    PurposeListCreateView,
+)
+from .query_views import JournalQueryView
+from .runtime_purpose_views import (
+    RuntimePurposeConfirmView,
+    RuntimePurposeLinkGoalView,
+    RuntimePurposeListView,
+    RuntimePurposeProposeView,
+    RuntimePurposeRetireView,
+    RuntimePurposeUpdateView,
+)
+from .status_views import JournalStatusView
+from .views import (
+    DailyNoteEntryDetailView,
+    DailyNoteEntryListView,
+    DailyNoteSectionView,
+    DailyNoteTemplateView,
+    DailyNoteView,
+    ExtractionApproveView,
+    ExtractionDismissView,
+    JournalEntryDetailView,
+    JournalEntryListCreateView,
+    MemoryView,
+    TemplateDetailView,
+    TemplateListCreateView,
+    WeeklyReviewDetailView,
+    WeeklyReviewListCreateView,
+)
+
+urlpatterns = [
+    # ── v2 Document API ──────────────────────────────────────────────────
+    path("documents/", DocumentListCreateView.as_view(), name="document-list-create"),
+    path("documents/<str:kind>/<path:slug>/append/", DocumentAppendView.as_view(), name="document-append"),
+    path("documents/<str:kind>/<path:slug>/clear/", DocumentClearView.as_view(), name="document-clear"),
+    path("documents/<str:kind>/<path:slug>/", DocumentDetailView.as_view(), name="document-detail"),
+    path("today/", TodayView.as_view(), name="today"),
+    path("tree/", SidebarTreeView.as_view(), name="sidebar-tree"),
+    path("status/", JournalStatusView.as_view(), name="journal-status"),
+    # ── Typed lifecycle reads/writes (session-auth; companion to runtime CRUD) ──
+    path("tasks/", TaskListCreateView.as_view(), name="task-list-create"),
+    path("tasks/<uuid:task_id>/", TaskDetailView.as_view(), name="task-detail"),
+    path("tasks/<uuid:task_id>/complete/", TaskCompleteView.as_view(), name="task-complete"),
+    path("tasks/<uuid:task_id>/reopen/", TaskReopenView.as_view(), name="task-reopen"),
+    path("goals/", GoalListCreateView.as_view(), name="goal-list-create"),
+    path("goals/<uuid:goal_id>/", GoalDetailView.as_view(), name="goal-detail"),
+    path("goals/<uuid:goal_id>/achieve/", GoalAchieveView.as_view(), name="goal-achieve"),
+    path("goals/<uuid:goal_id>/abandon/", GoalAbandonView.as_view(), name="goal-abandon"),
+    # ── North Star (Purpose) — session-auth console reads/writes ─────────
+    path("purposes/", PurposeListCreateView.as_view(), name="purpose-list-create"),
+    path("purposes/<uuid:purpose_id>/", PurposeDetailView.as_view(), name="purpose-detail"),
+    # ── Legacy endpoints (kept for backward compatibility) ───────────────
+    path("", JournalEntryListCreateView.as_view(), name="journal-list-create"),
+    path("<uuid:entry_id>/", JournalEntryDetailView.as_view(), name="journal-detail"),
+    path("daily/<str:date>/", DailyNoteView.as_view(), name="daily-note"),
+    path("daily/<str:date>/template/", DailyNoteTemplateView.as_view(), name="daily-note-template"),
+    path("daily/<str:date>/sections/<str:slug>/", DailyNoteSectionView.as_view(), name="daily-note-section"),
+    path("daily/<str:date>/entries/", DailyNoteEntryListView.as_view(), name="daily-note-entries"),
+    path("daily/<str:date>/entries/<int:index>/", DailyNoteEntryDetailView.as_view(), name="daily-note-entry-detail"),
+    path("memory/", MemoryView.as_view(), name="memory"),
+    path("templates/", TemplateListCreateView.as_view(), name="template-list-create"),
+    path("templates/<str:template_id>/", TemplateDetailView.as_view(), name="template-detail"),
+    path("reviews/", WeeklyReviewListCreateView.as_view(), name="weekly-review-list-create"),
+    path("reviews/<uuid:review_id>/", WeeklyReviewDetailView.as_view(), name="weekly-review-detail"),
+    # Nightly extraction — called by QStash tenant cron
+    path("extract/", NightlyExtractionView.as_view(), name="nightly-extract"),
+    # Extraction approval (web)
+    path("extractions/<uuid:extraction_id>/approve/", ExtractionApproveView.as_view(), name="extraction-approve"),
+    path("extractions/<uuid:extraction_id>/dismiss/", ExtractionDismissView.as_view(), name="extraction-dismiss"),
+    # Runtime — parameterized query (OC plugin, internal auth). Add-don't-replace
+    # companion to the legacy journal-runtime endpoints in apps.integrations.
+    path(
+        "runtime/<uuid:tenant_id>/query/",
+        JournalQueryView.as_view(),
+        name="runtime-journal-query",
+    ),
+    # ── North Star (Purpose) — internal-auth runtime endpoints (OC plugin) ──
+    path(
+        "runtime/<uuid:tenant_id>/purposes/",
+        RuntimePurposeListView.as_view(),
+        name="runtime-purpose-list",
+    ),
+    path(
+        "runtime/<uuid:tenant_id>/purposes/propose/",
+        RuntimePurposeProposeView.as_view(),
+        name="runtime-purpose-propose",
+    ),
+    path(
+        "runtime/<uuid:tenant_id>/purposes/<uuid:purpose_id>/",
+        RuntimePurposeUpdateView.as_view(),
+        name="runtime-purpose-update",
+    ),
+    path(
+        "runtime/<uuid:tenant_id>/purposes/<uuid:purpose_id>/confirm/",
+        RuntimePurposeConfirmView.as_view(),
+        name="runtime-purpose-confirm",
+    ),
+    path(
+        "runtime/<uuid:tenant_id>/purposes/<uuid:purpose_id>/retire/",
+        RuntimePurposeRetireView.as_view(),
+        name="runtime-purpose-retire",
+    ),
+    path(
+        "runtime/<uuid:tenant_id>/purposes/<uuid:purpose_id>/link-goal/",
+        RuntimePurposeLinkGoalView.as_view(),
+        name="runtime-purpose-link-goal",
+    ),
+]

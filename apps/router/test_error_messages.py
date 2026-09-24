@@ -1,0 +1,116 @@
+"""Tests for the ``strip_internal_framing`` scrubber.
+
+The chat pipeline prepends bracket-framed agent-context markers like
+``[Now: …]``, ``[chat: …]``, ``[System: just updated…]``,
+``[User tapped button: …]`` to outbound payloads. When a delivery fails
+three times and we apologize, the quoted excerpt must NOT echo this
+internal framing back to the user. Every call site should pass
+``raw_user_text`` so ``PendingMessage.user_text`` is already clean — but
+the scrubber is wired into both apology builders (router + orchestrator)
+as defense in depth.
+"""
+
+from __future__ import annotations
+
+from django.test import TestCase
+
+from apps.router.error_messages import ERROR_MESSAGES, error_msg, strip_internal_framing
+
+
+class StripInternalFramingTest(TestCase):
+    def test_returns_empty_unchanged(self):
+        self.assertEqual(strip_internal_framing(""), "")
+
+    def test_returns_plain_text_unchanged(self):
+        self.assertEqual(strip_internal_framing("hello there"), "hello there")
+
+    def test_strips_system_just_updated(self):
+        framed = "[System: just updated. User's message from before the update:]\nthanks. i'll read through these"
+        self.assertEqual(strip_internal_framing(framed), "thanks. i'll read through these")
+
+    def test_strips_system_restarting(self):
+        framed = "[System: assistant was restarting when this arrived. User's message:]\nactual user words"
+        self.assertEqual(strip_internal_framing(framed), "actual user words")
+
+    def test_strips_now_marker(self):
+        framed = "[Now: 2026-05-27 22:46 JST (Tuesday)]\nhi"
+        self.assertEqual(strip_internal_framing(framed), "hi")
+
+    def test_strips_chat_marker(self):
+        framed = "[chat: user is mid-conversation, reply concisely]\nquick q for you"
+        self.assertEqual(strip_internal_framing(framed), "quick q for you")
+
+    def test_strips_button_tap_marker(self):
+        framed = '[User tapped button: "Yes, schedule it"]'
+        self.assertEqual(strip_internal_framing(framed), "")
+
+    def test_strips_photo_attached_marker(self):
+        framed = "[Photo attached: /workspaces/abc/photo.jpg]\nwhat is this?"
+        self.assertEqual(strip_internal_framing(framed), "what is this?")
+
+    def test_strips_document_attached_marker(self):
+        framed = "[Document attached: /workspaces/abc/doc.pdf]\nwhat is this?"
+        self.assertEqual(strip_internal_framing(framed), "what is this?")
+
+    def test_strips_hardened_attachment_marker_in_one_match(self):
+        # The untrusted-content marker (apps.router.inbound_media.attachment_marker)
+        # is deliberately a single bracket pair with no nested ``]``, so the
+        # whole thing — including its untrusted-data preamble — must still
+        # peel off in one regex match, not just the bare "[Document attached:
+        # <path>]" prefix.
+        from apps.router.inbound_media import attachment_marker
+
+        framed = f"{attachment_marker('document', '/workspaces/abc/doc.pdf')}what is this?"
+        self.assertEqual(strip_internal_framing(framed), "what is this?")
+
+    def test_strips_stacked_markers(self):
+        framed = "[Now: 2026-05-27 22:46 JST]\n[chat: user is mid-conversation]\nactual question"
+        self.assertEqual(strip_internal_framing(framed), "actual question")
+
+    def test_strips_stacked_now_then_system(self):
+        framed = "[Now: 2026-05-27 22:46 JST]\n[System: just updated. User's message from before the update:]\nthe real message"
+        self.assertEqual(strip_internal_framing(framed), "the real message")
+
+    def test_leaves_user_bracket_text_alone(self):
+        # If the user legitimately starts their message with a non-allowlisted
+        # bracket, leave it intact — only known internal tags get stripped.
+        self.assertEqual(strip_internal_framing("[TODO] write tests"), "[TODO] write tests")
+        self.assertEqual(strip_internal_framing("[draft] hello"), "[draft] hello")
+
+    def test_case_insensitive_tag(self):
+        framed = "[system: just updated. user's message:]\nhi"
+        self.assertEqual(strip_internal_framing(framed), "hi")
+
+    def test_does_not_strip_marker_in_middle(self):
+        # Scrubber is anchored to the start. Mid-text marker stays.
+        self.assertEqual(
+            strip_internal_framing("hello [Now: 22:46]"),
+            "hello [Now: 22:46]",
+        )
+
+    def test_preserves_internal_newlines_in_user_text(self):
+        framed = "[System: just updated. User's message from before the update:]\nline one\n\nline two"
+        self.assertEqual(strip_internal_framing(framed), "line one\n\nline two")
+
+
+class BudgetExhaustedTopUpTest(TestCase):
+    """The budget-exhausted messages must surface the prepaid-credit top-up
+    (recovery affordance at the point of failure) in every language — trial
+    and paid tenants alike can top up (CreditCheckoutView has no trial gate)."""
+
+    KEYS = ("budget_exhausted_trial", "budget_exhausted_paid")
+
+    def test_english_mentions_prepaid_credit_and_billing_url(self):
+        for key in self.KEYS:
+            rendered = error_msg("en", key, plus_message="", billing_url="https://app.example/billing")
+            self.assertIn("prepaid credit", rendered)
+            self.assertIn("Billing page", rendered)
+            self.assertIn("https://app.example/billing", rendered)
+
+    def test_every_language_renders_without_leftover_placeholder(self):
+        for lang in ERROR_MESSAGES:
+            for key in self.KEYS:
+                rendered = error_msg(lang, key, plus_message="", billing_url="https://app.example/billing")
+                self.assertNotIn("{", rendered, f"{lang}/{key} left an unrendered placeholder")
+                self.assertNotIn("}", rendered, f"{lang}/{key} left an unrendered placeholder")
+                self.assertIn("https://app.example/billing", rendered)

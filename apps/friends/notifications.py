@@ -1,0 +1,304 @@
+"""Platform-agnostic wave (friend-request) notifications.
+
+Mirrors :mod:`apps.lessons.notifications`: when a wave arrives, send the
+ADDRESSEE inline accept/decline buttons on their preferred channel (Telegram or
+LINE), reusing the exact ``friend:<action>:<id>`` callback-data contract the
+router callbacks parse. Fully defensive — a notification failure must never
+break the wave that was already persisted. iOS-first users with no linked
+channel simply see the wave in the console.
+"""
+
+from __future__ import annotations
+
+import logging
+
+from django.conf import settings
+
+from apps.common.eval_sink import suppresses_real_transport
+from apps.tenants.models import Tenant
+
+from .models import Friendship, NeighborProfile
+
+logger = logging.getLogger(__name__)
+
+TELEGRAM_API_BASE = "https://api.telegram.org/bot"
+LINE_PUSH_URL = "https://api.line.me/v2/bot/message/push"
+
+
+def _waver_name(friendship: Friendship) -> str:
+    profile = NeighborProfile.objects.filter(tenant=friendship.requester_id).first()
+    if profile is not None:
+        return profile.display_name
+    return getattr(friendship.requester.user, "display_name", None) or "A neighbor"
+
+
+# ---------------------------------------------------------------------------
+# Telegram
+# ---------------------------------------------------------------------------
+
+
+def _send_telegram_wave(tenant: Tenant, friendship: Friendship) -> bool:
+    if suppresses_real_transport(tenant):
+        return False
+
+    import httpx
+
+    bot_token = getattr(settings, "TELEGRAM_BOT_TOKEN", "").strip()
+    if not bot_token:
+        return False
+    chat_id = tenant.user.telegram_chat_id
+    if not chat_id:
+        return False
+
+    name = _waver_name(friendship)
+    note = (friendship.invite_note or "").strip()
+    text = f"\U0001f44b <b>{name}</b> waved — want to be neighbors?"
+    if note:
+        text += f"\n\n“{note}”"
+    keyboard = {
+        "inline_keyboard": [
+            [
+                {"text": "\U0001f44b Wave back", "callback_data": f"friend:accept:{friendship.id}"},
+                {"text": "✕ Not now", "callback_data": f"friend:decline:{friendship.id}"},
+            ]
+        ]
+    }
+    try:
+        resp = httpx.post(
+            f"{TELEGRAM_API_BASE}{bot_token}/sendMessage",
+            json={"chat_id": chat_id, "text": text, "parse_mode": "HTML", "reply_markup": keyboard},
+            timeout=10,
+        )
+        if resp.status_code == 200:
+            return True
+        resp2 = httpx.post(
+            f"{TELEGRAM_API_BASE}{bot_token}/sendMessage",
+            json={"chat_id": chat_id, "text": f"{name} waved — want to be neighbors?", "reply_markup": keyboard},
+            timeout=10,
+        )
+        return resp2.status_code == 200
+    except Exception:
+        logger.exception("Failed to send wave notification via Telegram for tenant %s", tenant.id)
+        return False
+
+
+# ---------------------------------------------------------------------------
+# LINE
+# ---------------------------------------------------------------------------
+
+
+def _send_line_wave(tenant: Tenant, friendship: Friendship) -> bool:
+    if suppresses_real_transport(tenant):
+        return False
+
+    import httpx
+
+    channel_token = getattr(settings, "LINE_CHANNEL_ACCESS_TOKEN", "").strip()
+    if not channel_token:
+        return False
+    line_user_id = tenant.user.line_user_id
+    if not line_user_id:
+        return False
+
+    name = _waver_name(friendship)
+    note = (friendship.invite_note or "").strip()
+    contents = [{"type": "text", "text": f"\U0001f44b {name} waved", "weight": "bold", "size": "md"}]
+    if note:
+        contents.append({"type": "text", "text": note, "wrap": True, "margin": "md"})
+    contents.append({"type": "text", "text": "Want to be neighbors?", "wrap": True, "margin": "md"})
+    flex_content = {
+        "type": "bubble",
+        "body": {"type": "box", "layout": "vertical", "contents": contents},
+        "footer": {
+            "type": "box",
+            "layout": "horizontal",
+            "spacing": "sm",
+            "contents": [
+                {
+                    "type": "button",
+                    "style": "primary",
+                    "color": "#0D9488",
+                    "action": {
+                        "type": "postback",
+                        "label": "\U0001f44b Wave back",
+                        "data": f"friend:accept:{friendship.id}",
+                    },
+                },
+                {
+                    "type": "button",
+                    "style": "secondary",
+                    "action": {
+                        "type": "postback",
+                        "label": "✕ Not now",
+                        "data": f"friend:decline:{friendship.id}",
+                    },
+                },
+            ],
+        },
+    }
+    try:
+        resp = httpx.post(
+            LINE_PUSH_URL,
+            json={
+                "to": line_user_id,
+                "messages": [
+                    {"type": "flex", "altText": f"{name} waved — want to be neighbors?", "contents": flex_content}
+                ],
+            },
+            headers={"Authorization": f"Bearer {channel_token}", "Content-Type": "application/json"},
+            timeout=10,
+        )
+        if resp.status_code != 200:
+            logger.warning("LINE wave push failed (%s): %s", resp.status_code, resp.text[:300])
+        return resp.status_code == 200
+    except Exception:
+        logger.exception("Failed to send wave notification via LINE for tenant %s", tenant.id)
+        return False
+
+
+# ---------------------------------------------------------------------------
+# Platform dispatcher
+# ---------------------------------------------------------------------------
+
+_SENDERS = {"telegram": _send_telegram_wave, "line": _send_line_wave}
+
+
+def notify_wave_received(friendship: Friendship) -> bool:
+    """Notify the addressee of a pending wave on their preferred channel, with
+    fallback. Returns True if any channel accepted it. Never raises."""
+    try:
+        addressee = friendship.addressee
+        if friendship.status != Friendship.Status.PENDING:
+            return False
+        preferred = getattr(addressee.user, "preferred_channel", "") or "telegram"
+        fallback = "line" if preferred == "telegram" else "telegram"
+        for channel in (preferred, fallback):
+            sender = _SENDERS.get(channel)
+            if sender and sender(addressee, friendship):
+                return True
+        return False
+    except Exception:
+        logger.exception("notify_wave_received failed for friendship %s", getattr(friendship, "id", "?"))
+        return False
+
+
+# ---------------------------------------------------------------------------
+# Friend chat push (APNs wake nudge; poll is truth)
+# ---------------------------------------------------------------------------
+
+
+def _deliver_friend_push(message) -> None:
+    """Synchronous core (tests call this directly). One push per message via an
+    atomic notified_at claim; skips muted memberships; no-op when APNs is
+    unconfigured. Never raises."""
+    try:
+        from apps.common.apns import apns_configured
+
+        if not apns_configured():
+            return
+        from apps.router.push_views import _push_to_user_devices
+
+        from . import access
+        from .models import FriendThreadMembership
+
+        # Runs off the request thread (no tenant GUC); mark service-role so the
+        # FORCE-RLS claim/update on friend_messages isn't hidden by the policy.
+        with access.backstop_service_context():
+            if not access.claim_message_notified(message):
+                return  # a re-drain lost the claim — already pushed
+            # PR10: a blocked counterpart of the sender gets no push (quiet, both
+            # ways — they also don't see the message in-feed).
+            skip_ids = access.blocked_counterpart_ids(message.sender_tenant_id) | {message.sender_tenant_id}
+            recipients = list(
+                FriendThreadMembership.objects.filter(thread_id=message.thread_id, left_at__isnull=True, muted=False)
+                .exclude(tenant_id__in=skip_ids)
+                .select_related("user")
+            )
+            sender = NeighborProfile.objects.filter(tenant_id=message.sender_tenant_id).first()
+        name = sender.display_name if sender else "A neighbor"
+        for membership in recipients:
+            _push_to_user_devices(
+                membership.user,
+                body=f"New message from {name}",
+                thread_id=str(message.thread_id),
+                collapse_id=f"friend-{message.thread_id}",
+                content_available=True,
+                # Typed routing (design §6.2): iOS routes by `type` + the id.
+                extra={"type": "friend_message", "thread_id": str(message.thread_id)},
+            )
+    except Exception:
+        logger.exception("friend push failed for message %s", getattr(message, "seq", "?"))
+
+
+def notify_friend_message(message) -> None:
+    """Dispatch the friend-chat push OFF the request thread (never block the send
+    on APNs). Defensive; the recipient's ``?since=`` poll is the source of truth."""
+    import threading
+
+    from django.db import transaction
+
+    def _run():
+        _deliver_friend_push(message)
+
+    if getattr(settings, "NBHD_DISABLE_BACKGROUND_THREADS", False):
+        transaction.on_commit(_run)
+    else:
+        transaction.on_commit(lambda: threading.Thread(target=_run, daemon=True).start())
+
+
+# ---------------------------------------------------------------------------
+# Typed APNs wakes for wave-received + share-proposal-ready (iOS moments dock).
+# The home BFF poll is truth; these are silent, typed nudges so the dock
+# refreshes and routes. content_available only (no alert) — a wave already
+# alerts on Telegram/LINE, and a share-proposal is a quiet backstage suggestion.
+# ---------------------------------------------------------------------------
+
+
+def _push_app_typed(user, *, ptype: str, extra_ids: dict, body: str = "", collapse_id: str | None = None) -> None:
+    """Best-effort typed APNs wake to a user's registered devices. No-op when APNs
+    is unconfigured or the user has no devices. Never raises."""
+    try:
+        from apps.common.apns import apns_configured
+
+        if not apns_configured():
+            return
+        from apps.router.push_views import _push_to_user_devices
+
+        _push_to_user_devices(
+            user,
+            body=body,
+            thread_id=None,
+            collapse_id=collapse_id,
+            content_available=True,
+            extra={"type": ptype, **extra_ids},
+        )
+    except Exception:
+        logger.exception("typed friends push (%s) failed", ptype)
+
+
+def notify_wave_app(friendship: Friendship) -> None:
+    """Silent typed wake to the addressee's app devices for a pending wave, so the
+    iOS moments dock surfaces the wave-to-answer. Additive to the Telegram/LINE
+    alert in :func:`notify_wave_received`."""
+    if friendship.status != Friendship.Status.PENDING:
+        return
+    _push_app_typed(
+        friendship.addressee.user,
+        ptype="wave",
+        extra_ids={"friendship_id": str(friendship.id)},
+        collapse_id=f"wave-{friendship.id}",
+    )
+
+
+def notify_share_proposal(pending_share) -> None:
+    """Silent typed wake to the human when their assistant proposes a share, so
+    the moments dock surfaces the approval decision (backstage → decision-moment).
+    Only for agent-proposed, pending shares."""
+    if getattr(pending_share, "proposed_by", "") != "agent":
+        return
+    _push_app_typed(
+        pending_share.tenant.user,
+        ptype="share_approval",
+        extra_ids={"pending_share_id": str(pending_share.id)},
+        collapse_id=f"share-{pending_share.id}",
+    )

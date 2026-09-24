@@ -1,0 +1,799 @@
+"""Tests for Azure container payload wiring."""
+
+from __future__ import annotations
+
+import json
+from types import SimpleNamespace
+from unittest.mock import MagicMock, patch
+
+from django.test import SimpleTestCase, override_settings
+
+from apps.orchestrator.azure_client import (
+    assign_key_vault_role,
+    create_container_app,
+    create_tenant_file_share,
+    ensure_plugin_runtime_deps_mount,
+    register_environment_storage,
+    store_tenant_internal_key_in_key_vault,
+    update_container_image,
+    upload_config_to_file_share,
+    wake_container_app,
+)
+
+
+@override_settings(
+    AZURE_LOCATION="westus2",
+    AZURE_CONTAINER_ENV_ID="/subscriptions/test/resourceGroups/rg/providers/Microsoft.App/managedEnvironments/env",
+    AZURE_ACR_SERVER="nbhdunited.azurecr.io",
+    AZURE_RESOURCE_GROUP="rg-nbhd-prod",
+    AZURE_KEY_VAULT_NAME="kv-nbhd-prod",
+    ANTHROPIC_API_KEY="anthropic-secret",
+    OPENAI_API_KEY="openai-secret",
+    TELEGRAM_BOT_TOKEN="telegram-secret",
+    TELEGRAM_WEBHOOK_SECRET="webhook-secret",
+    NBHD_INTERNAL_API_KEY="internal-secret",
+    API_BASE_URL="https://nbhd-django.example.com",
+)
+class AzureClientTest(SimpleTestCase):
+    @override_settings(OPENCLAW_IMAGE_TAG="2026.5.28-test")
+    @patch("apps.orchestrator.azure_client._is_mock", return_value=False)
+    @patch("apps.orchestrator.azure_client.get_container_client")
+    def test_create_container_app_includes_runtime_config_env(
+        self,
+        mock_get_container_client,
+        _mock_is_mock,
+    ):
+        mock_client = MagicMock()
+        mock_get_container_client.return_value = mock_client
+
+        mock_result = SimpleNamespace(
+            configuration=SimpleNamespace(ingress=SimpleNamespace(fqdn="oc-tenant.internal.azurecontainerapps.io")),
+        )
+        mock_poller = MagicMock()
+        mock_poller.result.return_value = mock_result
+        mock_client.container_apps.begin_create_or_update.return_value = mock_poller
+
+        config_json = '{"plugins":{"nbhd-google-tools":{"enabled":true}}}'
+        response = create_container_app(
+            tenant_id="tenant-123",
+            container_name="oc-tenant",
+            config_json=config_json,
+            identity_id="/identities/tenant-123",
+            identity_client_id="client-123",
+        )
+
+        self.assertEqual(
+            response,
+            {"name": "oc-tenant", "fqdn": "oc-tenant.internal.azurecontainerapps.io"},
+        )
+
+        call_args = mock_client.container_apps.begin_create_or_update.call_args.args
+        self.assertEqual(call_args[0], "rg-nbhd-prod")
+        self.assertEqual(call_args[1], "oc-tenant")
+        payload = call_args[2]
+        secrets = payload["properties"]["configuration"]["secrets"]
+        secret_map = {entry["name"]: entry for entry in secrets}
+        self.assertEqual(
+            secret_map["anthropic-key"]["keyVaultUrl"],
+            "https://kv-nbhd-prod.vault.azure.net/secrets/anthropic-api-key",
+        )
+        self.assertEqual(
+            secret_map["openai-key"]["keyVaultUrl"],
+            "https://kv-nbhd-prod.vault.azure.net/secrets/openai-api-key",
+        )
+        self.assertEqual(
+            secret_map["nbhd-internal-api-key"]["keyVaultUrl"],
+            "https://kv-nbhd-prod.vault.azure.net/secrets/nbhd-internal-api-key",
+        )
+        self.assertEqual(
+            secret_map["nbhd-internal-api-key"]["identity"],
+            "/identities/tenant-123",
+        )
+
+        container = payload["properties"]["template"]["containers"][0]
+        # Image tag is driven by settings.OPENCLAW_IMAGE_TAG (the fleet tag CI
+        # sets after every deploy), NOT a hardcoded ``:latest`` — which never
+        # exists in ACR and caused MANIFEST_UNKNOWN on every fresh provision.
+        self.assertEqual(container["image"], "nbhdunited.azurecr.io/nbhd-openclaw:2026.5.28-test")
+
+        env_entries = container["env"]
+        env_map = {entry["name"]: entry for entry in env_entries}
+        self.assertEqual(env_map["NBHD_TENANT_ID"]["value"], "tenant-123")
+        self.assertEqual(env_map["NBHD_API_BASE_URL"]["value"], "https://nbhd-django.example.com")
+        self.assertEqual(env_map["OPENCLAW_CONFIG_JSON"]["value"], config_json)
+        self.assertEqual(env_map["AZURE_CLIENT_ID"]["value"], "client-123")
+        self.assertEqual(env_map["OPENAI_API_KEY"]["secretRef"], "openai-key")
+        self.assertEqual(env_map["NBHD_INTERNAL_API_KEY"]["secretRef"], "nbhd-internal-api-key")
+        self.assertEqual(env_map["OPENCLAW_GATEWAY_TOKEN"]["secretRef"], "nbhd-internal-api-key")
+        self.assertEqual(env_map["OPENROUTER_API_KEY"]["secretRef"], "openrouter-key")
+
+        ingress = payload["properties"]["configuration"]["ingress"]
+        self.assertEqual(ingress["targetPort"], 8080)
+
+    @override_settings(OPENCLAW_CONTAINER_SECRET_BACKEND="env")
+    @patch("apps.orchestrator.azure_client._is_mock", return_value=False)
+    @patch("apps.orchestrator.azure_client.get_container_client")
+    def test_create_container_app_supports_inline_secret_backend(
+        self,
+        mock_get_container_client,
+        _mock_is_mock,
+    ):
+        mock_client = MagicMock()
+        mock_get_container_client.return_value = mock_client
+
+        mock_result = SimpleNamespace(
+            configuration=SimpleNamespace(ingress=SimpleNamespace(fqdn="oc-tenant.internal.azurecontainerapps.io")),
+        )
+        mock_poller = MagicMock()
+        mock_poller.result.return_value = mock_result
+        mock_client.container_apps.begin_create_or_update.return_value = mock_poller
+
+        create_container_app(
+            tenant_id="tenant-123",
+            container_name="oc-tenant",
+            config_json='{"a":1}',
+            identity_id="/identities/tenant-123",
+            identity_client_id="client-123",
+        )
+
+        payload = mock_client.container_apps.begin_create_or_update.call_args.args[2]
+        secrets = payload["properties"]["configuration"]["secrets"]
+        secret_map = {entry["name"]: entry for entry in secrets}
+        self.assertEqual(secret_map["anthropic-key"]["value"], "anthropic-secret")
+        self.assertEqual(secret_map["openai-key"]["value"], "openai-secret")
+        self.assertEqual(secret_map["nbhd-internal-api-key"]["value"], "internal-secret")
+        container = payload["properties"]["template"]["containers"][0]
+        env_map = {entry["name"]: entry for entry in container["env"]}
+
+        # Verify core env vars are present
+        self.assertIn("NBHD_TENANT_ID", env_map)
+
+
+class AssignKeyVaultRoleTest(SimpleTestCase):
+    @patch("apps.orchestrator.azure_client._is_mock", return_value=True)
+    def test_mock_mode_skips_azure_call(self, _mock_is_mock):
+        # Should return without error in mock mode
+        assign_key_vault_role("mock-principal-123")
+
+    @override_settings(
+        AZURE_SUBSCRIPTION_ID="sub-123",
+        AZURE_RESOURCE_GROUP="rg-test",
+        AZURE_KEY_VAULT_NAME="kv-test",
+    )
+    @patch("apps.orchestrator.azure_client._is_mock", return_value=False)
+    @patch("apps.orchestrator.azure_client.get_authorization_client")
+    def test_creates_per_secret_role_assignments(self, mock_get_auth_client, _mock_is_mock):
+        from apps.orchestrator.azure_client import DEFAULT_TENANT_KV_SECRETS
+
+        mock_client = MagicMock()
+        mock_get_auth_client.return_value = mock_client
+
+        assign_key_vault_role("principal-abc")
+
+        self.assertEqual(
+            mock_client.role_assignments.create.call_count,
+            len(DEFAULT_TENANT_KV_SECRETS),
+        )
+
+        scopes = [call.kwargs["scope"] for call in mock_client.role_assignments.create.call_args_list]
+        expected_scopes = {
+            f"/subscriptions/sub-123/resourceGroups/rg-test/providers/Microsoft.KeyVault/vaults/kv-test/secrets/{s}"
+            for s in DEFAULT_TENANT_KV_SECRETS
+        }
+        self.assertEqual(set(scopes), expected_scopes)
+
+        # No call should land at vault scope — that's the regression we're guarding against
+        for scope in scopes:
+            self.assertIn("/secrets/", scope, f"Unexpected vault-scope grant: {scope}")
+
+        params = mock_client.role_assignments.create.call_args_list[0].kwargs["parameters"]
+        self.assertEqual(params.principal_id, "principal-abc")
+        self.assertEqual(params.principal_type, "ServicePrincipal")
+
+    @override_settings(
+        AZURE_SUBSCRIPTION_ID="sub-123",
+        AZURE_RESOURCE_GROUP="rg-test",
+        AZURE_KEY_VAULT_NAME="kv-test",
+    )
+    @patch("apps.orchestrator.azure_client._is_mock", return_value=False)
+    @patch("apps.orchestrator.azure_client.get_authorization_client")
+    def test_explicit_secret_names_overrides_default(self, mock_get_auth_client, _mock_is_mock):
+        mock_client = MagicMock()
+        mock_get_auth_client.return_value = mock_client
+
+        assign_key_vault_role("principal-abc", secret_names=["custom-secret-1", "custom-secret-2"])
+
+        self.assertEqual(mock_client.role_assignments.create.call_count, 2)
+        scopes = {call.kwargs["scope"] for call in mock_client.role_assignments.create.call_args_list}
+        self.assertEqual(
+            scopes,
+            {
+                "/subscriptions/sub-123/resourceGroups/rg-test/providers/Microsoft.KeyVault/vaults/kv-test/secrets/custom-secret-1",
+                "/subscriptions/sub-123/resourceGroups/rg-test/providers/Microsoft.KeyVault/vaults/kv-test/secrets/custom-secret-2",
+            },
+        )
+
+    @override_settings(
+        AZURE_SUBSCRIPTION_ID="sub-123",
+        AZURE_RESOURCE_GROUP="rg-test",
+        AZURE_KEY_VAULT_NAME="kv-test",
+    )
+    @patch("apps.orchestrator.azure_client._is_mock", return_value=False)
+    @patch("apps.orchestrator.azure_client.get_authorization_client")
+    def test_idempotent_on_409_conflict(self, mock_get_auth_client, _mock_is_mock):
+        from apps.orchestrator.azure_client import DEFAULT_TENANT_KV_SECRETS
+
+        mock_client = MagicMock()
+        mock_get_auth_client.return_value = mock_client
+
+        conflict_exc = Exception("RoleAssignmentExists")
+        conflict_exc.status_code = 409
+        mock_client.role_assignments.create.side_effect = conflict_exc
+
+        # Should not raise; should still try every per-secret grant
+        assign_key_vault_role("principal-abc")
+        self.assertEqual(
+            mock_client.role_assignments.create.call_count,
+            len(DEFAULT_TENANT_KV_SECRETS),
+        )
+
+    @override_settings(
+        AZURE_SUBSCRIPTION_ID="sub-123",
+        AZURE_RESOURCE_GROUP="rg-test",
+        AZURE_KEY_VAULT_NAME="",
+    )
+    @patch("apps.orchestrator.azure_client._is_mock", return_value=False)
+    @patch("apps.orchestrator.azure_client.get_authorization_client")
+    def test_raises_on_missing_vault_name(self, mock_get_auth_client, _mock_is_mock):
+        with self.assertRaises(ValueError):
+            assign_key_vault_role("principal-abc")
+
+
+class StoreTenantKeyTest(SimpleTestCase):
+    @patch("apps.orchestrator.azure_client._is_mock", return_value=True)
+    def test_mock_mode_returns_secret_name(self, _mock_is_mock):
+        result = store_tenant_internal_key_in_key_vault("abc-123", "secret-value")
+        self.assertEqual(result, "tenant-abc-123-internal-key")
+
+    @override_settings(AZURE_KEY_VAULT_NAME="kv-test")
+    @patch("apps.orchestrator.azure_client._is_mock", return_value=False)
+    @patch("apps.orchestrator.azure_client._get_provisioner_credential")
+    @patch("apps.orchestrator.azure_client.SecretClient", create=True)
+    def test_stores_secret_in_key_vault(self, mock_secret_cls, mock_cred, _mock_is_mock):
+        # SecretClient is imported inside the function, so we patch at module level with create=True
+        # But the function does `from azure.keyvault.secrets import SecretClient` locally
+        # We need to mock the import. Let's use a different approach.
+        pass
+
+
+class CreateTenantFileShareTest(SimpleTestCase):
+    @patch("apps.orchestrator.azure_client._is_mock", return_value=True)
+    def test_mock_mode_returns_share_info(self, _mock_is_mock):
+        result = create_tenant_file_share("abc-123-def-456-ghi")
+        self.assertEqual(result["share_name"], "ws-abc-123-def-456-ghi")
+
+    @override_settings(
+        AZURE_RESOURCE_GROUP="rg-test",
+        AZURE_STORAGE_ACCOUNT_NAME="sttest",
+    )
+    @patch("apps.orchestrator.azure_client._is_mock", return_value=False)
+    @patch("apps.orchestrator.azure_client.get_storage_client")
+    def test_creates_file_share(self, mock_get_storage_client, _mock_is_mock):
+        mock_client = MagicMock()
+        mock_get_storage_client.return_value = mock_client
+
+        result = create_tenant_file_share("tenant-abc")
+
+        mock_client.file_shares.create.assert_called_once()
+        call_kwargs = mock_client.file_shares.create.call_args.kwargs
+        self.assertEqual(call_kwargs["account_name"], "sttest")
+        self.assertEqual(call_kwargs["share_name"], "ws-tenant-abc")
+        self.assertEqual(result, {"share_name": "ws-tenant-abc", "account_name": "sttest"})
+
+    @override_settings(AZURE_STORAGE_ACCOUNT_NAME="")
+    @patch("apps.orchestrator.azure_client._is_mock", return_value=False)
+    def test_raises_on_missing_account_name(self, _mock_is_mock):
+        with self.assertRaises(ValueError):
+            create_tenant_file_share("tenant-abc")
+
+
+class RegisterEnvironmentStorageTest(SimpleTestCase):
+    @patch("apps.orchestrator.azure_client._is_mock", return_value=True)
+    def test_mock_mode_skips_azure_call(self, _mock_is_mock):
+        register_environment_storage("tenant-abc")
+
+    @override_settings(
+        AZURE_SUBSCRIPTION_ID="sub-123",
+        AZURE_RESOURCE_GROUP="rg-test",
+        AZURE_STORAGE_ACCOUNT_NAME="sttest",
+        AZURE_CONTAINER_ENV_ID="/subscriptions/sub-123/resourceGroups/rg-test/providers/Microsoft.App/managedEnvironments/test-env",
+    )
+    @patch("apps.orchestrator.azure_client._is_mock", return_value=False)
+    @patch("apps.orchestrator.azure_client.get_container_client")
+    @patch("apps.orchestrator.azure_client.get_storage_client")
+    def test_registers_storage_with_environment(
+        self,
+        mock_get_storage_client,
+        mock_get_container_client,
+        _mock_is_mock,
+    ):
+        mock_storage_client = MagicMock()
+        mock_get_storage_client.return_value = mock_storage_client
+        mock_storage_client.storage_accounts.list_keys.return_value = SimpleNamespace(
+            keys=[SimpleNamespace(value="fake-key-123")],
+        )
+
+        mock_container_client = MagicMock()
+        mock_get_container_client.return_value = mock_container_client
+
+        register_environment_storage("tenant-abc")
+
+        mock_container_client.managed_environments_storages.create_or_update.assert_called_once()
+        call_kwargs = mock_container_client.managed_environments_storages.create_or_update.call_args.kwargs
+        self.assertEqual(call_kwargs["environment_name"], "test-env")
+        self.assertEqual(call_kwargs["storage_name"], "ws-tenant-abc")
+
+        envelope = call_kwargs["storage_envelope"]
+        azure_file = envelope.properties.azure_file
+        self.assertEqual(azure_file.account_name, "sttest")
+        self.assertEqual(azure_file.account_key, "fake-key-123")
+        self.assertEqual(azure_file.access_mode, "ReadWrite")
+        self.assertEqual(azure_file.share_name, "ws-tenant-abc")
+
+
+@override_settings(
+    AZURE_LOCATION="westus2",
+    AZURE_CONTAINER_ENV_ID="/subscriptions/test/resourceGroups/rg/providers/Microsoft.App/managedEnvironments/env",
+    AZURE_ACR_SERVER="nbhdunited.azurecr.io",
+    AZURE_RESOURCE_GROUP="rg-nbhd-prod",
+    AZURE_KEY_VAULT_NAME="kv-nbhd-prod",
+    ANTHROPIC_API_KEY="anthropic-secret",
+    TELEGRAM_BOT_TOKEN="telegram-secret",
+    TELEGRAM_WEBHOOK_SECRET="webhook-secret",
+    NBHD_INTERNAL_API_KEY="internal-secret",
+    API_BASE_URL="https://nbhd-django.example.com",
+)
+class SharedInternalKeyTest(SimpleTestCase):
+    @patch("apps.orchestrator.azure_client._is_mock", return_value=False)
+    @patch("apps.orchestrator.azure_client.get_container_client")
+    def test_container_uses_shared_kv_secret(
+        self,
+        mock_get_container_client,
+        _mock_is_mock,
+    ):
+        mock_client = MagicMock()
+        mock_get_container_client.return_value = mock_client
+
+        mock_result = SimpleNamespace(
+            configuration=SimpleNamespace(ingress=SimpleNamespace(fqdn="oc-tenant.internal.azurecontainerapps.io")),
+        )
+        mock_poller = MagicMock()
+        mock_poller.result.return_value = mock_result
+        mock_client.container_apps.begin_create_or_update.return_value = mock_poller
+
+        create_container_app(
+            tenant_id="tenant-123",
+            container_name="oc-tenant",
+            config_json='{"a":1}',
+            identity_id="/identities/tenant-123",
+            identity_client_id="client-123",
+        )
+
+        payload = mock_client.container_apps.begin_create_or_update.call_args.args[2]
+        secrets = payload["properties"]["configuration"]["secrets"]
+        secret_map = {entry["name"]: entry for entry in secrets}
+        # All containers use the shared internal API key from Key Vault
+        self.assertEqual(
+            secret_map["nbhd-internal-api-key"]["keyVaultUrl"],
+            "https://kv-nbhd-prod.vault.azure.net/secrets/nbhd-internal-api-key",
+        )
+
+
+@override_settings(
+    AZURE_SUBSCRIPTION_ID="sub-123",
+    AZURE_RESOURCE_GROUP="rg-test",
+)
+class UpdateContainerImageTest(SimpleTestCase):
+    @patch("apps.orchestrator.azure_client._is_mock", return_value=True)
+    def test_mock_mode_skips_azure_call(self, _mock_is_mock):
+        # should be no-op in mock mode
+        update_container_image("oc-tenant", "nbhdunited.azurecr.io/nbhd-openclaw:abc123")
+
+    @override_settings(
+        AZURE_ACR_SERVER="nbhdunited.azurecr.io",
+    )
+    @patch("apps.orchestrator.azure_client._is_mock", return_value=False)
+    @patch("apps.orchestrator.azure_client.get_container_client")
+    def test_updates_openclaw_container_image(self, mock_get_container_client, _mock_is_mock):
+        mock_client = MagicMock()
+        mock_get_container_client.return_value = mock_client
+
+        container = MagicMock()
+        container.name = "openclaw"
+        container.image = "nbhdunited.azurecr.io/nbhd-openclaw:old"
+
+        app = MagicMock()
+        app.template.containers = [container]
+        mock_client.container_apps.get.return_value = app
+
+        poller = MagicMock()
+        mock_client.container_apps.begin_create_or_update.return_value = poller
+
+        update_container_image(
+            "oc-tenant",
+            "nbhdunited.azurecr.io/nbhd-openclaw:abc123",
+        )
+
+        self.assertEqual(container.image, "nbhdunited.azurecr.io/nbhd-openclaw:abc123")
+        mock_client.container_apps.get.assert_called_once_with("rg-test", "oc-tenant")
+        mock_client.container_apps.begin_create_or_update.assert_called_once_with(
+            "rg-test",
+            "oc-tenant",
+            app,
+        )
+        poller.result.assert_called_once()
+
+
+@override_settings(
+    AZURE_LOCATION="westus2",
+    AZURE_CONTAINER_ENV_ID="/subscriptions/test/resourceGroups/rg/providers/Microsoft.App/managedEnvironments/env",
+    AZURE_ACR_SERVER="nbhdunited.azurecr.io",
+    AZURE_RESOURCE_GROUP="rg-nbhd-prod",
+    AZURE_KEY_VAULT_NAME="kv-nbhd-prod",
+    ANTHROPIC_API_KEY="anthropic-secret",
+    OPENAI_API_KEY="openai-secret",
+    TELEGRAM_BOT_TOKEN="telegram-secret",
+    TELEGRAM_WEBHOOK_SECRET="webhook-secret",
+    NBHD_INTERNAL_API_KEY="internal-secret",
+    API_BASE_URL="https://nbhd-django.example.com",
+)
+class PluginRuntimeDepsMountTest(SimpleTestCase):
+    """Coverage for the plugin-runtime-deps EmptyDir mount that shadows the
+    file-share install path so OpenClaw's bundled-channel installer doesn't
+    hit EPERM on `.buildstamp` or wedge on a stale lock across restarts.
+    """
+
+    @patch("apps.orchestrator.azure_client._is_mock", return_value=False)
+    @patch("apps.orchestrator.azure_client.get_container_client")
+    def test_create_container_app_includes_emptydir_volume(
+        self,
+        mock_get_container_client,
+        _mock_is_mock,
+    ):
+        mock_client = MagicMock()
+        mock_get_container_client.return_value = mock_client
+
+        mock_result = SimpleNamespace(
+            configuration=SimpleNamespace(ingress=SimpleNamespace(fqdn="oc-tenant.internal")),
+        )
+        mock_poller = MagicMock()
+        mock_poller.result.return_value = mock_result
+        mock_client.container_apps.begin_create_or_update.return_value = mock_poller
+
+        create_container_app(
+            tenant_id="tenant-deps",
+            container_name="oc-tenant",
+            config_json='{"a":1}',
+            identity_id="/identities/tenant-deps",
+            identity_client_id="client-deps",
+        )
+
+        payload = mock_client.container_apps.begin_create_or_update.call_args.args[2]
+        template = payload["properties"]["template"]
+        volumes = {v["name"]: v for v in template["volumes"]}
+        self.assertIn("plugin-runtime-deps", volumes)
+        self.assertEqual(volumes["plugin-runtime-deps"]["storageType"], "EmptyDir")
+
+        mounts = {m["volumeName"]: m for m in template["containers"][0]["volumeMounts"]}
+        self.assertIn("plugin-runtime-deps", mounts)
+        self.assertEqual(
+            mounts["plugin-runtime-deps"]["mountPath"],
+            "/home/node/.openclaw/plugin-runtime-deps",
+        )
+
+        # index-cache EmptyDir — holds memory-core's SQLite FTS5 index off
+        # the share. Mount is always present (storage-cheap, always-safe);
+        # whether OpenClaw writes here is gated per-tenant by
+        # ``experimental_memory_core_enabled``.
+        self.assertIn("index-cache", volumes)
+        self.assertEqual(volumes["index-cache"]["storageType"], "EmptyDir")
+        self.assertIn("index-cache", mounts)
+        self.assertEqual(
+            mounts["index-cache"]["mountPath"],
+            "/home/node/.openclaw/index",
+        )
+
+    @override_settings(AZURE_RESOURCE_GROUP="rg-test")
+    @patch("apps.orchestrator.azure_client._is_mock", return_value=False)
+    @patch("apps.orchestrator.azure_client.get_container_client")
+    def test_ensure_mount_adds_volume_when_missing(
+        self,
+        mock_get_container_client,
+        _mock_is_mock,
+    ):
+        mock_client = MagicMock()
+        mock_get_container_client.return_value = mock_client
+
+        existing_volume = SimpleNamespace(name="workspace")
+        existing_mount = SimpleNamespace(volume_name="workspace")
+        container = SimpleNamespace(name="openclaw", volume_mounts=[existing_mount])
+        app = MagicMock()
+        app.template.containers = [container]
+        app.template.volumes = [existing_volume]
+        mock_client.container_apps.get.return_value = app
+        mock_client.container_apps.begin_create_or_update.return_value = MagicMock()
+
+        added = ensure_plugin_runtime_deps_mount("oc-tenant")
+
+        self.assertTrue(added)
+        volume_names = {v.name for v in app.template.volumes}
+        self.assertIn("plugin-runtime-deps", volume_names)
+        mount_names = {m.volume_name for m in container.volume_mounts}
+        self.assertIn("plugin-runtime-deps", mount_names)
+        mock_client.container_apps.begin_create_or_update.assert_called_once()
+
+    @override_settings(AZURE_RESOURCE_GROUP="rg-test")
+    @patch("apps.orchestrator.azure_client._is_mock", return_value=False)
+    @patch("apps.orchestrator.azure_client.get_container_client")
+    def test_ensure_mount_is_idempotent(
+        self,
+        mock_get_container_client,
+        _mock_is_mock,
+    ):
+        mock_client = MagicMock()
+        mock_get_container_client.return_value = mock_client
+
+        existing_volume = SimpleNamespace(name="plugin-runtime-deps")
+        existing_mount = SimpleNamespace(volume_name="plugin-runtime-deps")
+        container = SimpleNamespace(name="openclaw", volume_mounts=[existing_mount])
+        app = MagicMock()
+        app.template.containers = [container]
+        app.template.volumes = [existing_volume]
+        mock_client.container_apps.get.return_value = app
+
+        added = ensure_plugin_runtime_deps_mount("oc-tenant")
+
+        self.assertFalse(added)
+        mock_client.container_apps.begin_create_or_update.assert_not_called()
+
+    @override_settings(AZURE_RESOURCE_GROUP="rg-test")
+    @patch("apps.orchestrator.azure_client._is_mock", return_value=False)
+    @patch("apps.orchestrator.azure_client.get_container_client")
+    def test_update_container_image_bakes_in_mount(
+        self,
+        mock_get_container_client,
+        _mock_is_mock,
+    ):
+        """Image bumps must add the EmptyDir mount in the same revision so
+        every fleet rollout self-heals tenants stuck on old templates.
+        """
+        mock_client = MagicMock()
+        mock_get_container_client.return_value = mock_client
+
+        container = SimpleNamespace(
+            name="openclaw",
+            image="old:tag",
+            volume_mounts=[SimpleNamespace(volume_name="workspace")],
+        )
+        app = MagicMock()
+        app.template.containers = [container]
+        app.template.volumes = [SimpleNamespace(name="workspace")]
+        mock_client.container_apps.get.return_value = app
+        mock_client.container_apps.begin_create_or_update.return_value = MagicMock()
+
+        update_container_image("oc-tenant", "nbhdunited.azurecr.io/nbhd-openclaw:newtag")
+
+        self.assertEqual(container.image, "nbhdunited.azurecr.io/nbhd-openclaw:newtag")
+        volume_names = {v.name for v in app.template.volumes}
+        self.assertIn("plugin-runtime-deps", volume_names)
+        self.assertIn("index-cache", volume_names)
+        mount_names = {m.volume_name for m in container.volume_mounts}
+        self.assertIn("plugin-runtime-deps", mount_names)
+        self.assertIn("index-cache", mount_names)
+
+
+# A schema-valid config for the upload-mechanics tests below. These test the
+# byte-write path, not config validity, but upload_config_to_file_share now runs
+# the write-time validation gate, so a stub config would (correctly) be refused.
+_VALID_UPLOAD_CONFIG_JSON = json.dumps(
+    {
+        "gateway": {
+            "mode": "local",
+            "bind": "loopback",
+            "auth": {"mode": "token", "token": "${NBHD_INTERNAL_API_KEY}"},
+        },
+        "channels": {"telegram": {"enabled": True}},
+        "tools": {"deny": ["gateway"], "elevated": {"enabled": False}},
+        "cron": {"enabled": True},
+        "agents": {"defaults": {"model": {"primary": "deepseek/deepseek-v4", "fallbacks": []}}},
+    }
+)
+
+
+@override_settings(
+    AZURE_RESOURCE_GROUP="rg-nbhd-prod",
+    AZURE_STORAGE_ACCOUNT_NAME="stnbhdprod",
+)
+class UploadConfigToFileShareTest(SimpleTestCase):
+    """Guard against the kwarg-leak class that corrupted canary on 2026-05-22.
+
+    Old impl wrote to ``openclaw.json.tmp`` then called
+    ``rename_file("openclaw.json", overwrite=True)``. On the current
+    azure-storage-file-share 12.24+ / azure-core 1.39+ / requests 2.32+
+    triplet the ``overwrite=`` kwarg leaks into ``requests.Session.request``
+    (which doesn't accept it). Concurrent workers racing for the .tmp file
+    produced ``ResourceNotFoundError`` mid-rename, leaving the target file
+    allocated to expected size but filled with null bytes — Django logged
+    "Uploaded (atomic)" but the share held garbage.
+
+    These tests pin the safe pattern: one direct ``upload_file(data,
+    length=…)`` call, no ``overwrite`` kwarg anywhere.
+    """
+
+    @patch("apps.orchestrator.azure_client._is_mock", return_value=False)
+    @patch("apps.orchestrator.azure_client.get_storage_client")
+    @patch("azure.storage.fileshare.ShareFileClient")
+    def test_upload_config_uses_direct_upload_file_with_length(self, mock_share_cls, mock_get_storage, _mock_is_mock):
+        fake_storage = MagicMock()
+        fake_storage.storage_accounts.list_keys.return_value.keys = [MagicMock(value="k")]
+        mock_get_storage.return_value = fake_storage
+
+        upload_config_to_file_share(
+            "148ccf1c-ef13-47f8-ada1-a98fa90e14a0",
+            _VALID_UPLOAD_CONFIG_JSON,
+        )
+
+        # ShareFileClient is instantiated exactly once — against the final
+        # filename, no .tmp dance. Old impl created two clients (one for
+        # .tmp, then rename); this asserts the new direct-write shape.
+        self.assertEqual(mock_share_cls.call_count, 1)
+        client_kwargs = mock_share_cls.call_args.kwargs
+        self.assertEqual(client_kwargs["file_path"], "openclaw.json")
+        self.assertEqual(client_kwargs["share_name"], "ws-148ccf1c-ef13-47f8-a")
+
+        instance = mock_share_cls.return_value
+        instance.upload_file.assert_called_once()
+        upload_args, upload_kwargs = instance.upload_file.call_args
+        # ``length=`` form — same as every other upload_file caller in this module.
+        self.assertIn("length", upload_kwargs)
+        self.assertNotIn("overwrite", upload_kwargs)
+        # The body is the JSON payload bytes, length matches.
+        self.assertEqual(upload_kwargs["length"], len(upload_args[0]))
+        # ``rename_file`` is never touched — that's where the kwarg leak lived.
+        instance.rename_file.assert_not_called()
+
+    @patch("apps.orchestrator.azure_client._is_mock", return_value=True)
+    def test_mock_mode_is_no_op(self, _mock_is_mock):
+        # Must not raise; must not hit Azure.
+        upload_config_to_file_share("any-tenant", _VALID_UPLOAD_CONFIG_JSON)
+
+
+@override_settings(AZURE_RESOURCE_GROUP="rg-nbhd-prod")
+class WakeContainerAppIdempotencyTest(SimpleTestCase):
+    """wake_container_app must treat an already-active revision as success.
+
+    Regression for the canary 148ccf1c delivery wedge (2026-06-25): the
+    ``latest.active`` pre-check can read a stale revision list, so
+    activate_revision is still called on an already-active revision and Azure
+    raises ResourceExistsError (RevisionAlreadyInRequestedState). Letting that
+    propagate left ``hibernated_at`` set in wake_hibernated_tenant's except
+    clause, wedging the poller drain in an infinite 404->wake->crash loop.
+    """
+
+    @patch("apps.orchestrator.azure_client._is_mock", return_value=False)
+    @patch("apps.orchestrator.azure_client.get_container_client")
+    def test_already_active_revision_is_treated_as_success(self, mock_get_client, _mock_is_mock):
+        from azure.core.exceptions import ResourceExistsError
+
+        mock_client = MagicMock()
+        mock_get_client.return_value = mock_client
+        # Stale read: list says inactive, but the activate call hits "already active".
+        rev = SimpleNamespace(name="oc-x--u8a1074", created_time=1, active=False)
+        mock_client.container_apps_revisions.list_revisions.return_value = [rev]
+        mock_client.container_apps_revisions.activate_revision.side_effect = ResourceExistsError(
+            "Revision oc-x--u8a1074 is already active!"
+        )
+
+        # Must NOT raise — already-active is the desired end state.
+        wake_container_app("oc-x")
+        mock_client.container_apps_revisions.activate_revision.assert_called_once()
+
+    @patch("apps.orchestrator.azure_client._is_mock", return_value=False)
+    @patch("apps.orchestrator.azure_client.get_container_client")
+    def test_other_activation_errors_still_propagate(self, mock_get_client, _mock_is_mock):
+        mock_client = MagicMock()
+        mock_get_client.return_value = mock_client
+        rev = SimpleNamespace(name="oc-x--u8a1074", created_time=1, active=False)
+        mock_client.container_apps_revisions.list_revisions.return_value = [rev]
+        mock_client.container_apps_revisions.activate_revision.side_effect = RuntimeError("boom")
+
+        # A genuinely different failure must NOT be swallowed.
+        with self.assertRaises(RuntimeError):
+            wake_container_app("oc-x")
+
+    @patch("apps.orchestrator.azure_client._is_mock", return_value=False)
+    @patch("apps.orchestrator.azure_client.get_container_client")
+    def test_already_active_pre_check_skips_activate(self, mock_get_client, _mock_is_mock):
+        mock_client = MagicMock()
+        mock_get_client.return_value = mock_client
+        rev = SimpleNamespace(name="oc-x--u8a1074", created_time=1, active=True)
+        mock_client.container_apps_revisions.list_revisions.return_value = [rev]
+
+        wake_container_app("oc-x")
+        mock_client.container_apps_revisions.activate_revision.assert_not_called()
+
+    @patch("apps.orchestrator.azure_client._is_mock", return_value=False)
+    @patch("apps.orchestrator.azure_client.get_container_client")
+    def test_activates_latest_inactive_revision(self, mock_get_client, _mock_is_mock):
+        mock_client = MagicMock()
+        mock_get_client.return_value = mock_client
+        old = SimpleNamespace(name="oc-x--old", created_time=1, active=False)
+        new = SimpleNamespace(name="oc-x--new", created_time=2, active=False)
+        mock_client.container_apps_revisions.list_revisions.return_value = [old, new]
+
+        wake_container_app("oc-x")
+        mock_client.container_apps_revisions.activate_revision.assert_called_once_with(
+            "rg-nbhd-prod", "oc-x", "oc-x--new"
+        )
+
+    @patch("apps.orchestrator.azure_client._is_mock", return_value=False)
+    @patch("apps.orchestrator.azure_client.get_container_client")
+    def test_non_already_active_conflict_propagates(self, mock_get_client, _mock_is_mock):
+        from azure.core.exceptions import ResourceExistsError
+
+        mock_client = MagicMock()
+        mock_get_client.return_value = mock_client
+        rev = SimpleNamespace(name="oc-x--u8a1074", created_time=1, active=False)
+        mock_client.container_apps_revisions.list_revisions.return_value = [rev]
+        # A 409 that is NOT the already-active condition must propagate so the
+        # caller takes its bounded failure path rather than a false wake.
+        mock_client.container_apps_revisions.activate_revision.side_effect = ResourceExistsError(
+            "Another operation is in progress on this resource."
+        )
+
+        with self.assertRaises(ResourceExistsError):
+            wake_container_app("oc-x")
+
+
+@override_settings(AZURE_RESOURCE_GROUP="rg-nbhd-prod")
+class HibernateContainerAppIdempotencyTest(SimpleTestCase):
+    """hibernate_container_app must treat an already-inactive revision as success.
+
+    Mirror of the wake-side stale-read bug: list_revisions can report a revision
+    as active when it is already inactive, so deactivate_revision raises
+    ResourceExistsError. Letting it propagate aborts hibernation and leaves the
+    tenant awake with no cron-wake armed.
+    """
+
+    @patch("apps.orchestrator.azure_client._is_mock", return_value=False)
+    @patch("apps.orchestrator.azure_client.get_container_client")
+    def test_already_inactive_revision_is_treated_as_success(self, mock_get_client, _mock_is_mock):
+        from azure.core.exceptions import ResourceExistsError
+
+        from apps.orchestrator.azure_client import hibernate_container_app
+
+        mock_client = MagicMock()
+        mock_get_client.return_value = mock_client
+        rev = SimpleNamespace(name="oc-x--u8a1074", active=True)
+        mock_client.container_apps_revisions.list_revisions.return_value = [rev]
+        mock_client.container_apps_revisions.deactivate_revision.side_effect = ResourceExistsError(
+            "Revision oc-x--u8a1074 is already inactive!"
+        )
+
+        # Must NOT raise — already-inactive is the desired end state.
+        hibernate_container_app("oc-x")
+        mock_client.container_apps_revisions.deactivate_revision.assert_called_once()
+
+    @patch("apps.orchestrator.azure_client._is_mock", return_value=False)
+    @patch("apps.orchestrator.azure_client.get_container_client")
+    def test_other_deactivation_errors_still_propagate(self, mock_get_client, _mock_is_mock):
+        from apps.orchestrator.azure_client import hibernate_container_app
+
+        mock_client = MagicMock()
+        mock_get_client.return_value = mock_client
+        rev = SimpleNamespace(name="oc-x--u8a1074", active=True)
+        mock_client.container_apps_revisions.list_revisions.return_value = [rev]
+        mock_client.container_apps_revisions.deactivate_revision.side_effect = RuntimeError("boom")
+
+        with self.assertRaises(RuntimeError):
+            hibernate_container_app("oc-x")

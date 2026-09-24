@@ -1,0 +1,1025 @@
+"use client";
+
+import Link from "next/link";
+import { useEffect, useMemo, useState } from "react";
+
+import { PendingConfigChip } from "@/components/pending-config-chip";
+import { PersonaSelector } from "@/components/persona-selector";
+import { SectionCard } from "@/components/section-card";
+import { AppleLinkCard } from "@/components/settings/apple-link-card";
+import { SectionCardSkeleton } from "@/components/skeleton";
+import { StatusPill } from "@/components/status-pill";
+import {
+  useCancelDeletionMutation,
+  useDeleteAccountMutation,
+  useMeQuery,
+  usePersonasQuery,
+  usePreferencesQuery,
+  useRefreshConfigMutation,
+  useRefreshConfigStatusQuery,
+  useUpdateProfileMutation,
+  useUpdatePreferencesMutation,
+} from "@/lib/queries";
+
+type LanguageOption = {
+  label: string;
+  value: string;
+};
+
+const LANGUAGE_OPTIONS: LanguageOption[] = [
+  { label: "English", value: "en" },
+  { label: "日本語 (Japanese)", value: "ja" },
+  { label: "Español (Spanish)", value: "es" },
+  { label: "Français (French)", value: "fr" },
+  { label: "Deutsch (German)", value: "de" },
+  { label: "한국어 (Korean)", value: "ko" },
+  { label: "中文 (Chinese)", value: "zh" },
+  { label: "Português (Portuguese)", value: "pt" },
+  { label: "العربية (Arabic)", value: "ar" },
+  { label: "हिन्दी (Hindi)", value: "hi" },
+  { label: "Italiano (Italian)", value: "it" },
+  { label: "Русский (Russian)", value: "ru" },
+  { label: "Türkçe (Turkish)", value: "tr" },
+  { label: "Tiếng Việt (Vietnamese)", value: "vi" },
+  { label: "ไทย (Thai)", value: "th" },
+  { label: "Bahasa Indonesia (Indonesian)", value: "id" },
+];
+
+const TIMEZONE_GROUPS: Array<{ region: string; zones: string[] }> = [
+  {
+    region: "Popular",
+    zones: [
+      "Asia/Tokyo",
+      "America/New_York",
+      "America/Los_Angeles",
+      "Europe/London",
+      "Asia/Singapore",
+      "Asia/Shanghai",
+      "Europe/Paris",
+      "Australia/Sydney",
+      "Europe/Berlin",
+    ],
+  },
+  {
+    region: "North America",
+    zones: [
+      "America/Anchorage",
+      "America/Chicago",
+      "America/Denver",
+      "America/Halifax",
+      "America/Havana",
+      "America/Mexico_City",
+      "America/Phoenix",
+      "America/Puerto_Rico",
+      "America/Santiago",
+      "America/Toronto",
+      "America/Vancouver",
+      "America/Winnipeg",
+      "Canada/Atlantic",
+      "Canada/Central",
+      "Canada/Eastern",
+      "Canada/Mountain",
+      "Canada/Pacific",
+      "Canada/Newfoundland",
+      "Mexico/BajaSur",
+      "Mexico/General",
+    ],
+  },
+  {
+    region: "Europe",
+    zones: [
+      "Europe/Amsterdam",
+      "Europe/Andorra",
+      "Europe/Athens",
+      "Europe/Budapest",
+      "Europe/Dublin",
+      "Europe/Helsinki",
+      "Europe/Istanbul",
+      "Europe/Kiev",
+      "Europe/Lisbon",
+      "Europe/Madrid",
+      "Europe/Moscow",
+      "Europe/Oslo",
+      "Europe/Prague",
+      "Europe/Rome",
+      "Europe/Stockholm",
+      "Europe/Zurich",
+      "Europe/Belgrade",
+      "Europe/Brussels",
+      "Europe/Minsk",
+    ],
+  },
+  {
+    region: "Asia",
+    zones: [
+      "Asia/Bangkok",
+      "Asia/Calcutta",
+      "Asia/Dubai",
+      "Asia/Hong_Kong",
+      "Asia/Jerusalem",
+      "Asia/Karachi",
+      "Asia/Kolkata",
+      "Asia/Krasnoyarsk",
+      "Asia/Manila",
+      "Asia/Seoul",
+      "Asia/Shanghai",
+      "Asia/Singapore",
+      "Asia/Taipei",
+      "Asia/Tashkent",
+      "Asia/Tbilisi",
+      "Asia/Tehran",
+      "Asia/Tomsk",
+      "Asia/Yekaterinburg",
+      "Asia/Ho_Chi_Minh",
+      "Asia/Jakarta",
+      "Asia/Almaty",
+      "Asia/Baghdad",
+      "Asia/Novosibirsk",
+      "Asia/Vladivostok",
+    ],
+  },
+  {
+    region: "South America",
+    zones: [
+      "America/Asuncion",
+      "America/Araguaina",
+      "America/Argentina/Buenos_Aires",
+      "America/Argentina/Catamarca",
+      "America/Argentina/Cordoba",
+      "America/Bahia",
+      "America/Belem",
+      "America/Bogota",
+      "America/Campo_Grande",
+      "America/Caracas",
+      "America/Cayenne",
+      "America/Cuiaba",
+      "America/Fortaleza",
+      "America/Montevideo",
+      "America/Paramaribo",
+      "America/Recife",
+      "America/Sao_Paulo",
+    ],
+  },
+  {
+    region: "Africa",
+    zones: [
+      "Africa/Abidjan",
+      "Africa/Addis_Ababa",
+      "Africa/Cairo",
+      "Africa/Casablanca",
+      "Africa/Dar_es_Salaam",
+      "Africa/Johannesburg",
+      "Africa/Khartoum",
+      "Africa/Lagos",
+      "Africa/Lusaka",
+      "Africa/Mogadishu",
+      "Africa/Nairobi",
+      "Africa/Tripoli",
+      "Africa/Tunis",
+      "Africa/Windhoek",
+      "Africa/Algiers",
+      "Africa/Brazzaville",
+      "Africa/Ceuta",
+      "Africa/Juba",
+    ],
+  },
+];
+
+function offsetLabel(tz: string): string {
+  if (!tz) return "UTC+0";
+
+  // Compute the real current offset/abbreviation for any IANA zone at runtime.
+  // Falls back gracefully if the zone is invalid or unsupported by the runtime.
+  try {
+    const parts = new Intl.DateTimeFormat("en-US", {
+      timeZone: tz,
+      timeZoneName: "shortOffset",
+    }).formatToParts(new Date());
+    const offset = parts.find((p) => p.type === "timeZoneName")?.value;
+    if (offset) {
+      // "GMT+9" / "GMT-5" / "GMT" → "UTC+9" / "UTC-5" / "UTC+0"
+      const normalized = offset.replace(/^GMT/, "UTC").replace(/^UTC$/, "UTC+0");
+      return normalized;
+    }
+  } catch {
+    // Invalid time zone string — fall through to default.
+  }
+
+  return "UTC+0";
+}
+
+function findTimezoneLabel(tz: string) {
+  return `${tz} (${offsetLabel(tz)})`;
+}
+
+function timeAgo(dateStr: string): string {
+  const seconds = Math.floor((Date.now() - new Date(dateStr).getTime()) / 1000);
+  if (seconds < 60) return "just now";
+  if (seconds < 3600) return `${Math.floor(seconds / 60)} minutes ago`;
+  if (seconds < 86400) return `${Math.floor(seconds / 3600)} hours ago`;
+  return `${Math.floor(seconds / 86400)} days ago`;
+}
+
+export default function SettingsPage() {
+  const { data: me, isLoading } = useMeQuery();
+  const { data: personas } = usePersonasQuery();
+  const { data: prefs } = usePreferencesQuery();
+  const { data: refreshConfigStatus, refetch: refetchRefreshConfigStatus } = useRefreshConfigStatusQuery();
+  const refreshConfigMutation = useRefreshConfigMutation();
+  const updatePrefs = useUpdatePreferencesMutation();
+  const updateProfile = useUpdateProfileMutation();
+
+  const [editingPersona, setEditingPersona] = useState(false);
+  const [editingDisplayName, setEditingDisplayName] = useState(false);
+  const [editingLanguage, setEditingLanguage] = useState(false);
+  const [editingTimezone, setEditingTimezone] = useState(false);
+  const [editingLocation, setEditingLocation] = useState(false);
+
+  const [selectedPersona, setSelectedPersona] = useState("");
+  const [displayName, setDisplayName] = useState("");
+  const [language, setLanguage] = useState("en");
+  const [timezone, setTimezone] = useState("UTC");
+  const [locationCity, setLocationCity] = useState("");
+  const [refreshMessage, setRefreshMessage] = useState("");
+  const [refreshError, setRefreshError] = useState("");
+
+  const [savingField, setSavingField] = useState<string | null>(null);
+  const [saveMessage, setSaveMessage] = useState("");
+  const [saveStatus, setSaveStatus] = useState<"success" | "error">("success");
+
+  const languageLookup = useMemo(() => {
+    const map = new Map<string, string>();
+    LANGUAGE_OPTIONS.forEach((option) => map.set(option.value, option.label));
+    return map;
+  }, []);
+
+  const currentPersona = prefs?.agent_persona ?? "neighbor";
+  const currentPersonaLabel = personas?.find((p) => p.key === currentPersona);
+
+  const hasPendingConfigUpdate = refreshConfigStatus?.has_pending_update ?? false;
+  const canRefreshConfig = refreshConfigStatus?.can_refresh ?? true;
+  const cooldownMinutes = refreshConfigStatus ? Math.max(1, Math.ceil(refreshConfigStatus.cooldown_seconds / 60)) : 0;
+
+  useEffect(() => {
+    if (!editingDisplayName && me) {
+      setDisplayName(me.display_name || "");
+    }
+    if (!editingLanguage && me) {
+      setLanguage(me.language || "en");
+    }
+    if (!editingTimezone && me) {
+      setTimezone(me.timezone || "UTC");
+    }
+    if (!editingLocation && me) {
+      setLocationCity(me.location_city || "");
+    }
+  }, [me, editingDisplayName, editingLanguage, editingTimezone, editingLocation]);
+
+  useEffect(() => {
+    if (!editingPersona && currentPersona) {
+      setSelectedPersona(currentPersona);
+    }
+  }, [currentPersona, editingPersona]);
+
+  const clearStatus = () => {
+    setSavingField(null);
+    setSaveMessage("");
+    setSaveStatus("success");
+  };
+
+  const clearRefreshStatus = () => {
+    setRefreshMessage("");
+    setRefreshError("");
+  };
+
+  const handleSaveProfileField = async (
+    field: "display_name" | "language" | "timezone" | "location",
+    payload: { display_name?: string; language?: string; timezone?: string; location_city?: string; location_lat?: number | null; location_lon?: number | null },
+  ) => {
+    setSaveMessage("");
+    setSaveStatus("success");
+    setSavingField(field);
+
+    const previousTimezone = me?.timezone;
+
+    try {
+      await updateProfile.mutateAsync(payload);
+
+      if (field === "display_name") {
+        setEditingDisplayName(false);
+      }
+      if (field === "language") {
+        setEditingLanguage(false);
+      }
+      if (field === "timezone") {
+        setEditingTimezone(false);
+      }
+      if (field === "location") {
+        setEditingLocation(false);
+      }
+
+      if (field === "timezone" && payload.timezone && previousTimezone !== payload.timezone) {
+        setSaveMessage("Saved! Agent timezone updated. Changes take effect on next message.");
+      } else if (field === "location") {
+        setSaveMessage("Saved! Weather forecasts will use your location.");
+      } else {
+        setSaveMessage("Saved!");
+      }
+    } catch (error) {
+      setSaveStatus("error");
+      setSaveMessage(error instanceof Error ? error.message : "Failed to save. Please try again.");
+    } finally {
+      setSavingField(null);
+      if (field === "display_name") {
+        setEditingDisplayName(false);
+      }
+      if (field === "language") {
+        setEditingLanguage(false);
+      }
+      if (field === "timezone") {
+        setEditingTimezone(false);
+      }
+      if (field === "location") {
+        setEditingLocation(false);
+      }
+      window.setTimeout(clearStatus, 3000);
+    }
+  };
+
+  const handleTimezoneSave = async () => {
+    if (!timezone || timezone === me?.timezone) {
+      setEditingTimezone(false);
+      return;
+    }
+    await handleSaveProfileField("timezone", { timezone });
+  };
+
+  const handleLocationSave = async () => {
+    const city = locationCity.trim();
+    if (!city || city === me?.location_city) {
+      setEditingLocation(false);
+      return;
+    }
+    // Save city name; coordinates will be resolved by the agent on next briefing
+    await handleSaveProfileField("location", { location_city: city });
+  };
+
+  const handleLanguageSave = async () => {
+    const normalized = language || "en";
+    if (!normalized || normalized === me?.language) {
+      setEditingLanguage(false);
+      return;
+    }
+    await handleSaveProfileField("language", { language: normalized });
+  };
+
+  const handleDisplayNameSave = async () => {
+    const next = displayName.trim() || me?.display_name || "";
+    if (!next || next === me?.display_name) {
+      setEditingDisplayName(false);
+      return;
+    }
+    await handleSaveProfileField("display_name", { display_name: next });
+  };
+
+  const handlePersonaSave = async () => {
+    if (selectedPersona && selectedPersona !== currentPersona) {
+      await updatePrefs.mutateAsync({ agent_persona: selectedPersona });
+      setSaveStatus("success");
+      setSaveMessage("Saved!");
+      window.setTimeout(clearStatus, 3000);
+    }
+    setEditingPersona(false);
+  };
+
+  const handleRefreshConfig = async () => {
+    setRefreshMessage("");
+    setRefreshError("");
+    try {
+      await refreshConfigMutation.mutateAsync();
+      setRefreshMessage("Configuration refreshed. Your assistant will restart momentarily.");
+      window.setTimeout(clearRefreshStatus, 4000);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : "Failed to refresh configuration.";
+      const statusResult = await refetchRefreshConfigStatus().catch(() => undefined);
+      const status = statusResult?.data as { can_refresh?: boolean; cooldown_seconds?: number } | undefined;
+      const canRefresh = status?.can_refresh ?? canRefreshConfig;
+      const cooldown = status?.cooldown_seconds ?? refreshConfigStatus?.cooldown_seconds ?? 0;
+      const nextCooldownMinutes = Math.max(1, Math.ceil(Math.max(cooldown, 0) / 60));
+
+      if (!canRefresh || message.includes("429")) {
+        setRefreshError(cooldown > 0 ? `Available in ${nextCooldownMinutes} minutes` : "Configuration refresh is on cooldown.");
+        return;
+      }
+
+      setRefreshError(message);
+      window.setTimeout(clearRefreshStatus, 5000);
+    }
+  };
+
+  const isSaving = savingField !== null || updatePrefs.isPending;
+  const isRefreshingConfig = refreshConfigMutation.isPending;
+
+  if (isLoading) {
+    return (
+      <div className="space-y-4">
+        <SectionCardSkeleton lines={6} />
+        <SectionCardSkeleton lines={3} />
+        <SectionCardSkeleton lines={4} />
+        <SectionCardSkeleton lines={2} />
+      </div>
+    );
+  }
+
+  return (
+    <div className="space-y-4">
+      <SectionCard title="Account" subtitle="Your profile and authentication details" delay={0}>
+        <PendingConfigChip />
+        {me ? (
+          <dl className="grid min-w-0 gap-4 text-sm sm:grid-cols-2 sm:gap-3">
+            {/* Display Name */}
+            <div className="rounded-panel border border-border bg-surface-elevated p-4 min-w-0 overflow-visible">
+              <div className="mb-2 flex items-start justify-between gap-2">
+                <dt className="font-mono text-[11px] uppercase tracking-[0.14em] text-ink-muted">Display Name</dt>
+                {!editingDisplayName ? (
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setDisplayName(me.display_name || "");
+                      setEditingDisplayName(true);
+                    }}
+                    className="rounded-full border border-border px-4 py-1.5 text-sm text-ink-muted transition hover:border-border-strong hover:text-ink min-h-[44px]"
+                  >
+                    Edit
+                  </button>
+                ) : null}
+              </div>
+              {!editingDisplayName ? (
+                <dd className="mt-1 break-words text-base font-medium text-ink">{me.display_name || "Not set"}</dd>
+              ) : (
+                <div className="space-y-3">
+                  <input
+                    value={displayName}
+                    onChange={(e) => setDisplayName(e.target.value)}
+                    className="mt-1 w-full rounded-panel border border-border bg-surface px-3 py-2 text-sm text-ink placeholder:text-ink-faint focus:border-accent focus:outline-none focus:ring-1 focus:ring-accent"
+                    placeholder="Enter display name"
+                  />
+                  <div className="flex flex-wrap items-center gap-3">
+                    <button
+                      type="button"
+                      onClick={handleDisplayNameSave}
+                      disabled={savingField === "display_name"}
+                      className="rounded-full bg-accent px-5 py-2 text-sm font-medium text-white transition hover:bg-accent/85 disabled:opacity-55 min-h-[44px]"
+                    >
+                      {savingField === "display_name" ? "Saving..." : "Save"}
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => setEditingDisplayName(false)}
+                      className="rounded-full border border-border px-4 py-1.5 text-sm transition hover:border-border-strong min-h-[44px]"
+                    >
+                      Cancel
+                    </button>
+                  </div>
+                </div>
+              )}
+            </div>
+
+            {/* Email */}
+            <div className="rounded-panel border border-border bg-surface-elevated p-4 min-w-0 overflow-visible">
+              <dt className="font-mono text-[11px] uppercase tracking-[0.14em] text-ink-muted">Email</dt>
+              <dd className="mt-1 break-words text-base text-ink">{me.email}</dd>
+            </div>
+
+            {/* Username */}
+            <div className="rounded-panel border border-border bg-surface-elevated p-4 min-w-0 overflow-visible">
+              <dt className="font-mono text-[11px] uppercase tracking-[0.14em] text-ink-muted">Username</dt>
+              <dd className="mt-1 break-words text-base text-ink">{me.username}</dd>
+            </div>
+
+            {/* Language */}
+            <div className="rounded-panel border border-border bg-surface-elevated p-4 min-w-0 overflow-visible">
+              <div className="mb-2 flex items-start justify-between gap-2">
+                <dt className="font-mono text-[11px] uppercase tracking-[0.14em] text-ink-muted">Language</dt>
+                {!editingLanguage ? (
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setLanguage(me.language || "en");
+                      setEditingLanguage(true);
+                    }}
+                    className="rounded-full border border-border px-4 py-1.5 text-sm text-ink-muted transition hover:border-border-strong hover:text-ink min-h-[44px]"
+                  >
+                    Edit
+                  </button>
+                ) : null}
+              </div>
+              {!editingLanguage ? (
+                <dd className="mt-1 break-words text-base text-ink">{languageLookup.get(me.language || "en") || me.language || "en"}</dd>
+              ) : (
+                <div className="space-y-3">
+                  <label className="block text-sm text-ink-muted">
+                    <span className="sr-only">Language</span>
+                    <select
+                      value={language}
+                      onChange={(e) => setLanguage(e.target.value)}
+                      className="mt-1 w-full rounded-panel border border-border bg-surface px-3 py-2 text-sm text-ink focus:border-accent focus:outline-none focus:ring-1 focus:ring-accent"
+                    >
+                      {LANGUAGE_OPTIONS.map((option) => (
+                        <option key={option.value} value={option.value}>
+                          {option.label}
+                        </option>
+                      ))}
+                    </select>
+                  </label>
+                  <div className="flex flex-wrap items-center gap-3">
+                    <button
+                      type="button"
+                      onClick={handleLanguageSave}
+                      disabled={savingField === "language"}
+                      className="rounded-full bg-accent px-5 py-2 text-sm font-medium text-white transition hover:bg-accent/85 disabled:opacity-55 min-h-[44px]"
+                    >
+                      {savingField === "language" ? "Saving..." : "Save"}
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => setEditingLanguage(false)}
+                      className="rounded-full border border-border px-4 py-1.5 text-sm transition hover:border-border-strong min-h-[44px]"
+                    >
+                      Cancel
+                    </button>
+                  </div>
+                </div>
+              )}
+            </div>
+
+            {/* Timezone */}
+            <div className="rounded-panel border border-border bg-surface-elevated p-4 min-w-0 overflow-visible sm:col-span-2">
+              <div className="mb-2 flex items-start justify-between gap-2">
+                <dt className="font-mono text-[11px] uppercase tracking-[0.14em] text-ink-muted">Timezone</dt>
+                {!editingTimezone ? (
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setTimezone(me.timezone || "UTC");
+                      setEditingTimezone(true);
+                    }}
+                    className="rounded-full border border-border px-4 py-1.5 text-sm text-ink-muted transition hover:border-border-strong hover:text-ink min-h-[44px]"
+                  >
+                    Edit
+                  </button>
+                ) : null}
+              </div>
+              {!editingTimezone ? (
+                <dd className="mt-1 break-words text-base text-ink">{findTimezoneLabel(me.timezone || "UTC")}</dd>
+              ) : (
+                <div className="space-y-3">
+                  <label className="block text-sm text-ink-muted">
+                    <span className="sr-only">Timezone</span>
+                    <select
+                      value={timezone}
+                      onChange={(e) => setTimezone(e.target.value)}
+                      className="mt-1 w-full rounded-panel border border-border bg-surface px-3 py-2 text-sm text-ink focus:border-accent focus:outline-none focus:ring-1 focus:ring-accent"
+                    >
+                      {TIMEZONE_GROUPS.map((group) => (
+                        <optgroup key={group.region} label={group.region}>
+                          {group.zones.map((tz) => (
+                            <option key={`${group.region}-${tz}`} value={tz}>
+                              {findTimezoneLabel(tz)}
+                            </option>
+                          ))}
+                        </optgroup>
+                      ))}
+                    </select>
+                  </label>
+                  <div className="flex flex-wrap items-center gap-3">
+                    <button
+                      type="button"
+                      onClick={handleTimezoneSave}
+                      disabled={savingField === "timezone"}
+                      className="rounded-full bg-accent px-5 py-2 text-sm font-medium text-white transition hover:bg-accent/85 disabled:opacity-55 min-h-[44px]"
+                    >
+                      {savingField === "timezone" ? "Saving..." : "Save"}
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => setEditingTimezone(false)}
+                      className="rounded-full border border-border px-4 py-1.5 text-sm transition hover:border-border-strong min-h-[44px]"
+                    >
+                      Cancel
+                    </button>
+                  </div>
+                </div>
+              )}
+            </div>
+
+            {/* Location */}
+            <div className="rounded-panel border border-border bg-surface-elevated p-4 min-w-0 overflow-visible sm:col-span-2">
+              <div className="mb-2 flex items-start justify-between gap-2">
+                <dt className="font-mono text-[11px] uppercase tracking-[0.14em] text-ink-muted">Location</dt>
+                {!editingLocation ? (
+                  <button
+                    type="button"
+                    onClick={() => {
+                      if (!me) return;
+                      setLocationCity(me.location_city || "");
+                      setEditingLocation(true);
+                    }}
+                    className="rounded-full border border-border px-4 py-1.5 text-sm text-ink-muted transition hover:border-border-strong hover:text-ink min-h-[44px]"
+                  >
+                    Edit
+                  </button>
+                ) : null}
+              </div>
+              {!editingLocation ? (
+                <dd className="mt-1 break-words text-base text-ink">
+                  {me.location_city || <span className="text-ink-muted">Not set — used for weather and local info</span>}
+                </dd>
+              ) : (
+                <div className="space-y-3">
+                  <input
+                    value={locationCity}
+                    onChange={(e) => setLocationCity(e.target.value)}
+                    className="mt-1 w-full rounded-panel border border-border bg-surface px-3 py-2 text-sm text-ink placeholder:text-ink-faint focus:border-accent focus:outline-none focus:ring-1 focus:ring-accent"
+                    placeholder="e.g. Brooklyn, Osaka, London"
+                    maxLength={255}
+                    autoFocus
+                  />
+                  <p className="text-xs text-ink-faint">
+                    Your assistant uses this for weather forecasts and local recommendations.
+                  </p>
+                  <div className="flex flex-wrap items-center gap-3">
+                    <button
+                      type="button"
+                      onClick={handleLocationSave}
+                      disabled={savingField === "location"}
+                      className="rounded-full bg-accent px-5 py-2 text-sm font-medium text-white transition hover:bg-accent/85 disabled:opacity-55 min-h-[44px]"
+                    >
+                      {savingField === "location" ? "Saving..." : "Save"}
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => setEditingLocation(false)}
+                      className="rounded-full border border-border px-4 py-1.5 text-sm transition hover:border-border-strong min-h-[44px]"
+                    >
+                      Cancel
+                    </button>
+                  </div>
+                </div>
+              )}
+            </div>
+
+            {/* Telegram — read-only status; connect/unlink lives on Integrations */}
+            <div className="rounded-panel border border-border bg-surface-elevated p-4 min-w-0 overflow-visible">
+              <dt className="font-mono text-[11px] uppercase tracking-[0.14em] text-ink-muted">Telegram</dt>
+              <dd className="mt-1">
+                {me.telegram_chat_id ? (
+                  <span className="break-words text-base text-ink">
+                    {me.telegram_username ? `@${me.telegram_username}` : "Connected"}
+                  </span>
+                ) : (
+                  <div className="space-y-2">
+                    <StatusPill status="pending" />
+                    <Link
+                      href="/settings/integrations"
+                      className="inline-flex rounded-full border border-border-strong px-3 py-1.5 text-xs text-ink hover:border-border transition min-h-[44px] items-center"
+                    >
+                      Connect Telegram
+                    </Link>
+                  </div>
+                )}
+              </dd>
+            </div>
+
+            {/* LINE — read-only status; connect/unlink lives on Integrations */}
+            <div className="rounded-panel border border-border bg-surface-elevated p-4 min-w-0 overflow-visible">
+              <dt className="font-mono text-[11px] uppercase tracking-[0.14em] text-ink-muted">LINE</dt>
+              <dd className="mt-1">
+                {me.line_user_id ? (
+                  <span className="break-words text-base text-ink">
+                    {me.line_display_name || "Connected"}
+                  </span>
+                ) : (
+                  <div className="space-y-2">
+                    <StatusPill status="pending" />
+                    <Link
+                      href="/settings/integrations"
+                      className="inline-flex rounded-full border border-border-strong px-3 py-1.5 text-xs text-ink hover:border-border transition min-h-[44px] items-center"
+                    >
+                      Connect LINE
+                    </Link>
+                  </div>
+                )}
+              </dd>
+            </div>
+
+            <AppleLinkCard linked={me.apple_linked} />
+
+            {/* Tenant */}
+            <div className="rounded-panel border border-border bg-surface-elevated p-4 min-w-0 overflow-visible">
+              <dt className="font-mono text-[11px] uppercase tracking-[0.14em] text-ink-muted">Tenant</dt>
+              <dd className="mt-1">
+                {me.tenant ? (
+                  <StatusPill status={me.tenant.status} />
+                ) : (
+                  <span className="text-sm text-ink-muted">No tenant provisioned</span>
+                )}
+              </dd>
+            </div>
+          </dl>
+        ) : (
+          <p className="text-sm text-ink-muted">Could not load account details.</p>
+        )}
+      </SectionCard>
+
+      {saveMessage ? (
+        <div
+          role={saveStatus === "error" ? "alert" : "status"}
+          className={
+            saveStatus === "error"
+              ? "rounded-panel border border-rose-border bg-rose-bg px-3 py-2 text-sm text-rose-text"
+              : "rounded-panel border border-signal/30 bg-signal-faint px-3 py-2 text-sm text-signal"
+          }
+        >
+          {saveMessage}
+        </div>
+      ) : null}
+
+      <SectionCard title="Agent Persona" subtitle="Your assistant's personality and communication style" delay={100}>
+        {!editingPersona ? (
+          <div className="flex items-center justify-between">
+            <div className="flex items-center gap-3">
+              {currentPersonaLabel && (
+                <>
+                  <span className="text-2xl">{currentPersonaLabel.emoji}</span>
+                  <div>
+                    <p className="font-medium text-ink">{currentPersonaLabel.label}</p>
+                    <p className="text-sm text-ink-muted">{currentPersonaLabel.description}</p>
+                  </div>
+                </>
+              )}
+              {!currentPersonaLabel && <p className="text-sm text-ink-muted">No persona selected</p>}
+            </div>
+            <button
+              type="button"
+              onClick={() => {
+                setSelectedPersona(currentPersona);
+                setEditingPersona(true);
+              }}
+              className="rounded-full border border-border px-4 py-1.5 text-sm text-ink-muted transition hover:border-border-strong hover:text-ink"
+            >
+              Change
+            </button>
+          </div>
+        ) : (
+          <div className="space-y-4">
+            {personas && <PersonaSelector personas={personas} selected={selectedPersona} onSelect={setSelectedPersona} />}
+            <div className="flex items-center gap-3">
+              <button
+                type="button"
+                onClick={handlePersonaSave}
+                disabled={isSaving}
+                className="rounded-full bg-accent px-5 py-2 text-sm font-medium text-white transition hover:bg-accent/85 disabled:opacity-55"
+              >
+                {updatePrefs.isPending ? "Saving..." : "Save"}
+              </button>
+              <button
+                type="button"
+                onClick={() => setEditingPersona(false)}
+                className="rounded-full border border-border px-4 py-2 text-sm text-ink-muted transition hover:border-border-strong"
+              >
+                Cancel
+              </button>
+            </div>
+            <p className="text-xs text-ink-faint">Changes take effect on the next container restart or reprovision.</p>
+          </div>
+        )}
+      </SectionCard>
+
+      <SectionCard
+        title="Agent Configuration"
+        subtitle="Configuration updates are applied automatically when your assistant is idle"
+        delay={200}
+      >
+        <div className="rounded-panel border border-border bg-surface-elevated p-4 min-w-0 overflow-visible">
+          <p className="font-mono text-[11px] uppercase tracking-[0.14em] text-ink-muted">
+            Agent Configuration
+          </p>
+          <p className="mt-1 text-base text-ink">
+            {refreshConfigStatus?.last_refreshed
+              ? `Last updated: ${timeAgo(refreshConfigStatus.last_refreshed)}`
+              : "Last updated: never"}
+          </p>
+          {refreshConfigStatus?.container_image_tag && (
+            <p className="mt-1 font-mono text-[11px] text-ink-faint">
+              running {refreshConfigStatus.container_image_tag.slice(0, 7)}
+              {refreshConfigStatus.image_outdated && refreshConfigStatus.latest_image_tag && (
+                <span className="ml-2 text-amber-text">
+                  → {refreshConfigStatus.latest_image_tag.slice(0, 7)} available
+                </span>
+              )}
+            </p>
+          )}
+        </div>
+
+        {(hasPendingConfigUpdate || refreshConfigStatus?.image_outdated) ? (
+          <>
+            <div className="mt-3 rounded-panel border border-amber-border/80 bg-amber-bg px-3.5 py-2.5 text-sm text-amber-text">
+              🔄 An update is available and will be applied automatically when your assistant is idle.
+            </div>
+            <div className="mt-3 flex flex-wrap items-center gap-3">
+              <button
+                type="button"
+                onClick={handleRefreshConfig}
+                disabled={isRefreshingConfig || !canRefreshConfig}
+                className="rounded-full border border-border-strong px-5 py-2 text-sm text-ink-muted transition hover:border-border-strong hover:text-ink disabled:cursor-not-allowed disabled:opacity-55"
+              >
+                {isRefreshingConfig
+                  ? "Applying..."
+                  : canRefreshConfig
+                    ? "Apply Now"
+                    : `Available in ${cooldownMinutes} minutes`}
+              </button>
+              {(refreshMessage || refreshError) ? (
+                <p className={`text-sm ${refreshMessage ? "text-signal" : "text-rose-text"}`}>{refreshMessage || refreshError}</p>
+              ) : null}
+            </div>
+            <p className="mt-2 text-xs text-ink-faint">Or wait — it&apos;ll apply automatically within 15 minutes of inactivity.</p>
+          </>
+        ) : (
+          <p className="mt-3 text-sm text-ink-muted">✓ Your assistant is up to date</p>
+        )}
+
+      </SectionCard>
+
+      <DangerZone />
+    </div>
+  );
+}
+
+// ── Danger Zone ───────────────────────────────────────────────────────────────
+
+function formatDate(d: Date) {
+  return d.toLocaleDateString(undefined, { year: "numeric", month: "long", day: "numeric" });
+}
+
+function DangerZone() {
+  const { data: me } = useMeQuery();
+  const [open, setOpen] = useState(false);
+  const [input, setInput] = useState("");
+  const [error, setError] = useState("");
+  const deleteAccount = useDeleteAccountMutation();
+  const cancelDeletion = useCancelDeletionMutation();
+
+  const pendingDeletion = me?.tenant?.pending_deletion ?? false;
+  const scheduledAt = me?.tenant?.deletion_scheduled_at
+    ? new Date(me.tenant.deletion_scheduled_at)
+    : null;
+  const hasActiveSub = me?.tenant?.has_active_subscription ?? false;
+
+  const confirmed = input === "DELETE";
+
+  const handleDelete = async () => {
+    if (!confirmed) return;
+    setError("");
+    try {
+      const result = await deleteAccount.mutateAsync();
+      if (result.scheduled) {
+        setOpen(false);
+        setInput("");
+        // UI re-renders from invalidated "me" query showing scheduled state
+      } else {
+        window.location.assign("/signin?deleted=1");
+      }
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Deletion failed. Please try again or contact support.");
+    }
+  };
+
+  const handleCancelDeletion = async () => {
+    setError("");
+    try {
+      await cancelDeletion.mutateAsync();
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Could not cancel deletion. Please try again.");
+    }
+  };
+
+  // ── Already scheduled ─────────────────────────────────────────────────────
+  if (pendingDeletion) {
+    return (
+      <section className="rounded-panel border border-rose-border bg-surface p-5">
+        <h2 className="text-base font-semibold text-rose-text">Danger Zone</h2>
+        <div className="mt-3 rounded-panel border border-rose-border bg-rose-bg p-4 space-y-3">
+          <p className="text-sm font-medium text-rose-text">
+            Your account is scheduled for deletion.
+          </p>
+          <p className="text-sm text-ink-muted">
+            {scheduledAt ? (
+              <>
+                Your subscription runs until{" "}
+                <strong className="text-ink">{formatDate(scheduledAt)}</strong>.
+                You have full access until then — on that date your assistant,
+                journal, and all data will be permanently deleted.
+              </>
+            ) : (
+              "Your account will be deleted at the end of your current billing period. You have full access until then."
+            )}
+          </p>
+          {error && <p className="text-sm text-rose-text">{error}</p>}
+          <button
+            type="button"
+            onClick={handleCancelDeletion}
+            disabled={cancelDeletion.isPending}
+            className="rounded-full border border-border-strong px-4 py-2 text-sm font-medium text-ink transition hover:border-border-strong disabled:opacity-50"
+          >
+            {cancelDeletion.isPending ? "Cancelling…" : "Cancel — keep my account"}
+          </button>
+        </div>
+      </section>
+    );
+  }
+
+  // ── Normal state ──────────────────────────────────────────────────────────
+  return (
+    <section className="rounded-panel border border-rose-border bg-surface p-5">
+      <h2 className="text-base font-semibold text-rose-text">Danger Zone</h2>
+      <p className="mt-1 text-sm text-ink-muted">
+        Permanently delete your account and all associated data.
+      </p>
+
+      {!open ? (
+        <button
+          type="button"
+          onClick={() => setOpen(true)}
+          className="mt-4 rounded-full border border-rose-border px-4 py-2 text-sm font-medium text-rose-text transition hover:bg-rose-bg"
+        >
+          Delete my account
+        </button>
+      ) : (
+        <div className="mt-4 space-y-4 rounded-panel border border-rose-border bg-rose-bg p-4">
+          {/* Access period notice — shown prominently before they commit */}
+          {hasActiveSub && (
+            <div className="rounded-panel border border-rose-border/60 bg-surface px-3.5 py-2.5 text-sm text-ink-muted">
+              You&apos;ll keep full access until the end of your current billing period.
+              The exact deletion date will be confirmed after you submit.
+            </div>
+          )}
+
+          <div className="space-y-1.5">
+            <p className="text-sm font-medium text-rose-text">What gets deleted:</p>
+            <ul className="ml-4 list-disc space-y-0.5 text-sm text-ink-muted">
+              {hasActiveSub ? (
+                <li>Subscription cancelled — deletion scheduled for end of billing period</li>
+              ) : (
+                <li>Account deleted immediately</li>
+              )}
+              <li>Your AI assistant and all its memory</li>
+              <li>All journal entries, documents, and goals</li>
+              <li>No recovery possible after deletion</li>
+            </ul>
+          </div>
+
+          <div>
+            <label className="block text-sm font-medium text-rose-text">
+              Type <span className="font-mono font-bold">DELETE</span> to confirm
+            </label>
+            <input
+              type="text"
+              value={input}
+              onChange={(e) => { setInput(e.target.value); setError(""); }}
+              placeholder="DELETE"
+              className="mt-1.5 w-full rounded-panel border border-rose-border bg-surface px-3 py-2 text-sm font-mono text-ink placeholder:text-ink-faint focus:border-rose-text focus:outline-none focus:ring-1 focus:ring-rose-border"
+              autoComplete="off"
+              spellCheck={false}
+            />
+          </div>
+
+          {error && <p className="text-sm text-rose-text">{error}</p>}
+
+          <div className="flex flex-wrap gap-2">
+            <button
+              type="button"
+              onClick={handleDelete}
+              disabled={!confirmed || deleteAccount.isPending}
+              className="rounded-full bg-rose-text px-4 py-2 text-sm font-medium text-white transition hover:opacity-85 disabled:cursor-not-allowed disabled:opacity-40"
+            >
+              {deleteAccount.isPending
+                ? "Processing…"
+                : hasActiveSub
+                  ? "Schedule deletion"
+                  : "Delete my account"}
+            </button>
+            <button
+              type="button"
+              onClick={() => { setOpen(false); setInput(""); setError(""); }}
+              className="rounded-full border border-border px-4 py-2 text-sm transition hover:border-border-strong"
+            >
+              Never mind
+            </button>
+          </div>
+        </div>
+      )}
+    </section>
+  );
+}

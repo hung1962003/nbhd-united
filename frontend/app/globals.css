@@ -1,0 +1,572 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+:root {
+  /* ── Constellation Dark Palette ── */
+  --ink: #e2e8f0;
+  --ink-muted: rgba(226, 232, 240, 0.72);
+  --ink-faint: rgba(226, 232, 240, 0.42);
+  --mist: #0f1419;
+  --bg: #0b0f13;
+  --surface: #161b22;
+  --surface-elevated: #1e252e;
+  --surface-hover: rgba(226, 232, 240, 0.06);
+  --card: rgba(22, 27, 34, 0.95);
+  --accent: #7C6BF0;
+  --accent-hi: #9B8DF5;
+  --accent-hover: #9B8DF5;
+  --signal: #4ECDC4;
+  --signal-text: #4ECDC4;
+  --signal-faint: rgba(78, 205, 196, 0.15);
+  /* Engagement prototype action accents */
+  --engagement-show-up: #79A7FF;
+  --engagement-move: #4ECDC4;
+  --engagement-sit: #73D6A0;
+  --engagement-reflect: #A882FF;
+  --engagement-rest: #F2C66D;
+  --telegram: #229ED9;
+  --line: #06C755;
+  --border: rgba(226, 232, 240, 0.12);
+  --border-strong: rgba(226, 232, 240, 0.25);
+  --rose-bg: rgba(159, 18, 57, 0.15);
+  --rose-border: rgba(244, 63, 94, 0.25);
+  --rose-text: #fda4af;
+  --amber-bg: rgba(146, 64, 14, 0.15);
+  --amber-border: rgba(245, 158, 11, 0.25);
+  --amber-text: #fcd34d;
+  --emerald-bg: rgba(6, 95, 70, 0.15);
+  --emerald-text: #6ee7b7;
+  --overlay: rgba(0, 0, 0, 0.70);
+  --shadow-panel: 0 20px 55px rgba(0, 0, 0, 0.35);
+  --bg-gradient:
+    radial-gradient(circle at 20% 30%, rgba(124, 107, 240, 0.05) 0%, transparent 40%),
+    radial-gradient(circle at 80% 70%, rgba(78, 205, 196, 0.05) 0%, transparent 40%),
+    radial-gradient(circle at 50% 50%, rgba(232, 180, 184, 0.03) 0%, transparent 50%),
+    linear-gradient(180deg, #0b0f13 0%, #0d1218 48%, #0b0f13 100%);
+  --grid-opacity: 0.08;
+  --font-display: "DM Serif Display", "Georgia", "Times New Roman", serif;
+  --font-body: "Plus Jakarta Sans", "Avenir Next", "Trebuchet MS", "Verdana", sans-serif;
+  --font-mono: "IBM Plex Mono", "Consolas", "Menlo", monospace;
+  --font-headline: "Space Grotesk", sans-serif;
+  --font-serif: "Instrument Serif", Georgia, serif;
+  color-scheme: dark;
+
+  /* Focus ring */
+  --focus-ring: 0 0 0 3px rgba(124, 107, 240, 0.15), 0 0 0 2px #7C6BF0;
+  --focus-ring-offset: 0 0 0 2px var(--surface), 0 0 0 4px #7C6BF0;
+
+  /* Fluid spacing */
+  --space-xs: clamp(0.25rem, 0.5vw, 0.5rem);
+  --space-sm: clamp(0.5rem, 1vw, 0.75rem);
+  --space-md: clamp(0.75rem, 1.5vw + 0.25rem, 1.5rem);
+  --space-lg: clamp(1.25rem, 2.5vw + 0.25rem, 2.5rem);
+  --space-xl: clamp(2rem, 4vw + 0.5rem, 5rem);
+  --page-pad: clamp(1rem, 4vw, 2.5rem);
+
+  /* Status tones */
+  --status-emerald-bg: rgba(6, 95, 70, 0.2);
+  --status-emerald-text: #6ee7b7;
+  --status-rose-bg: rgba(159, 18, 57, 0.2);
+  --status-rose-text: #fda4af;
+  --status-amber-bg: rgba(146, 64, 14, 0.2);
+  --status-amber-text: #fcd34d;
+  --status-sky-bg: rgba(7, 89, 133, 0.2);
+  --status-sky-text: #7dd3fc;
+  --status-slate-bg: rgba(51, 65, 85, 0.2);
+  --status-slate-text: #cbd5e1;
+  --status-indigo-bg: rgba(55, 48, 163, 0.2);
+  --status-indigo-text: #a5b4fc;
+  --status-violet-bg: rgba(91, 33, 182, 0.2);
+  --status-violet-text: #c4b5fd;
+  --status-orange-bg: rgba(154, 52, 18, 0.2);
+  --status-orange-text: #fdba74;
+
+  /* Constellation tokens (used by landing + synapse) */
+  --constellation-purple: #7C6BF0;
+  --constellation-pink: #E8B4B8;
+  --constellation-teal: #4ECDC4;
+  --constellation-dark: #0B0F13;
+  --constellation-surface: rgba(255, 255, 255, 0.03);
+  --constellation-border: rgba(255, 255, 255, 0.1);
+  --constellation-text: #E2E8F0;
+  --constellation-text-muted: #94A3B8;
+  --constellation-text-faint: #64748B;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html,
+body {
+  margin: 0;
+  min-height: 100%;
+}
+
+body {
+  background: var(--bg);
+  color: var(--ink);
+  font-family: var(--font-body), sans-serif;
+  text-rendering: optimizeLegibility;
+}
+
+.font-mono {
+  font-family: var(--font-mono), monospace;
+}
+
+.font-display {
+  font-family: var(--font-display), serif;
+}
+
+.btn-shine {
+  position: relative;
+  overflow: hidden;
+  box-shadow: inset 0 1px 0 rgba(255,255,255,0.08);
+}
+.btn-shine::after {
+  content: "";
+  position: absolute;
+  inset: 0;
+  background: linear-gradient(to bottom, rgba(255,255,255,0.08), transparent 50%);
+  opacity: 0;
+  transition: opacity 200ms ease;
+  pointer-events: none;
+  border-radius: inherit;
+}
+.btn-shine:hover::after { opacity: 1; }
+
+.landing-dark {
+  background-color: var(--constellation-dark);
+  color: var(--constellation-text);
+}
+
+.constellation-bg {
+  background-image:
+    radial-gradient(circle at 20% 30%, rgba(124, 107, 240, 0.05) 0%, transparent 40%),
+    radial-gradient(circle at 80% 70%, rgba(78, 205, 196, 0.05) 0%, transparent 40%),
+    radial-gradient(circle at 50% 50%, rgba(232, 180, 184, 0.03) 0%, transparent 50%);
+}
+
+.glass-card {
+  background: var(--constellation-surface);
+  backdrop-filter: blur(12px);
+  -webkit-backdrop-filter: blur(12px);
+  border: 1px solid var(--constellation-border);
+}
+
+.glass-card-horizons {
+  background: rgba(15, 20, 24, 0.7);
+  backdrop-filter: blur(12px);
+  -webkit-backdrop-filter: blur(12px);
+  border: 1px solid rgba(114, 118, 123, 0.15);
+  border-radius: 1.25rem;
+}
+
+.glow-signal {
+  box-shadow: 0 0 12px rgba(78, 205, 196, 0.3);
+}
+
+.glow-purple {
+  box-shadow: 0 0 20px rgba(124, 107, 240, 0.3);
+}
+
+.glow-purple-hover:hover {
+  box-shadow: 0 0 30px rgba(124, 107, 240, 0.45);
+}
+
+/* ── Onboarding nebula background ── */
+.nebula-bg {
+  background-color: #060a0e;
+  color: #e0e3e8;
+  background-image:
+    radial-gradient(ellipse 140% 100% at 65% 55%, rgba(78, 205, 196, 0.18) 0%, rgba(78, 205, 196, 0.04) 40%, transparent 70%),
+    radial-gradient(ellipse 110% 90% at 10% 20%, rgba(78, 205, 196, 0.12) 0%, rgba(78, 205, 196, 0.02) 45%, transparent 65%),
+    radial-gradient(ellipse 120% 80% at 40% 90%, rgba(124, 107, 240, 0.10) 0%, rgba(124, 107, 240, 0.02) 40%, transparent 60%),
+    radial-gradient(ellipse 80% 70% at 92% 10%, rgba(78, 205, 196, 0.09) 0%, transparent 55%),
+    radial-gradient(ellipse 50% 80% at 5% 50%, rgba(124, 107, 240, 0.07) 0%, transparent 50%),
+    radial-gradient(ellipse 200% 200% at 50% 50%, rgba(78, 205, 196, 0.05) 0%, transparent 60%);
+  background-attachment: fixed;
+}
+
+@keyframes pulseNode {
+  0% { box-shadow: 0 0 0 0 rgba(199, 191, 255, 0.5), 0 0 20px rgba(199, 191, 255, 0.4); }
+  70% { box-shadow: 0 0 0 10px rgba(199, 191, 255, 0), 0 0 20px rgba(199, 191, 255, 0.4); }
+  100% { box-shadow: 0 0 0 0 rgba(199, 191, 255, 0), 0 0 20px rgba(199, 191, 255, 0.4); }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .nebula-bg { background-attachment: scroll; }
+  @keyframes pulseNode { 0%, 100% { box-shadow: 0 0 20px rgba(199, 191, 255, 0.4); } }
+}
+
+a {
+  color: inherit;
+  text-decoration: none;
+}
+
+/* ── Focus Styles ── */
+
+:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 3px;
+}
+
+/* ── Skip Link ── */
+
+.skip-link {
+  position: fixed;
+  top: -100%;
+  left: 1rem;
+  z-index: 9999;
+  background: var(--accent);
+  color: #ffffff;
+  padding: 0.75rem 1.5rem;
+  border-radius: 0 0 0.75rem 0.75rem;
+  font-weight: 600;
+  font-size: 0.875rem;
+  text-decoration: none;
+  transition: top 200ms ease;
+}
+
+.skip-link:focus {
+  top: 0;
+  outline: none;
+}
+
+/* ── Scrollbar Hiding (horizontal scroll containers) ── */
+
+.scrollbar-none {
+  scrollbar-width: none;
+  -ms-overflow-style: none;
+}
+.scrollbar-none::-webkit-scrollbar {
+  display: none;
+}
+
+/* ── Reduced Motion ── */
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+    scroll-behavior: auto !important;
+  }
+}
+
+/* ── High Contrast ── */
+
+@media (forced-colors: active) {
+  :root {
+    --accent: LinkText;
+    --ink: CanvasText;
+    --bg: Canvas;
+    --surface: Canvas;
+    --border: CanvasText;
+    --engagement-show-up: Highlight;
+    --engagement-move: Highlight;
+    --engagement-sit: Highlight;
+    --engagement-reflect: Highlight;
+    --engagement-rest: CanvasText;
+  }
+}
+
+/* ── Selection ── */
+::selection {
+  background: rgba(124, 107, 240, 0.25);
+  color: #e2e8f0;
+}
+
+/* ── Placeholder ── */
+::placeholder {
+  color: var(--ink-faint);
+  opacity: 1;
+}
+
+/* ── Scrollbar ── */
+html {
+  scrollbar-width: thin;
+  scrollbar-color: rgba(124, 107, 240, 0.35) transparent;
+}
+
+::-webkit-scrollbar {
+  width: 4px;
+}
+
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+::-webkit-scrollbar-thumb {
+  background: rgba(124, 107, 240, 0.35);
+  border-radius: 100px;
+}
+
+::-webkit-scrollbar-thumb:hover {
+  background: rgba(124, 107, 240, 0.55);
+}
+
+/* ── Safe Areas ── */
+html,
+body {
+  padding: env(safe-area-inset-top) env(safe-area-inset-right) env(safe-area-inset-bottom) env(safe-area-inset-left);
+}
+
+@supports (padding: max(0px)) {
+  .pb-safe {
+    padding-bottom: max(0.75rem, env(safe-area-inset-bottom));
+  }
+  .pb-safe-lg {
+    padding-bottom: max(1.25rem, env(safe-area-inset-bottom));
+  }
+  .min-h-safe {
+    min-height: calc(100dvh - env(safe-area-inset-top) - env(safe-area-inset-bottom));
+  }
+}
+
+/* ── Page Transitions ── */
+@supports (view-transition-name: page) {
+  ::view-transition-old(page),
+  ::view-transition-new(page) {
+    animation-duration: 200ms;
+    animation-timing-function: cubic-bezier(0.4, 0, 0.2, 1);
+  }
+}
+
+.view-transition-enter {
+  animation: pageEnter 200ms cubic-bezier(0.4, 0, 0.2, 1);
+}
+
+.view-transition-exit {
+  animation: pageExit 200ms cubic-bezier(0.4, 0, 0.2, 1);
+}
+
+@keyframes pageEnter {
+  from {
+    opacity: 0;
+    transform: translateY(8px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+@keyframes pageExit {
+  from {
+    opacity: 1;
+    transform: translateY(0);
+  }
+  to {
+    opacity: 0;
+    transform: translateY(-8px);
+  }
+}
+
+/* ── Page Load ── */
+@keyframes contentFadeUp {
+  from {
+    opacity: 0;
+    transform: translateY(12px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+.content-fade-up {
+  /* NO `forwards`. This class wraps every page (root layout). With `forwards`
+     the element retains the final keyframe transform as an identity matrix —
+     and ANY transform (even identity) makes it the containing block for
+     `position:fixed` descendants, collapsing full-screen fixed overlays to this
+     wrapper's 0 height (black game canvas, loading text pinned to top, skip-link
+     `top:-100%` resolving to 0 so it's always visible). Without `forwards` the
+     element reverts to its base style (no transform) after the fade — same
+     end state visually (translateY(0) ≡ none), but the containing block is gone. */
+  animation: contentFadeUp 200ms cubic-bezier(0.4, 0, 0.2, 1);
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .content-fade-up {
+    animation: none;
+  }
+}
+
+/* ── Stardust animation ── */
+@keyframes stardust {
+  0%, 100% {
+    opacity: 0.3;
+    transform: translateY(0) scale(1);
+  }
+  50% {
+    opacity: 1;
+    transform: translateY(-8px) scale(1.15);
+  }
+}
+
+.stardust-dot {
+  animation: stardust 3s ease-in-out infinite;
+}
+
+/* ── Constellation line animation ── */
+@keyframes drawLine {
+  from {
+    stroke-dashoffset: 100;
+  }
+  to {
+    stroke-dashoffset: 0;
+  }
+}
+
+.constellation-line {
+  stroke-dasharray: 100;
+  stroke-dashoffset: 100;
+  animation: drawLine 1.5s ease-out forwards;
+}
+
+/* ── Saved checkmark animation ── */
+@keyframes checkmarkIn {
+  from {
+    opacity: 0;
+    transform: scale(0.8) translateY(4px);
+  }
+  to {
+    opacity: 1;
+    transform: scale(1) translateY(0);
+  }
+}
+
+.saved-pill {
+  animation: checkmarkIn 200ms cubic-bezier(0.4, 0, 0.2, 1) forwards;
+}
+
+/* ── Skeleton shimmer ── */
+@keyframes stardustShimmer {
+  0% {
+    background-position: -200% 0;
+  }
+  100% {
+    background-position: 200% 0;
+  }
+}
+
+.stardust-skeleton {
+  background: linear-gradient(
+    90deg,
+    rgba(124, 107, 240, 0.08) 0%,
+    rgba(124, 107, 240, 0.15) 25%,
+    rgba(78, 205, 196, 0.1) 50%,
+    rgba(124, 107, 240, 0.15) 75%,
+    rgba(124, 107, 240, 0.08) 100%
+  );
+  background-size: 400% 100%;
+  animation: stardustShimmer 2s ease-in-out infinite;
+}
+
+/* ── Left border glow for active items ── */
+.active-glow-left {
+  position: relative;
+}
+
+.active-glow-left::before {
+  content: '';
+  position: absolute;
+  left: 0;
+  top: 0.25rem;
+  bottom: 0.25rem;
+  width: 2px;
+  background: var(--accent);
+  border-radius: 0 2px 2px 0;
+  box-shadow: 0 0 8px rgba(124, 107, 240, 0.4), 0 0 16px rgba(124, 107, 240, 0.2);
+}
+
+/* ── Mobile tab bar shadow ── */
+.mobile-tab-shadow {
+  box-shadow: 0 -1px 12px rgba(0, 0, 0, 0.4), 0 -1px 0 rgba(255, 255, 255, 0.03);
+}
+
+/* ── Bottom sheet ── */
+@keyframes bottomSheetEnter {
+  from {
+    transform: translateY(100%);
+  }
+  to {
+    transform: translateY(0);
+  }
+}
+
+.bottom-sheet-enter {
+  animation: bottomSheetEnter 250ms cubic-bezier(0.4, 0, 0.2, 1) forwards;
+}
+
+/* ── Core: breathing orb (mindfulness) ── */
+@keyframes breathe {
+  0%, 100% { transform: scale(1); }
+  50% { transform: scale(1.055); }
+}
+@keyframes breatheGlow {
+  0%, 100% { opacity: 0.45; transform: scale(1); }
+  50% { opacity: 0.85; transform: scale(1.14); }
+}
+@keyframes breatheRing {
+  0% { opacity: 0.55; transform: scale(0.82); }
+  100% { opacity: 0; transform: scale(1.6); }
+}
+.core-breathe { animation: breathe 7s ease-in-out infinite; }
+.core-breathe-glow { animation: breatheGlow 7s ease-in-out infinite; }
+.core-breathe-ring { animation: breatheRing 7s ease-out infinite; }
+
+@keyframes eqbar {
+  0%, 100% { height: 30%; }
+  50% { height: 100%; }
+}
+
+@keyframes coreTextShimmer {
+  0% { background-position: 200% 0; }
+  100% { background-position: -200% 0; }
+}
+/* Each composing line softly fades up as it mounts (the element is keyed by
+   message index), then a slow shimmer drifts across — calm, not flashing. */
+@keyframes coreComposeFadeIn {
+  0% { opacity: 0; transform: translateY(3px); }
+  100% { opacity: 1; transform: translateY(0); }
+}
+.core-shimmer {
+  background: linear-gradient(90deg, var(--ink-faint), var(--ink) 50%, var(--ink-faint));
+  background-size: 200% 100%;
+  -webkit-background-clip: text;
+  background-clip: text;
+  color: transparent;
+  animation: coreComposeFadeIn 1s ease-out, coreTextShimmer 5s linear infinite;
+}
+@media (prefers-reduced-motion: reduce) {
+  .core-shimmer { animation: none; color: var(--ink-muted); }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .core-breathe,
+  .core-breathe-glow,
+  .core-breathe-ring {
+    animation: none;
+  }
+}
+
+/* ── Print ── */
+
+@media print {
+  body {
+    background: #fff !important;
+    color: #000 !important;
+    font-size: 12pt;
+  }
+
+  nav,
+  .skip-link,
+  footer {
+    display: none !important;
+  }
+}

@@ -1,0 +1,567 @@
+"""Dashboard API — aggregated views for the frontend."""
+
+from __future__ import annotations
+
+import re
+from datetime import date, datetime, timedelta
+
+from django.db.models import Count, Sum
+from django.utils import timezone
+from rest_framework import status
+from rest_framework.permissions import IsAuthenticated
+from rest_framework.response import Response
+from rest_framework.views import APIView
+
+from apps.billing.models import UsageRecord
+from apps.common.cache import tenant_cache
+from apps.insights.models import AssistantInsight
+from apps.integrations.models import Integration
+from apps.journal.models import Document, JournalEntry, PendingExtraction, WeeklyReview
+from apps.journal.services import is_pristine_goals_scaffold
+from apps.tenants.models import Tenant
+
+_WEEKLY_SLUG_RE = re.compile(r"^(\d{4})-(\d{2})-(\d{2})$")
+_ISO_WEEKLY_SLUG_RE = re.compile(r"^(\d{4})-W(\d{2})$")
+
+
+def _clean_markdown_preview(markdown: str, max_chars: int = 180) -> str:
+    """Produce a clean, prose-only preview snippet from markdown.
+
+    Drops heading lines entirely (they become noise in a short preview),
+    strips formatting markers, and collapses whitespace. The output is
+    plain text suitable for display on a compact dashboard card.
+    """
+    if not markdown:
+        return ""
+    text = markdown
+    # Drop heading lines entirely — the first heading typically restates the title
+    text = re.sub(r"^\s*#{1,6}\s+.*$", "", text, flags=re.MULTILINE)
+    # Drop horizontal rules
+    text = re.sub(r"^\s*[-*_]{3,}\s*$", "", text, flags=re.MULTILINE)
+    # Strip bold/italic markers
+    text = re.sub(r"\*\*(.+?)\*\*", r"\1", text)
+    text = re.sub(r"__(.+?)__", r"\1", text)
+    text = re.sub(r"(?<!\w)\*(.+?)\*(?!\w)", r"\1", text)
+    text = re.sub(r"(?<!\w)_(.+?)_(?!\w)", r"\1", text)
+    # Markdown links → just the visible text
+    text = re.sub(r"\[([^\]]+)\]\([^)]+\)", r"\1", text)
+    # Inline code
+    text = re.sub(r"`(.+?)`", r"\1", text)
+    # List markers (unordered + ordered)
+    text = re.sub(r"^\s*[-*+]\s+", "", text, flags=re.MULTILINE)
+    text = re.sub(r"^\s*\d+\.\s+", "", text, flags=re.MULTILINE)
+    # Blockquote markers
+    text = re.sub(r"^\s*>\s*", "", text, flags=re.MULTILINE)
+    # Collapse whitespace
+    text = re.sub(r"\s+", " ", text).strip()
+    if len(text) > max_chars:
+        from apps.pii.authoring import truncate_placeholder_safe
+
+        text = truncate_placeholder_safe(text, max_chars - 1).rstrip(" ,;:-") + "\u2026"
+    return text
+
+
+def _dedupe_legacy_goal_docs(docs: list[dict]) -> list[dict]:
+    """Collapse legacy ``Document(kind=GOAL)`` rows that share a normalized key.
+
+    The typed-Goal migration (``migrate_documents_to_typed_models._goal_key``)
+    folds title-collisions like "Goals"/"Goal" into a single typed Goal but
+    marks ONLY the primary source Document as migrated — the other rows in the
+    group are left untouched and keep surfacing as separate, duplicate cards on
+    Horizons (the reported "three Goals cards" symptom). Reproduce that grouping
+    here, at read time, keeping just the most-recently-updated document per key.
+    Pure and reversible: no rows are deleted or mutated, no schema change. Uses
+    the exact same normalization as the migration's ``_goal_key`` so the display
+    collapses precisely what the migration would have consolidated.
+    """
+    best: dict[str, dict] = {}
+    for doc in docs:
+        raw = (doc.get("title") or doc.get("slug") or "").strip().lower()
+        key = raw.rstrip("s") or "_blank"
+        current = best.get(key)
+        if current is None or doc["updated_at"] > current["updated_at"]:
+            best[key] = doc
+    return list(best.values())
+
+
+def _derive_week_bounds(slug: str, fallback: date) -> tuple[date, date]:
+    """Return week bounds for a Monday-date or ISO-week document slug.
+
+    Falls back to the Monday/Sunday surrounding ``fallback`` if the slug is not
+    parseable (older slugs, manual entries, etc.).
+    """
+    match = _WEEKLY_SLUG_RE.match(slug or "")
+    if match:
+        try:
+            start = date(int(match.group(1)), int(match.group(2)), int(match.group(3)))
+            return start, start + timedelta(days=6)
+        except ValueError:
+            pass
+    match = _ISO_WEEKLY_SLUG_RE.match(slug or "")
+    if match:
+        try:
+            start = date.fromisocalendar(int(match.group(1)), int(match.group(2)), 1)
+            return start, start + timedelta(days=6)
+        except ValueError:
+            pass
+    monday = fallback - timedelta(days=fallback.weekday())
+    return monday, monday + timedelta(days=6)
+
+
+def _serialize_weekly_document(wd: dict, *, owner_tenant) -> dict:
+    """Shape a Document(kind=weekly) row for the Horizons Weekly Pulse fallback."""
+    from apps.pii.authoring import resolve_receipt_values
+    from apps.pii.redactor import rehydrate_for_tenant
+
+    updated_at = wd["updated_at"]
+    fallback_date = updated_at.date() if isinstance(updated_at, datetime) else updated_at
+    week_start, week_end = _derive_week_bounds(wd.get("slug") or "", fallback_date)
+    title = rehydrate_for_tenant(owner_tenant, wd.get("title") or "Weekly Review")
+    markdown = rehydrate_for_tenant(owner_tenant, wd.get("markdown") or "")
+    return {
+        "id": str(wd["id"]),
+        "title": title,
+        "slug": wd.get("slug") or "",
+        "week_start": str(week_start),
+        "week_end": str(week_end),
+        "preview": _clean_markdown_preview(markdown),
+        "markdown": markdown,
+        "pii_receipts": resolve_receipt_values(
+            wd.get("pii_receipts") or {},
+            getattr(owner_tenant, "pii_entity_map", None),
+        ),
+        "updated_at": updated_at.isoformat(),
+    }
+
+
+def _topic_signals(tenant) -> list[dict]:
+    """Thin wrapper around ``summarize_topic_signals``.
+
+    Lives in this module so the lazy import stays close to its single
+    caller (HorizonsView) and so the views layer can swap to a richer
+    summary later without touching the insights app.
+    """
+    from apps.insights.signals import summarize_topic_signals
+
+    return summarize_topic_signals(tenant)
+
+
+class DashboardView(APIView):
+    """Main dashboard — tenant status, usage, connections."""
+
+    permission_classes = [IsAuthenticated]
+
+    @tenant_cache(ttl=30, tag="dashboard")
+    def get(self, request):
+        try:
+            tenant = request.user.tenant
+        except Tenant.DoesNotExist:
+            return Response(
+                {"detail": "No tenant found."},
+                status=status.HTTP_404_NOT_FOUND,
+            )
+
+        # Usage stats
+        usage = UsageRecord.objects.filter(tenant=tenant).aggregate(
+            total_input_tokens=Sum("input_tokens"),
+            total_output_tokens=Sum("output_tokens"),
+            total_cost=Sum("cost_estimate"),
+        )
+
+        # Connected services
+        connections = list(
+            Integration.objects.filter(
+                tenant=tenant,
+                status=Integration.Status.ACTIVE,
+            ).values("provider", "provider_email", "connected_at")
+        )
+
+        return Response(
+            {
+                "tenant": {
+                    "id": str(tenant.id),
+                    "status": tenant.status,
+                    "model_tier": tenant.model_tier,
+                    "provisioned_at": tenant.provisioned_at,
+                },
+                "usage": {
+                    "messages_today": tenant.messages_today,
+                    "messages_this_month": tenant.messages_this_month,
+                    "tokens_this_month": tenant.tokens_this_month,
+                    "estimated_cost_this_month": str(tenant.estimated_cost_this_month),
+                    "monthly_token_budget": tenant.effective_token_budget,
+                    "total_input_tokens": usage["total_input_tokens"] or 0,
+                    "total_output_tokens": usage["total_output_tokens"] or 0,
+                    "total_cost": str(usage["total_cost"] or 0),
+                },
+                "connections": connections,
+            }
+        )
+
+
+class UsageHistoryView(APIView):
+    """Usage history — recent usage records."""
+
+    permission_classes = [IsAuthenticated]
+
+    def get(self, request):
+        try:
+            tenant = request.user.tenant
+        except Tenant.DoesNotExist:
+            return Response({"detail": "No tenant found."}, status=status.HTTP_404_NOT_FOUND)
+
+        records = UsageRecord.objects.filter(tenant=tenant).order_by("-created_at")[:50]
+        data = [
+            {
+                "id": str(r.id),
+                "event_type": r.event_type,
+                "input_tokens": r.input_tokens,
+                "output_tokens": r.output_tokens,
+                "model_used": r.model_used,
+                "cost_estimate": str(r.cost_estimate),
+                "created_at": r.created_at,
+            }
+            for r in records
+        ]
+        return Response({"results": data})
+
+
+class HorizonsView(APIView):
+    """Horizons — goals, momentum, and weekly pulse for the frontend."""
+
+    permission_classes = [IsAuthenticated]
+
+    @tenant_cache(ttl=60, tag="dashboard")
+    def get(self, request):
+        try:
+            tenant = request.user.tenant
+        except Tenant.DoesNotExist:
+            return Response({"detail": "No tenant found."}, status=status.HTTP_404_NOT_FOUND)
+
+        today = timezone.now().date()
+        thirty_days_ago = today - timedelta(days=29)
+
+        # 1. Active goals — dual-read for the #624 typed-Goal migration.
+        # Union typed ACTIVE Goal rows with legacy Document(kind=GOAL) rows,
+        # excluding legacy docs that have already been migrated to typed Goals
+        # (tracked via Goal.migrated_from_document). Typed rows serialize into
+        # the same dict shape the frontend expects (description → markdown,
+        # synthesized slug from id since typed Goals don't have a slug column).
+        # Local import — see feedback_local_reimport_pattern memory.
+        from apps.journal.models import Goal
+
+        typed_goals_qs = Goal.objects.filter(tenant=tenant, status=Goal.Status.ACTIVE).order_by("-updated_at")
+        migrated_doc_ids = list(
+            typed_goals_qs.exclude(migrated_from_document_id__isnull=True).values_list(
+                "migrated_from_document_id", flat=True
+            )
+        )
+
+        typed_goals = [
+            {
+                "id": g.id,
+                "title": g.title,
+                "slug": f"typed:{g.id}",
+                "markdown": g.description or "",
+                "pii_receipts": g.pii_receipts or {},
+                "created_at": g.created_at,
+                "updated_at": g.updated_at,
+            }
+            for g in typed_goals_qs[:20]
+        ]
+        legacy_goals = list(
+            Document.objects.filter(
+                tenant=tenant,
+                kind=Document.Kind.GOAL,
+            )
+            .exclude(id__in=migrated_doc_ids)
+            .order_by("-updated_at")[:20]
+            .values(
+                "id",
+                "title",
+                "slug",
+                "markdown",
+                "pii_receipts",
+                "created_at",
+                "updated_at",
+            )
+        )
+        legacy_goals = [goal for goal in legacy_goals if not is_pristine_goals_scaffold(goal["markdown"] or "")]
+        # Collapse title-colliding legacy docs the typed-Goal migration left
+        # un-pruned (see _dedupe_legacy_goal_docs) so the same goal renders once.
+        legacy_goals = _dedupe_legacy_goal_docs(legacy_goals)
+        goals = sorted(
+            typed_goals + legacy_goals,
+            key=lambda g: g["updated_at"],
+            reverse=True,
+        )[:20]
+
+        from apps.pii.authoring import receipt_placeholders, resolve_receipt_values
+        from apps.pii.redactor import rehydrate_for_tenant
+
+        for goal in goals:
+            goal["title"] = rehydrate_for_tenant(tenant, goal["title"] or "")
+            goal["markdown"] = rehydrate_for_tenant(tenant, goal["markdown"] or "")
+
+        # 2. Pending goal/task extractions (exclude expired). Purpose
+        # hypotheses render as their own North Star card below, not here.
+        pending = list(
+            PendingExtraction.objects.filter(
+                tenant=tenant,
+                kind__in=[PendingExtraction.Kind.GOAL, PendingExtraction.Kind.TASK],
+                status=PendingExtraction.Status.PENDING,
+                expires_at__gte=timezone.now(),
+            )
+            .order_by("-created_at")[:10]
+            .values(
+                "id",
+                "kind",
+                "text",
+                "pii_receipts",
+                "confidence",
+                "source_date",
+                "created_at",
+            )
+        )
+
+        # 3. Weekly pulse (last 4 weeks) — try legacy model first
+        weeks = list(
+            WeeklyReview.objects.filter(
+                tenant=tenant,
+            )
+            .order_by("-week_start")[:4]
+            .values(
+                "week_start",
+                "week_end",
+                "week_rating",
+                "top_wins",
+                "pii_receipts",
+            )
+        )
+
+        # 3b. Also fetch Document(kind='weekly') as fallback
+        weekly_docs = list(
+            Document.objects.filter(
+                tenant=tenant,
+                kind=Document.Kind.WEEKLY,
+            )
+            .order_by("-updated_at")[:4]
+            .values(
+                "id",
+                "title",
+                "slug",
+                "markdown",
+                "pii_receipts",
+                "updated_at",
+            )
+        )
+
+        # 4. Mood trend (30 days)
+        moods = list(
+            JournalEntry.objects.filter(
+                tenant=tenant,
+                date__gte=thirty_days_ago,
+            )
+            .order_by("date")
+            .values("date", "mood", "energy", "pii_receipts")
+        )
+
+        # 5. Momentum (30 days) — message counts + journal dates
+        message_counts = dict(
+            UsageRecord.objects.filter(
+                tenant=tenant,
+                created_at__date__gte=thirty_days_ago,
+            )
+            .values_list("created_at__date")
+            .annotate(count=Count("id"))
+        )
+        journal_dates = set(
+            JournalEntry.objects.filter(
+                tenant=tenant,
+                date__gte=thirty_days_ago,
+            ).values_list("date", flat=True)
+        )
+        doc_dates = set(
+            Document.objects.filter(
+                tenant=tenant,
+                kind=Document.Kind.DAILY,
+                created_at__date__gte=thirty_days_ago,
+            ).values_list("created_at__date", flat=True)
+        )
+        all_journal_dates = journal_dates | doc_dates
+
+        momentum = []
+        for i in range(30):
+            d = today - timedelta(days=29 - i)
+            mc = message_counts.get(d, 0)
+            hj = d in all_journal_dates
+            momentum.append({"date": str(d), "message_count": mc, "has_journal": hj})
+
+        # Current streak (consecutive days with activity, from today backwards)
+        streak = 0
+        for i in range(29, -1, -1):
+            day = momentum[i]
+            if day["message_count"] > 0 or day["has_journal"]:
+                streak += 1
+            else:
+                break
+
+        # 6. Assistant insights — the assistant's memory of patterns it has
+        # noticed about this user. Most recent open + confirmed, capped at 20.
+        # Refuted are intentionally excluded from the user view (kept in DB
+        # for the assistant's own reference, but not surfaced as cards).
+        insights = list(
+            AssistantInsight.objects.filter(
+                tenant=tenant,
+                status__in=[
+                    AssistantInsight.Status.OPEN,
+                    AssistantInsight.Status.CONFIRMED,
+                ],
+            )
+            .select_related("topic")
+            .order_by("-created_at")[:20]
+        )
+
+        # 7. North Star — the direction above goals. One unified list the
+        # Horizons card renders: confirmed/evolving Purpose rows plus anything
+        # still awaiting the user's yes/no (proposed Purpose rows the assistant
+        # created live, and nightly purpose-hypothesis cards). ``source`` tells
+        # the frontend which confirm/reject path to call. Local import — see
+        # feedback_local_reimport_pattern memory.
+        from apps.journal.models import Purpose
+
+        north_star = [
+            {
+                "id": str(p.id),
+                "source": "purpose",
+                "statement": rehydrate_for_tenant(tenant, p.statement),
+                "pillars": p.pillars or [],
+                "status": p.status,
+                "origin": p.origin,
+                "pii_receipts": resolve_receipt_values(
+                    p.pii_receipts or {},
+                    getattr(tenant, "pii_entity_map", None),
+                ),
+                "created_at": p.created_at.isoformat(),
+            }
+            for p in Purpose.objects.filter(
+                tenant=tenant,
+                status__in=[
+                    Purpose.Status.CONFIRMED,
+                    Purpose.Status.EVOLVING,
+                    Purpose.Status.PROPOSED,
+                ],
+            ).order_by("-updated_at")[:20]
+        ]
+        for card in PendingExtraction.objects.filter(
+            tenant=tenant,
+            kind=PendingExtraction.Kind.PURPOSE,
+            status=PendingExtraction.Status.PENDING,
+            expires_at__gte=timezone.now(),
+        ).order_by("-created_at")[:10]:
+            north_star.append(
+                {
+                    "id": str(card.id),
+                    "source": "extraction",
+                    "statement": rehydrate_for_tenant(tenant, card.text),
+                    "pillars": card.tags or [],
+                    "status": "proposed",
+                    "origin": "assistant_proposed",
+                    "pii_receipts": resolve_receipt_values(
+                        card.pii_receipts or {},
+                        getattr(tenant, "pii_entity_map", None),
+                    ),
+                    "created_at": card.created_at.isoformat(),
+                }
+            )
+
+        return Response(
+            {
+                "north_star": north_star,
+                "goals": [
+                    {
+                        "id": str(g["id"]),
+                        "title": g["title"] or "Untitled Goal",
+                        "slug": g["slug"],
+                        "preview": _clean_markdown_preview(g["markdown"] or ""),
+                        "markdown": g["markdown"] or "",
+                        "pii_receipts": resolve_receipt_values(
+                            g.get("pii_receipts") or {},
+                            getattr(tenant, "pii_entity_map", None),
+                        ),
+                        "created_at": g["created_at"].isoformat(),
+                        "updated_at": g["updated_at"].isoformat(),
+                    }
+                    for g in goals
+                ],
+                "pending_extractions": [
+                    {
+                        "id": str(p["id"]),
+                        "kind": p["kind"],
+                        "text": rehydrate_for_tenant(tenant, p["text"]),
+                        "pii_receipts": resolve_receipt_values(
+                            p.get("pii_receipts") or {},
+                            getattr(tenant, "pii_entity_map", None),
+                        ),
+                        "confidence": p["confidence"],
+                        "source_date": str(p["source_date"]) if p["source_date"] else None,
+                        "created_at": p["created_at"].isoformat(),
+                    }
+                    for p in pending
+                ],
+                "weekly_pulse": [
+                    {
+                        "week_start": str(w["week_start"]),
+                        "week_end": str(w["week_end"]),
+                        "week_rating": w["week_rating"],
+                        "top_win": (rehydrate_for_tenant(tenant, w["top_wins"][0]) if w["top_wins"] else None),
+                        "pii_receipts": resolve_receipt_values(
+                            w.get("pii_receipts") or {},
+                            getattr(tenant, "pii_entity_map", None),
+                        ),
+                    }
+                    for w in weeks
+                ],
+                "weekly_documents": [_serialize_weekly_document(wd, owner_tenant=tenant) for wd in weekly_docs],
+                "mood_trend": [
+                    {
+                        "date": str(m["date"]),
+                        "mood": rehydrate_for_tenant(tenant, m["mood"]),
+                        "energy": m["energy"],
+                        "pii_receipts": resolve_receipt_values(
+                            m.get("pii_receipts") or {},
+                            getattr(tenant, "pii_entity_map", None),
+                        ),
+                    }
+                    for m in moods
+                ],
+                "momentum": momentum,
+                "current_streak": streak,
+                "assistant_insights": [
+                    {
+                        "id": str(ins.id),
+                        "pillar": ins.pillar,
+                        "topic_slug": ins.topic.slug if ins.topic else None,
+                        "topic_display_name": ins.topic.display_name if ins.topic else None,
+                        "statement": rehydrate_for_tenant(tenant, ins.statement),
+                        "pii_receipts": resolve_receipt_values(
+                            {
+                                "statement": {
+                                    "redactions": receipt_placeholders(ins.statement),
+                                }
+                            },
+                            getattr(tenant, "pii_entity_map", None),
+                        ),
+                        "status": ins.status,
+                        "confidence": ins.confidence,
+                        "created_at": ins.created_at.isoformat(),
+                        "last_confirmed_at": ins.last_confirmed_at.isoformat() if ins.last_confirmed_at else None,
+                    }
+                    for ins in insights
+                ],
+                # Phase 3 Day 2: "Topics I've learned" — per-topic meta-state
+                # behind the assistant's voice register. Local import to keep
+                # the heavy insights aggregation off Django startup.
+                "topic_signals": _topic_signals(tenant),
+            }
+        )

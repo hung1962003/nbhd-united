@@ -1,0 +1,78 @@
+from django.urls import path
+
+from . import views
+from .runtime_views import RuntimeContainerStartedView
+
+urlpatterns = [
+    # Internal runtime — called by OpenClaw container startup script.
+    path(
+        "runtime/<uuid:tenant_id>/container-started/",
+        RuntimeContainerStartedView.as_view(),
+        name="cron-runtime-container-started",
+    ),
+    path("trigger/<str:task_name>/", views.trigger_task, name="cron-trigger"),
+    path("trigger-debug/<str:task_name>/", views.trigger_task_debug, name="cron-trigger-debug"),
+    path("tasks/", views.list_tasks, name="cron-list-tasks"),
+    path("apply-pending-configs/", views.apply_pending_configs, name="cron-apply-pending-configs"),
+    path("force-reseed-crons/", views.force_reseed_crons, name="cron-force-reseed-crons"),
+    path("restart-tenant-container/", views.restart_tenant_container, name="cron-restart-tenant-container"),
+    path("expire-trials/", views.expire_trials, name="cron-expire-trials"),
+    path("bump-all-pending-configs/", views.bump_all_pending_configs, name="cron-bump-all-pending-configs"),
+    path("run-update-cron-prompts/", views.run_update_cron_prompts, name="cron-run-update-cron-prompts"),
+    path(
+        "run-backfill-lesson-embeddings/",
+        views.run_backfill_lesson_embeddings,
+        name="cron-run-backfill-lesson-embeddings",
+    ),
+    path(
+        "run-rewrite-lessons-actionable/",
+        views.run_rewrite_lessons_actionable,
+        name="cron-run-rewrite-lessons-actionable",
+    ),
+    path("run-reseed-lessons/", views.run_reseed_lessons, name="cron-run-reseed-lessons"),
+    path("scrub-thread-titles/", views.scrub_thread_titles, name="cron-scrub-thread-titles"),
+    path("repair-fuel-rows/", views.repair_fuel_rows, name="cron-repair-fuel-rows"),
+    path(
+        "retire-quarantined/",
+        views.retire_quarantined_rows,
+        name="cron-retire-quarantined",
+    ),
+    path(
+        "delete-registry-cron/",
+        views.delete_registry_cron,
+        name="cron-delete-registry-cron",
+    ),
+    path("verify-gateway-tools/", views.verify_gateway_tools, name="cron-verify-gateway-tools"),
+    path("register-system-crons/", views.register_system_crons, name="cron-register-system-crons"),
+    path("backfill-welcomes/", views.backfill_welcomes, name="cron-backfill-welcomes"),
+    path("broadcast-message/", views.broadcast_message, name="cron-broadcast-message"),
+    path("dedup-crons/", views.dedup_crons, name="cron-dedup-crons"),
+    path("run-health-check/", views.run_health_check, name="cron-run-health-check"),
+    path("admin-health/", views.admin_health_status, name="cron-admin-health"),
+    # One-shot BYO fleet rollout endpoints (PR #434). Manual ops; the
+    # workflow_dispatch step in ci-cd.yml is the canonical caller. Routine
+    # deploys do not invoke either.
+    path(
+        "rollout-byo-image-bump/",
+        views.rollout_byo_image_bump,
+        name="cron-rollout-byo-image-bump",
+    ),
+    path(
+        "rollout-byo-persona-refresh/",
+        views.rollout_byo_persona_refresh,
+        name="cron-rollout-byo-persona-refresh",
+    ),
+    # Atomic fleet bump (config + image + version, fan-out per tenant).
+    # See docs/infrastructure/openclaw-5-7-migration.md for usage and the
+    # design rationale (gunicorn 300s budget, Option C QStash fan-out).
+    path(
+        "rollout-atomic-bump/",
+        views.rollout_atomic_bump,
+        name="cron-rollout-atomic-bump",
+    ),
+    path(
+        "atomic-bump-status/",
+        views.atomic_bump_status,
+        name="cron-atomic-bump-status",
+    ),
+]

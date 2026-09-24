@@ -1,0 +1,1887 @@
+"""Central Telegram poller — one process polls getUpdates for the shared bot,
+routes each message to the correct tenant's OpenClaw container via the
+/telegram-webhook endpoint, then sends the AI reply back to the user."""
+
+from __future__ import annotations
+
+import base64
+import logging
+import os
+import signal
+import threading
+import time
+from typing import Any
+
+import httpx
+from django.conf import settings
+from django.db import close_old_connections
+from django.utils import timezone
+
+from apps.billing.services import (
+    check_budget,
+    record_usage,
+    resolve_model_for_attribution,
+)
+from apps.common.eval_sink import blocks_real_transport_for_identifier, suppresses_real_transport
+from apps.tenants.models import Tenant
+
+from .error_messages import error_msg
+from .services import (
+    extract_chat_id,
+    handle_start_command,
+    is_rate_limited,
+    resolve_tenant_by_chat_id,
+    send_onboarding_link,
+)
+
+logger = logging.getLogger(__name__)
+
+TELEGRAM_API_BASE = "https://api.telegram.org/bot"
+POLL_TIMEOUT = 30  # seconds for long-polling
+MAX_BACKOFF = 60  # max seconds between retries on error
+STILL_THINKING_DELAY = 45.0  # seconds before sending "still thinking" notice
+
+
+class TelegramPoller:
+    """Long-polls Telegram getUpdates and routes messages to tenant containers."""
+
+    def __init__(self) -> None:
+        self.bot_token: str = getattr(settings, "TELEGRAM_BOT_TOKEN", "").strip()
+        self.webhook_secret: str = getattr(settings, "TELEGRAM_WEBHOOK_SECRET", "").strip()
+        self.gateway_token: str = getattr(settings, "NBHD_INTERNAL_API_KEY", "").strip()
+        self.offset: int = 0
+        self._running = False
+        self._backoff = 1
+        self._http: httpx.Client | None = None
+        self._pending_messages: dict[int, tuple[str, int | str | None]] = {}
+        self._update_in_progress: set[int] = set()  # chat_ids currently being updated
+
+    # ------------------------------------------------------------------
+    # Lifecycle
+    # ------------------------------------------------------------------
+
+    def start(self) -> None:
+        """Run the polling loop. Blocks until signalled to stop."""
+        # Encryption-at-rest Phase 1 (PR4): best-effort DEK cache pre-warm,
+        # dark (nothing decrypts yet). The poller holds fleet DEKs today for
+        # redaction mints and will decrypt contextual-recall in a later
+        # phase, so it needs the same warm cache as a gunicorn worker.
+        # Fire-and-forget on a daemon thread — never blocks poller startup.
+        # startup.sh restarts the poller process (and re-invokes `start()`)
+        # whenever it dies, so this re-warms on every restart; a DEK is
+        # immutable per (tenant, epoch) once cached (see apps.crypto.cache),
+        # so a redundant warm on restart is a cheap no-op, not a bug.
+        from apps.crypto.prewarm import start_prewarm_thread
+
+        start_prewarm_thread()
+
+        if not self.bot_token:
+            raise RuntimeError("TELEGRAM_BOT_TOKEN is not configured")
+
+        self._running = True
+        self._install_signal_handlers()
+
+        # Delete any existing webhook so getUpdates works
+        self._delete_webhook()
+
+        logger.info("Central Telegram poller starting (long-poll timeout=%ds)", POLL_TIMEOUT)
+
+        self._http = httpx.Client(timeout=httpx.Timeout(POLL_TIMEOUT + 10, connect=10))
+        try:
+            while self._running:
+                try:
+                    updates = self._get_updates()
+                    if updates:
+                        self._backoff = 1  # reset on success
+                        for update in updates:
+                            self._process_update(update)
+                    # Even an empty list is a successful poll
+                    self._backoff = 1
+                except httpx.TimeoutException:
+                    # Normal for long-polling — just retry
+                    continue
+                except httpx.HTTPStatusError as exc:
+                    if self._is_expected_get_updates_conflict(exc):
+                        logger.warning(
+                            "Telegram getUpdates conflict "
+                            "(status=%d endpoint=/getUpdates); another poller is active, backing off %ds",
+                            exc.response.status_code,
+                            self._backoff,
+                        )
+                    else:
+                        logger.exception("Error in poll loop, backing off %ds", self._backoff)
+                    time.sleep(self._backoff)
+                    self._backoff = min(self._backoff * 2, MAX_BACKOFF)
+                except Exception:
+                    logger.exception("Error in poll loop, backing off %ds", self._backoff)
+                    time.sleep(self._backoff)
+                    self._backoff = min(self._backoff * 2, MAX_BACKOFF)
+                finally:
+                    # Release any DB connection accumulated during this poll
+                    # cycle. Django's request lifecycle normally calls this
+                    # via the `request_finished` signal, but the poller
+                    # bypasses HTTP entirely — without this its Django
+                    # connection would persist for the process's entire
+                    # lifetime, permanently pinning a Supavisor pool slot.
+                    # See 2026-05-15 pool-exhaustion incident.
+                    close_old_connections()
+        finally:
+            self._http.close()
+            self._http = None
+            close_old_connections()
+            logger.info("Central Telegram poller stopped")
+
+    def stop(self) -> None:
+        """Signal the poller to stop gracefully."""
+        logger.info("Shutdown requested")
+        self._running = False
+
+    # ------------------------------------------------------------------
+    # Signal handling
+    # ------------------------------------------------------------------
+
+    def _install_signal_handlers(self) -> None:
+        for sig in (signal.SIGINT, signal.SIGTERM):
+            signal.signal(sig, self._handle_signal)
+
+    def _handle_signal(self, signum: int, frame: Any) -> None:
+        logger.info("Received signal %s", signal.Signals(signum).name)
+        self.stop()
+
+    # ------------------------------------------------------------------
+    # Telegram API helpers
+    # ------------------------------------------------------------------
+
+    @property
+    def _api_base(self) -> str:
+        return f"{TELEGRAM_API_BASE}{self.bot_token}"
+
+    def _delete_webhook(self) -> None:
+        """Delete any existing webhook so getUpdates works."""
+        try:
+            resp = httpx.post(
+                f"{self._api_base}/deleteWebhook",
+                json={"drop_pending_updates": False},
+                timeout=10,
+            )
+            data = resp.json()
+            logger.info("deleteWebhook result: %s", data.get("description", data))
+        except Exception:
+            logger.exception("Failed to delete webhook")
+
+    def _get_updates(self) -> list[dict]:
+        """Long-poll for updates from Telegram."""
+        assert self._http is not None
+        resp = self._http.post(
+            f"{self._api_base}/getUpdates",
+            json={
+                "timeout": POLL_TIMEOUT,
+                "offset": self.offset,
+                "allowed_updates": ["message", "callback_query", "edited_message"],
+            },
+        )
+        resp.raise_for_status()
+        data = resp.json()
+        if not data.get("ok"):
+            logger.error("getUpdates returned ok=false: %s", data)
+            return []
+        return data.get("result", [])
+
+    @staticmethod
+    def _is_expected_get_updates_conflict(exc: httpx.HTTPStatusError) -> bool:
+        """Return whether ``exc`` is Telegram's expected competing-poller 409."""
+        try:
+            url = exc.request.url
+            return (
+                exc.response.status_code == 409
+                and url.scheme == "https"
+                and url.host == "api.telegram.org"
+                and url.path.startswith("/bot")
+                and url.path.endswith("/getUpdates")
+            )
+        except (AttributeError, RuntimeError):
+            return False
+
+    def _send_message(self, chat_id: int, text: str, **kwargs: Any) -> None:
+        """Send a message via Telegram Bot API."""
+        assert self._http is not None
+        if blocks_real_transport_for_identifier("telegram", chat_id):
+            return
+        payload: dict[str, Any] = {"chat_id": chat_id, "text": text, **kwargs}
+        try:
+            resp = self._http.post(
+                f"{self._api_base}/sendMessage",
+                json=payload,
+                timeout=10,
+            )
+            if not resp.is_success:
+                logger.warning("sendMessage failed (%s): %s", resp.status_code, resp.text[:200])
+        except Exception:
+            logger.exception("Failed to send message to chat_id=%s", chat_id)
+
+    @staticmethod
+    def _split_message(text: str, max_len: int = 4096) -> list[str]:
+        """Split a long message into chunks that fit Telegram's limit.
+
+        Splits on paragraph breaks first, then newlines, then hard cuts.
+        """
+        if len(text) <= max_len:
+            return [text]
+
+        chunks: list[str] = []
+        remaining = text
+
+        while remaining:
+            if len(remaining) <= max_len:
+                chunks.append(remaining)
+                break
+
+            # Try to split at paragraph break
+            cut = remaining.rfind("\n\n", 0, max_len)
+            if cut == -1:
+                # Try newline
+                cut = remaining.rfind("\n", 0, max_len)
+            if cut == -1:
+                # Try space
+                cut = remaining.rfind(" ", 0, max_len)
+            if cut == -1:
+                # Hard cut
+                cut = max_len
+
+            chunks.append(remaining[:cut].rstrip())
+            remaining = remaining[cut:].lstrip()
+
+        return [c for c in chunks if c]  # Drop empty chunks
+
+    def _send_markdown(self, chat_id: int, text: str) -> None:
+        """Render the assistant's markdown to Telegram HTML and send it.
+
+        The agent emits CommonMark/GFM; rendering to Telegram's HTML subset
+        (``apps.router.telegram_format``) gives bold headings, aligned
+        monospace tables and real anchors with no visible markdown. Long
+        messages are split on block boundaries by the renderer. On the rare
+        HTML rejection, that chunk degrades to tag-free text (no markdown).
+        """
+        assert self._http is not None
+        if blocks_real_transport_for_identifier("telegram", chat_id):
+            return
+        from apps.router.telegram_format import render_telegram_html, strip_telegram_html
+
+        for i, chunk in enumerate(render_telegram_html(text)):
+            if i > 0:
+                time.sleep(0.3)  # Brief delay between chunks
+
+            try:
+                resp = self._http.post(
+                    f"{self._api_base}/sendMessage",
+                    json={"chat_id": chat_id, "text": chunk, "parse_mode": "HTML"},
+                    timeout=10,
+                )
+                if resp.is_success:
+                    continue
+                # If Telegram rejected the HTML (400), fall back to plain text
+                if resp.status_code == 400:
+                    logger.debug("HTML rejected for chunk %d, falling back to plain text", i)
+                    self._send_message(chat_id, strip_telegram_html(chunk))
+                    continue
+                logger.warning("sendMessage(HTML) failed (%s): %s", resp.status_code, resp.text[:200])
+            except Exception:
+                # Network error — try plain text
+                self._send_message(chat_id, strip_telegram_html(chunk))
+
+    def _send_photo(self, chat_id: int, photo_path: str, tenant: Tenant, caption: str = "") -> bool:
+        """Send a photo to Telegram from the tenant's workspace file share.
+
+        Returns True if sent successfully.
+        """
+        assert self._http is not None
+        if suppresses_real_transport(tenant):
+            logger.error(
+                "eval-sink transport block: tenant=%s transport=telegram",
+                tenant.id,
+            )
+            return False
+        try:
+            # Map container path back to file share path
+            # Container: /home/node/.openclaw/workspace/X → File share: workspace/X
+            share_path = photo_path
+            if "/workspace/" in share_path:
+                share_path = "workspace/" + share_path.split("/workspace/", 1)[1]
+
+            # Download from file share
+            from apps.orchestrator.azure_client import _is_mock
+
+            if _is_mock():
+                return False
+
+            account_name = str(getattr(settings, "AZURE_STORAGE_ACCOUNT_NAME", "") or "").strip()
+            if not account_name:
+                return False
+
+            from azure.storage.fileshare import ShareFileClient
+
+            from apps.orchestrator.azure_client import get_storage_client
+
+            storage_client = get_storage_client()
+            keys = storage_client.storage_accounts.list_keys(
+                settings.AZURE_RESOURCE_GROUP,
+                account_name,
+            )
+            account_key = keys.keys[0].value
+            share_name = f"ws-{str(tenant.id)[:20]}"
+
+            file_client = ShareFileClient(
+                account_url=f"https://{account_name}.file.core.windows.net",
+                share_name=share_name,
+                file_path=share_path,
+                credential=account_key,
+            )
+            data = file_client.download_file().readall()
+
+            # Send via Telegram sendPhoto
+            ext = share_path.rsplit(".", 1)[-1].lower() if "." in share_path else "jpg"
+            mime = {"png": "image/png", "gif": "image/gif", "webp": "image/webp"}.get(ext, "image/jpeg")
+            files = {"photo": (f"image.{ext}", data, mime)}
+            form_data = {"chat_id": str(chat_id)}
+            if caption:
+                # Captions are short; send as clean markdown-free text rather
+                # than risk a parse-mode rejection on a 1-line caption.
+                from apps.router.telegram_format import markdown_to_plaintext
+
+                form_data["caption"] = markdown_to_plaintext(caption, max_len=1024)
+
+            resp = self._http.post(
+                f"{self._api_base}/sendPhoto",
+                data=form_data,
+                files=files,
+                timeout=15,
+            )
+            if resp.is_success:
+                return True
+            logger.warning("sendPhoto failed (%s): %s", resp.status_code, resp.text[:200])
+            return False
+
+        except Exception:
+            logger.exception("Failed to send photo from %s", photo_path)
+            return False
+
+    def _send_rich_response(self, chat_id: int, tenant: Tenant, text: str) -> None:
+        """Send an AI response, extracting and sending any embedded images.
+
+        Detects image references like MEDIA:/path/to/image.jpg or
+        workspace file paths, sends them as Telegram photos, and sends
+        the remaining text as markdown.
+        """
+        import re
+
+        # Quick-reply buttons and the journal deep-link chip are iOS-only for
+        # now — Telegram has no transport for either here, so just strip the
+        # markers (never let them leak as raw text).
+        from apps.router.journal_link import extract_journal_link
+        from apps.router.quick_replies import extract_quick_replies
+
+        text, _quick_replies = extract_quick_replies(text, tenant_id=tenant.id, channel="telegram_poller")
+        text, _journal_link = extract_journal_link(text, tenant_id=tenant.id, channel="telegram_poller")
+
+        # Final owner-facing integrity guard.
+        entity_map = getattr(tenant, "pii_entity_map", None)
+        from apps.router.reply_text import finalize_outbound_text
+
+        text = finalize_outbound_text(text, entity_map, tenant_id=tenant.id, channel="telegram_poller")
+
+        # Log-only instrumentation: ASCII chart leakage when no marker emitted.
+        from apps.router.output_guards import log_ascii_chart_leak
+
+        log_ascii_chart_leak(text, tenant_id=tenant.id, channel="telegram_poller")
+
+        # Extract [[insight:slug]]statement[[/insight]] markers and write
+        # AssistantInsight rows before chart processing. Same flow as
+        # pending_queue.py / line_webhook.py — covers all 3 outbound paths.
+        try:
+            from apps.insights.markers import extract_and_record_insights
+
+            text = extract_and_record_insights(text, tenant=tenant)
+        except Exception:
+            logger.exception("insight marker extraction failed (telegram poller)")
+
+        # Render [[chart:type]] markers into images and inject MEDIA: paths
+        chart_pattern = re.compile(r"\[\[chart:(\w+)(?:\|(.+?))?\]\]")
+        for match in chart_pattern.finditer(text):
+            chart_type = match.group(1)
+            raw_params = match.group(2) or ""
+            params = dict(p.split("=", 1) for p in raw_params.split(",") if "=" in p)
+            try:
+                from apps.router.charts import render_chart
+
+                png_bytes = render_chart(chart_type, tenant, params)
+                if png_bytes:
+                    import uuid as _uuid
+
+                    fname = f"charts/{chart_type}_{_uuid.uuid4().hex[:8]}.png"
+                    fpath = f"workspace/{fname}"
+                    from apps.orchestrator.azure_client import upload_workspace_file_binary
+
+                    upload_workspace_file_binary(str(tenant.id), fpath, png_bytes)
+                    container_path = f"/home/node/.openclaw/workspace/{fname}"
+                    text = text.replace(match.group(0), f"MEDIA:{container_path}")
+                else:
+                    text = text.replace(match.group(0), "")
+            except Exception:
+                logger.exception("Chart rendering failed for %s", chart_type)
+                text = text.replace(match.group(0), "")
+
+        # Pattern: MEDIA:path or common image extensions in workspace paths
+        # OpenClaw uses MEDIA:./path or MEDIA:https://... convention
+        media_pattern = re.compile(
+            r"MEDIA:(\S+\.(?:jpg|jpeg|png|gif|webp))",
+            re.IGNORECASE,
+        )
+
+        # Also detect workspace image paths the agent might reference
+        workspace_pattern = re.compile(
+            r"(/home/node/\.openclaw/workspace/\S+\.(?:jpg|jpeg|png|gif|webp))",
+            re.IGNORECASE,
+        )
+
+        # Extract all image references
+        media_matches = media_pattern.findall(text)
+        workspace_matches = workspace_pattern.findall(text)
+
+        # Clean image references from text
+        clean_text = media_pattern.sub("", text)
+        clean_text = workspace_pattern.sub("", clean_text)
+        clean_text = clean_text.strip()
+
+        # Send images first
+        for path in media_matches + workspace_matches:
+            # Resolve relative paths
+            if path.startswith("./"):
+                path = f"/home/node/.openclaw/workspace/{path[2:]}"
+            if path.startswith("/home/node/"):
+                self._send_photo(chat_id, path, tenant)
+
+        # Parse inline buttons: [[button:Label|callback_data]]
+        button_pattern = re.compile(r"\[\[button:([^|]+)\|([^\]]+)\]\]")
+        buttons = button_pattern.findall(clean_text)
+        clean_text = button_pattern.sub("", clean_text).strip()
+
+        # Build reply_markup if buttons found
+        reply_markup = None
+        if buttons:
+            keyboard = [[{"text": label.strip(), "callback_data": f"agent:{data.strip()}"}] for label, data in buttons]
+            reply_markup = {"inline_keyboard": keyboard}
+
+        # Send remaining text
+        if clean_text:
+            if reply_markup:
+                # Render to Telegram HTML; the last chunk carries the buttons.
+                from apps.router.telegram_format import render_telegram_html
+
+                chunks = render_telegram_html(clean_text) or [clean_text]
+                for i, chunk in enumerate(chunks):
+                    if i > 0:
+                        time.sleep(0.3)
+                    if i == len(chunks) - 1:
+                        # Last chunk gets the buttons
+                        self._send_message(chat_id, chunk, parse_mode="HTML", reply_markup=reply_markup)
+                    else:
+                        self._send_message(chat_id, chunk, parse_mode="HTML")
+            else:
+                self._send_markdown(chat_id, clean_text)
+        elif reply_markup:
+            # Buttons-only reply: agent emitted [[button:...]] markers with no prose.
+            # clean_text is empty after stripping but we still need to deliver the
+            # keyboard. Telegram's sendMessage requires non-empty text; use a
+            # middle-dot placeholder (printable, survives strip()) so reply_markup
+            # is not silently dropped.
+            self._send_message(chat_id, "·", reply_markup=reply_markup)
+
+    def _send_typing(self, chat_id: int) -> None:
+        """Send 'typing' chat action to Telegram."""
+        assert self._http is not None
+        if blocks_real_transport_for_identifier("telegram", chat_id):
+            return
+        try:
+            self._http.post(
+                f"{self._api_base}/sendChatAction",
+                json={"chat_id": chat_id, "action": "typing"},
+                timeout=5,
+            )
+        except Exception:
+            pass  # Non-critical, don't log
+
+    def _transcribe_voice(self, file_id: str, tenant: Tenant | None = None) -> str | None:
+        """Download a Telegram voice file and transcribe via OpenAI Whisper.
+
+        When ``tenant`` is provided, a vocabulary hint built from the tenant's
+        own known non-PII proper nouns (denylisted brands, workspace names, the
+        user's display name) is passed as the Whisper ``prompt`` so distinctive
+        names transcribe consistently instead of being phonetically garbled.
+        This is the class behind the 2026-07 "Rakuten" -> "Rocketen" incident —
+        that clip entered via iOS on-device STT (fixed app-side via
+        ``contextualStrings`` fed from the same vocabulary); this hint hardens
+        the Telegram channel against the same failure. See
+        apps/router/transcription.py.
+
+        Returns transcribed text, or None on failure.
+        """
+        assert self._http is not None
+        if tenant is not None and suppresses_real_transport(tenant):
+            logger.error(
+                "eval-sink transport block: tenant=%s transport=telegram",
+                tenant.id,
+            )
+            return None
+        openai_key = getattr(settings, "OPENAI_API_KEY", "") or os.environ.get("OPENAI_API_KEY", "")
+        if not openai_key:
+            logger.warning("Cannot transcribe voice: no OPENAI_API_KEY configured")
+            return None
+
+        try:
+            # 1. Get file path from Telegram
+            resp = self._http.post(
+                f"{self._api_base}/getFile",
+                json={"file_id": file_id},
+                timeout=10,
+            )
+            if not resp.is_success:
+                logger.warning("getFile failed: %s", resp.text[:200])
+                return None
+
+            file_path = resp.json().get("result", {}).get("file_path")
+            if not file_path:
+                logger.warning("getFile returned no file_path")
+                return None
+
+            # 2. Download the audio file
+            file_url = f"https://api.telegram.org/file/bot{self.bot_token}/{file_path}"
+            dl_resp = self._http.get(file_url, timeout=15)
+            if not dl_resp.is_success:
+                logger.warning("Failed to download voice file: %s", dl_resp.status_code)
+                return None
+
+            audio_data = dl_resp.content
+            # Determine extension from file_path
+            ext = file_path.rsplit(".", 1)[-1] if "." in file_path else "ogg"
+
+            # 3. Transcribe via OpenAI Whisper API. Bias decoding toward the
+            # tenant's own known non-PII vocabulary so brand/project names are
+            # spelled consistently instead of re-guessed per clip. See
+            # apps/router/transcription.py for the PII boundary on the hint.
+            from apps.router.transcription import build_transcription_prompt
+
+            data = {"model": "whisper-1"}
+            prompt = build_transcription_prompt(tenant)
+            if prompt:
+                data["prompt"] = prompt
+            whisper_resp = self._http.post(
+                "https://api.openai.com/v1/audio/transcriptions",
+                headers={"Authorization": f"Bearer {openai_key}"},
+                files={"file": (f"voice.{ext}", audio_data, f"audio/{ext}")},
+                data=data,
+                timeout=30,
+            )
+            if not whisper_resp.is_success:
+                logger.warning("Whisper transcription failed: %s %s", whisper_resp.status_code, whisper_resp.text[:200])
+                return None
+
+            text = whisper_resp.json().get("text", "").strip()
+            if text:
+                logger.info("Transcribed voice message (%d bytes → %d chars)", len(audio_data), len(text))
+                return text
+
+            return None
+
+        except Exception:
+            logger.exception("Voice transcription error")
+            return None
+
+    def _delayed_forward(
+        self,
+        chat_id: int,
+        tenant: Tenant,
+        message_text: str,
+        delay: int = 15,
+        provider_event_id: int | str | None = None,
+    ) -> None:
+        """Wait for container restart, then forward the pending message.
+
+        Runs in a background thread to avoid blocking the poller loop.
+        """
+        time.sleep(delay)
+        self._send_typing(chat_id)
+        self._forward_to_container(
+            chat_id,
+            tenant,
+            message_text,
+            provider_event_id=provider_event_id,
+        )
+
+    def _download_photo(self, message: dict) -> str | None:
+        """Download the largest photo from a Telegram message and return as base64 data URL.
+
+        Returns None if download fails or photo is too large (>5MB).
+        """
+        photos = message.get("photo", [])
+        if not photos:
+            return None
+
+        # Telegram provides multiple sizes, last is largest
+        largest = photos[-1]
+        file_id = largest.get("file_id")
+        file_size = largest.get("file_size", 0)
+
+        if not file_id:
+            return None
+        if file_size > 5 * 1024 * 1024:  # 5MB limit
+            logger.warning("Photo too large (%d bytes), skipping", file_size)
+            return None
+
+        assert self._http is not None
+        try:
+            # Get file path
+            resp = self._http.post(
+                f"{self._api_base}/getFile",
+                json={"file_id": file_id},
+                timeout=10,
+            )
+            if not resp.is_success:
+                return None
+
+            file_path = resp.json().get("result", {}).get("file_path")
+            if not file_path:
+                return None
+
+            # Download
+            file_url = f"https://api.telegram.org/file/bot{self.bot_token}/{file_path}"
+            dl_resp = self._http.get(file_url, timeout=15)
+            if not dl_resp.is_success:
+                return None
+
+            b64 = base64.b64encode(dl_resp.content).decode()
+            ext = file_path.rsplit(".", 1)[-1] if "." in file_path else "jpg"
+            return f"data:image/{ext};base64,{b64}"
+
+        except Exception:
+            logger.exception("Failed to download photo")
+            return None
+
+    def _upload_photo_to_workspace(self, tenant: Tenant, message: dict) -> str | None:
+        """Download photo from Telegram and upload to tenant's workspace.
+
+        Returns the container-mounted file path (for the agent's image tool),
+        or None on failure.
+        """
+        if suppresses_real_transport(tenant):
+            logger.error(
+                "eval-sink transport block: tenant=%s transport=telegram",
+                tenant.id,
+            )
+            return None
+        photo_data_url = self._download_photo(message)
+        if not photo_data_url:
+            return None
+
+        try:
+            # Extract binary + extension from the data URL
+            # (data:image/<ext>;base64,<data>).
+            header, b64data = photo_data_url.split(",", 1)
+            ext = "jpg"
+            if "png" in header:
+                ext = "png"
+            elif "gif" in header:
+                ext = "gif"
+            elif "webp" in header:
+                ext = "webp"
+
+            photo_bytes = base64.b64decode(b64data)
+
+            # Shared storage chokepoint — same filename scheme + container path
+            # as the iOS ingress (see apps/router/inbound_media.py).
+            from apps.router.inbound_media import store_inbound_image
+
+            container_path, workspace_path = store_inbound_image(str(tenant.id), photo_bytes, ext)
+            logger.info("Uploaded photo to %s for tenant %s", workspace_path, str(tenant.id)[:8])
+            return container_path
+
+        except Exception:
+            logger.exception("Failed to upload photo to workspace")
+            return None
+
+    def _answer_callback_query(self, callback_id: str, text: str) -> None:
+        """Answer a Telegram callback query."""
+        assert self._http is not None
+        try:
+            self._http.post(
+                f"{self._api_base}/answerCallbackQuery",
+                json={"callback_query_id": callback_id, "text": text},
+                timeout=5,
+            )
+        except Exception:
+            logger.exception("Failed to answer callback query %s", callback_id)
+
+    def _edit_message_reply_markup(self, chat_id: int, message_id: int, reply_markup: dict | None) -> None:
+        """Edit a message's inline keyboard (or remove it)."""
+        assert self._http is not None
+        if blocks_real_transport_for_identifier("telegram", chat_id):
+            return
+        payload: dict[str, Any] = {"chat_id": chat_id, "message_id": message_id}
+        if reply_markup:
+            payload["reply_markup"] = reply_markup
+        else:
+            payload["reply_markup"] = {"inline_keyboard": []}
+        try:
+            self._http.post(
+                f"{self._api_base}/editMessageReplyMarkup",
+                json=payload,
+                timeout=5,
+            )
+        except Exception:
+            pass  # Non-critical
+
+    def _execute_telegram_response(self, response_data: dict) -> None:
+        """Execute a Telegram API method from a response dict (same format as webhook returns)."""
+        method = response_data.get("method")
+        if not method:
+            return
+        chat_id = response_data.get("chat_id")
+        if chat_id is not None and blocks_real_transport_for_identifier("telegram", chat_id):
+            return
+        assert self._http is not None
+        try:
+            payload = {k: v for k, v in response_data.items() if k != "method"}
+            self._http.post(
+                f"{self._api_base}/{method}",
+                json=payload,
+                timeout=10,
+            )
+        except Exception:
+            logger.exception("Failed to execute Telegram method %s", method)
+
+    # ------------------------------------------------------------------
+    # Update processing
+    # ------------------------------------------------------------------
+
+    def _process_update(self, update: dict) -> None:
+        """Process a single Telegram update.
+
+        The read offset is advanced only AFTER the update has been handled
+        (or deliberately skipped as a duplicate) — never before. Advancing
+        it up front meant any failure in the DB-touching setup below — most
+        often an ``EMAXCONNSESSION`` from an exhausted Supabase pooler in
+        ``set_rls_context`` — propagated out of this method with the offset
+        already moved, so the next ``getUpdates`` acked the update to
+        Telegram *unprocessed*. The user's message was silently dropped:
+        no reply, no enqueue, no retry. Deferring the advance lets a
+        transient failure fall through to the poll loop's backoff and the
+        same update is re-fetched next poll; the dedup ledger
+        (``claim_inbound_event``) keeps a crashed-after-handling update
+        from being answered twice.
+        """
+        update_id = update.get("update_id", 0)
+
+        # Set service-role RLS context for DB access. If this raises (pooler
+        # exhaustion / DB unreachable) the exception propagates to the poll
+        # loop WITHOUT advancing the offset, so the update is retried on the
+        # next poll instead of being acked-and-lost.
+        from apps.tenants.middleware import set_rls_context
+
+        set_rls_context(service_role=True)
+
+        # Idempotency gate — the offset is in-memory only, so a poller
+        # restart re-fetches every update Telegram hadn't seen acked and
+        # would reprocess it. Claiming update_id here makes restart
+        # replays (and any provider re-send) a harmless no-op.
+        from apps.router.inbound_dedup import claim_inbound_event
+
+        if update_id and not claim_inbound_event(f"tg:{update_id}"):
+            logger.info("Telegram poller: skipping duplicate update %s", update_id)
+            # Already handled on a prior sighting — safe to ack so we don't
+            # re-fetch it forever.
+            self.offset = update_id + 1
+            return
+
+        try:
+            self._handle_update(update)
+        except Exception:
+            # Poison update (a bug handling THIS message, not infra): log
+            # and let the offset advance below so one bad update can't wedge
+            # the poller re-fetching it on every poll.
+            logger.exception("Unhandled error processing update %s", update_id)
+
+        # Handled (or logged as poison) — now it's safe to advance past it.
+        self.offset = update_id + 1
+
+    def _handle_update(self, update: dict) -> None:
+        """Core routing logic for a single update."""
+        provider_event_id = update.get("update_id")
+        # Handle /start TOKEN for account linking
+        link_response = handle_start_command(update)
+        if link_response:
+            self._execute_telegram_response(link_response)
+            return
+
+        chat_id = extract_chat_id(update)
+        if not chat_id:
+            return
+
+        # Rate limiting
+        if is_rate_limited(chat_id):
+            logger.warning("Rate limited chat_id %s", chat_id)
+            return
+
+        tenant = resolve_tenant_by_chat_id(chat_id)
+
+        if tenant is not None and suppresses_real_transport(tenant):
+            logger.warning(
+                "Telegram poller: dropping eval-sink update tenant=%s",
+                tenant.id,
+            )
+            return
+
+        # Handle callback queries (button presses)
+        if "callback_query" in update and tenant is not None:
+            callback_data = update["callback_query"].get("data", "")
+            callback_id = update["callback_query"].get("id", "")
+
+            # Onboarding callbacks (tz_country:, tz_zone:)
+            if callback_data.startswith("tz_"):
+                from apps.router.onboarding import handle_onboarding_callback
+
+                reply = handle_onboarding_callback(tenant, callback_data)
+                if reply is not None:
+                    self._answer_callback_query(callback_id, "✓")
+                    self._send_message(chat_id, reply.text, **reply.to_telegram_kwargs())
+                return
+
+            # Lesson approval callbacks
+            if callback_data.startswith("lesson:"):
+                self._handle_lesson_callback(update, tenant)
+                return
+
+            # Proactive extraction callbacks (goals/tasks/lessons from nightly job)
+            if callback_data.startswith("extract:"):
+                self._handle_extraction_callback(update, tenant)
+                return
+
+            # Reconciliation undo callbacks (Remove/Undo button on the
+            # morning extraction summary — callback_data ``task_action:undo:<id>``)
+            if callback_data.startswith("task_action:"):
+                self._handle_task_action_callback(update, tenant)
+                return
+
+            # Wave (friend-request) accept/decline callbacks
+            if callback_data.startswith("friend:"):
+                self._handle_friend_callback(update, tenant)
+                return
+
+            # Action gate callbacks (approve/deny destructive actions)
+            if callback_data.startswith("gate_approve:") or callback_data.startswith("gate_deny:"):
+                self._handle_gate_callback(update, tenant, callback_data, callback_id, chat_id)
+                return
+
+            # Container update callbacks
+            if callback_data.startswith("container_update:"):
+                # Debounce: check if already processing
+                if chat_id in self._update_in_progress:
+                    self._answer_callback_query(callback_id, "⏳ Already updating...")
+                    return
+
+                from apps.router.container_updates import handle_update_callback
+
+                # Edit the original message to remove buttons (prevents re-tapping)
+                orig_msg_id = update["callback_query"].get("message", {}).get("message_id")
+                if orig_msg_id:
+                    self._edit_message_reply_markup(chat_id, orig_msg_id, None)
+
+                if callback_data == "container_update:yes":
+                    self._update_in_progress.add(chat_id)
+                    self._answer_callback_query(callback_id, "✅ Updating now...")
+                    self._send_message(chat_id, "✅ Updating now! I'll be back in about a minute...")
+
+                    # Do the actual update + forward in background (Azure takes 45-90s)
+                    pending = self._pending_messages.pop(chat_id, None)
+                    pending_text, pending_event_id = pending or (None, None)
+
+                    def _do_update():
+                        try:
+                            from apps.router.container_updates import update_container
+
+                            success = update_container(tenant)
+                            if not success:
+                                self._send_message(
+                                    chat_id,
+                                    "Sorry, the update failed. Your assistant is still available on the current version.",
+                                )
+                                return
+                            if pending_text:
+                                # Wait for container gateway to be healthy before forwarding
+                                if self._wait_for_container_ready(tenant, timeout=120):
+                                    # Prepend context note so agent isn't cold. Pass
+                                    # ``raw_user_text=pending_text`` so the dropped-message
+                                    # apology quotes the user's actual words instead of
+                                    # the ``[System: just updated…]`` framing.
+                                    context_msg = f"[System: just updated. User's message from before the update:]\n{pending_text}"
+                                    self._send_typing(chat_id)
+                                    self._forward_to_container(
+                                        chat_id,
+                                        tenant,
+                                        context_msg,
+                                        raw_user_text=pending_text,
+                                        provider_event_id=pending_event_id,
+                                    )
+                                else:
+                                    # Container didn't come up in time — tell user, let them resend
+                                    self._send_message(chat_id, "✅ Update complete! You can send your message again.")
+                        finally:
+                            self._update_in_progress.discard(chat_id)
+
+                    threading.Thread(target=_do_update, daemon=True).start()
+
+                elif callback_data == "container_update:no":
+                    self._answer_callback_query(callback_id, "👍")
+                    reply_text = handle_update_callback(tenant, callback_data)
+                    if reply_text:
+                        self._send_message(chat_id, reply_text)
+                    # Forward pending message to current container
+                    pending = self._pending_messages.pop(chat_id, None)
+                    pending_text, pending_event_id = pending or (None, None)
+                    if pending_text:
+                        self._send_typing(chat_id)
+                        self._forward_to_container(
+                            chat_id,
+                            tenant,
+                            pending_text,
+                            provider_event_id=pending_event_id,
+                        )
+
+                return
+
+            # Agent-generated button callbacks → forward to agent as a message
+            if callback_data.startswith("agent:"):
+                button_value = callback_data[6:]  # Strip "agent:" prefix
+                self._answer_callback_query(callback_id, "✓")
+                # Remove buttons from the original message
+                orig_msg_id = update["callback_query"].get("message", {}).get("message_id")
+                if orig_msg_id:
+                    self._edit_message_reply_markup(chat_id, orig_msg_id, None)
+                # A tapped agent button spawns a real AI turn, so it must clear
+                # the same suspended + budget pre-flight gate as a typed message;
+                # otherwise a button tap lands a billable turn on a suspended or
+                # over-budget tenant. Mirrors the typed-message gate below and the
+                # LINE _handle_postback gate. See FA-0974.
+                if tenant is None:
+                    response_data = send_onboarding_link(chat_id)
+                    self._execute_telegram_response(response_data)
+                    return
+                frontend_url = getattr(settings, "FRONTEND_URL", "https://neighborhoodunited.org").rstrip("/")
+                if (
+                    tenant.status == Tenant.Status.SUSPENDED
+                    and not tenant.is_trial
+                    and not bool(tenant.stripe_subscription_id)
+                ):
+                    lang = getattr(tenant.user, "language", None) or "en"
+                    self._send_message(
+                        chat_id,
+                        error_msg(lang, "suspended", billing_url=f"{frontend_url}/settings/billing"),
+                    )
+                    return
+                budget_reason = check_budget(tenant)
+                if budget_reason:
+                    from apps.router.views import _hibernate_for_quota
+
+                    _hibernate_for_quota(tenant)
+                    self._send_budget_exhausted(chat_id, tenant, budget_reason)
+                    return
+                # Forward the button tap to the agent. ``raw_user_text=button_value``
+                # so the dropped-message apology quotes the button label rather than
+                # the ``[User tapped button: …]`` framing if delivery fails.
+                self._send_typing(chat_id)
+                self._forward_to_container(
+                    chat_id,
+                    tenant,
+                    f'[User tapped button: "{button_value}"]',
+                    raw_user_text=button_value,
+                    provider_event_id=provider_event_id,
+                )
+                return
+
+        # Unknown user → onboarding
+        if not tenant:
+            response_data = send_onboarding_link(chat_id)
+            self._execute_telegram_response(response_data)
+            logger.info("Unknown chat_id %s, sent onboarding link", chat_id)
+            return
+
+        # Provisioning tenant — assistant is still waking up
+        if tenant.status in (Tenant.Status.PENDING, Tenant.Status.PROVISIONING):
+            lang = getattr(tenant.user, "language", None) or "en"
+            self._send_message(chat_id, error_msg(lang, "waking_up"))
+            return
+
+        # Paused tenant — trial ended or payment lapsed
+        frontend_url = getattr(settings, "FRONTEND_URL", "https://neighborhoodunited.org").rstrip("/")
+        if tenant.status == Tenant.Status.SUSPENDED and not tenant.is_trial and not bool(tenant.stripe_subscription_id):
+            lang = getattr(tenant.user, "language", None) or "en"
+            self._send_message(
+                chat_id,
+                error_msg(lang, "suspended", billing_url=f"{frontend_url}/settings/billing"),
+            )
+            return
+
+        # Budget check — hibernate container if over budget
+        budget_reason = check_budget(tenant)
+        if budget_reason:
+            from apps.router.views import _hibernate_for_quota
+
+            _hibernate_for_quota(tenant)
+            self._send_budget_exhausted(chat_id, tenant, budget_reason)
+            return
+
+        # Update last_message_at
+        Tenant.objects.filter(id=tenant.id).update(last_message_at=timezone.now())
+
+        # Send typing indicator for voice messages (transcription takes a few seconds)
+        msg_obj = update.get("message") or update.get("edited_message") or {}
+        if msg_obj.get("voice") or msg_obj.get("audio"):
+            self._send_typing(chat_id)
+
+        # Extract message text (pass tenant so voice transcription can hint
+        # Whisper with the tenant's own vocabulary)
+        message_text = self._extract_message_text(update, tenant)
+        if not message_text:
+            return
+
+        # Onboarding / re-introduction gate
+        from apps.router.onboarding import get_onboarding_response, needs_reintroduction
+
+        if needs_reintroduction(tenant):
+            # Existing user with default profile — trigger re-intro
+            tenant.onboarding_step = 0
+            # onboarding_complete stays True so get_onboarding_response
+            # knows to use the re-intro message (not fresh welcome)
+            tenant.save(update_fields=["onboarding_step", "updated_at"])
+
+        if not tenant.onboarding_complete or tenant.onboarding_step == 0:
+            # Extract Telegram language_code for auto-detection
+            msg = update.get("message") or update.get("edited_message") or {}
+            tg_lang = (msg.get("from") or {}).get("language_code", "")
+            onboarding_reply = get_onboarding_response(tenant, message_text, telegram_lang=tg_lang)
+            if onboarding_reply is not None:
+                self._send_message(chat_id, onboarding_reply.text, **onboarding_reply.to_telegram_kwargs())
+                return
+
+        # Check for container updates before forwarding
+        from apps.router.container_updates import check_and_maybe_update
+
+        update_action = check_and_maybe_update(tenant)
+        if update_action:
+            if update_action["action"] == "ask_user":
+                # Store the pending message so we can forward it after update
+                self._pending_messages[chat_id] = (message_text, provider_event_id)
+                self._send_message(
+                    chat_id,
+                    update_action["text"],
+                    reply_markup=update_action["reply_markup"],
+                )
+                return
+            # "silent_update" — container is restarting, delay then forward in background
+            if update_action["action"] == "silent_update":
+                self._send_typing(chat_id)
+                threading.Thread(
+                    target=self._delayed_forward,
+                    args=(chat_id, tenant, message_text, 15, provider_event_id),
+                    daemon=True,
+                ).start()
+                return
+
+        # Capture the user's original text before we decorate it with
+        # photo prefix / session context / workspace+datetime markers.
+        # Used for the dropped-message apology excerpt — see
+        # ``_forward_to_container``.
+        raw_user_text = message_text
+
+        # Upload photo to tenant workspace if present
+        image_path = None
+        msg_data = update.get("message") or update.get("edited_message") or {}
+        had_photo = bool(msg_data.get("photo"))
+        if had_photo:
+            self._send_typing(chat_id)
+            image_path = self._upload_photo_to_workspace(tenant, msg_data)
+
+        # Forward to container via /v1/chat/completions
+        if image_path:
+            # Tell agent where the image is so it can use the image tool.
+            # Shared helper (not a hand-rolled f-string) keeps the marker text
+            # — including its untrusted-content framing — byte-identical to
+            # the iOS ingress; see apps/router/inbound_media.py.
+            from apps.router.inbound_media import attachment_marker
+
+            message_text = f"{attachment_marker('photo', image_path)}{message_text}"
+        elif had_photo:
+            # The photo couldn't be downloaded/uploaded (e.g. >5MB cap in
+            # ``_download_photo``). Tell the agent so it can tell the user
+            # instead of confidently replying to an image it never saw —
+            # mirrors the document/voice "couldn't process" markers.
+            message_text = f"[Photo too large to process — please send a smaller image under 5 MB]\n{message_text}"
+
+        # Contextual recall: inject goals/tasks + relevant history on session start
+        if self._is_new_session(tenant):
+            message_text = self._build_session_context(tenant, message_text)
+
+        # ``had_photo`` (not just a successful upload) forces a singleton: both
+        # the "[Photo attached: …]" and the ">5 MB" fallback markers live only
+        # in message_text and must survive a cold-start coalesce.
+        self._forward_to_container(
+            chat_id,
+            tenant,
+            message_text,
+            raw_user_text=raw_user_text,
+            is_image=had_photo,
+            provider_event_id=provider_event_id,
+        )
+
+    # ── Contextual recall ──────────────────────────────────────────────────
+
+    SESSION_GAP_SECONDS = 30 * 60  # 30 minutes
+
+    def _is_new_session(self, tenant: Tenant) -> bool:
+        """Return True if enough time has passed since the tenant's last message."""
+        try:
+            if not tenant.last_message_at:
+                return True  # First ever message
+            elapsed = (timezone.now() - tenant.last_message_at).total_seconds()
+            return elapsed > self.SESSION_GAP_SECONDS
+        except (TypeError, AttributeError):
+            return False
+
+    def _build_session_context(self, tenant: Tenant, message_text: str) -> str:
+        """Prepend goals, tasks, and relevant history to the message.
+
+        Called on the first message after a 30-min gap. Best-effort — if anything
+        fails (embedding API down, no docs), returns the original message unchanged.
+        """
+        try:
+            return self._build_session_context_inner(tenant, message_text)
+        except Exception:
+            logger.exception("contextual_recall: failed for tenant %s", str(tenant.id)[:8])
+            return message_text
+
+    def _build_session_context_inner(self, tenant: Tenant, message_text: str) -> str:
+        from apps.journal.models import DocumentChunk
+        from apps.lessons.models import Lesson
+
+        context_parts: list[str] = []
+
+        # Step 1: Always inject goals + tasks.
+        # Dual-read for #624: typed Goal/Task rows take precedence over
+        # legacy Documents. Reuse the journal envelope renderers so the
+        # session context matches what USER.md shows.
+        from apps.journal.envelope import render_goals, render_open_tasks
+
+        goals_markdown = render_goals(tenant, max_chars=1500)
+        if goals_markdown.strip():
+            context_parts.append(f"## Your active goals\n{goals_markdown}")
+
+        tasks_markdown = render_open_tasks(tenant)
+        if tasks_markdown.strip():
+            context_parts.append(f"## Your current tasks\n{tasks_markdown[:1500]}")
+
+        # Step 2: Search relevant history (best-effort — skip if embedding fails)
+        history_parts: list[str] = []
+        try:
+            from pgvector.django import CosineDistance
+
+            from apps.lessons.services import generate_embedding
+
+            query_embedding = generate_embedding(
+                message_text[:500],
+                tenant=tenant,
+                seam="session_start_query_embedding",
+            )
+
+            # Search daily note chunks
+            chunks = (
+                DocumentChunk.objects.filter(tenant=tenant)
+                .annotate(distance=CosineDistance("embedding", query_embedding))
+                .order_by("distance")[:5]
+            )
+            for c in chunks:
+                similarity = 1.0 - float(c.distance)
+                if similarity > 0.65:
+                    history_parts.append(c.text)
+                if len(history_parts) >= 2:
+                    break
+
+            # Search lessons
+            lessons = (
+                Lesson.objects.filter(tenant=tenant, status="approved", embedding__isnull=False)
+                .annotate(distance=CosineDistance("embedding", query_embedding))
+                .order_by("distance")[:3]
+            )
+            for lsn in lessons:
+                similarity = 1.0 - float(lsn.distance)
+                if similarity > 0.65 and len(history_parts) < 3:
+                    history_parts.append(f"💡 {lsn.text}")
+
+        except Exception:
+            logger.warning(
+                "contextual_recall: embedding search failed for tenant %s", str(tenant.id)[:8], exc_info=True
+            )
+
+        if history_parts:
+            context_parts.append("## Relevant history\n" + "\n---\n".join(history_parts))
+
+        if not context_parts:
+            return message_text
+
+        prefix = "[Context for this conversation:]\n\n" + "\n\n".join(context_parts)
+        prefix += "\n\n[Now respond to the user's message:]\n\n"
+        return prefix + message_text
+
+    def _extract_reply_context(self, message: dict) -> str:
+        """Extract reply-to context if user is replying to a bot message.
+
+        Returns a prefix string like '[Replying to: "truncated text"]\n\n' or empty string.
+        """
+        reply = message.get("reply_to_message")
+        if not reply:
+            return ""
+
+        # Only include context for replies to bot messages
+        reply_from = reply.get("from", {})
+        if not reply_from.get("is_bot"):
+            return ""
+
+        reply_text = reply.get("text") or reply.get("caption") or ""
+        if not reply_text:
+            return ""
+
+        # Truncate long quotes
+        if len(reply_text) > 200:
+            reply_text = reply_text[:200] + "…"
+
+        return f'[Replying to: "{reply_text}"]\n\n'
+
+    def _extract_message_text(self, update: dict, tenant: Tenant | None = None) -> str | None:
+        """Extract user message text from a Telegram update.
+
+        ``tenant`` (when known) is forwarded to voice transcription so Whisper
+        gets a per-tenant vocabulary hint; it is optional so callers/tests that
+        only need text extraction keep working unchanged.
+        """
+        message = update.get("message") or update.get("edited_message")
+        if not message:
+            return None
+
+        reply_prefix = self._extract_reply_context(message)
+
+        # Forwarded message — prepend source info
+        if message.get("forward_from") or message.get("forward_from_chat"):
+            fwd_name = ""
+            if message.get("forward_from"):
+                fwd_name = message["forward_from"].get("first_name", "someone")
+            elif message.get("forward_from_chat"):
+                fwd_name = message["forward_from_chat"].get("title", "a chat")
+            fwd_text = message.get("text") or message.get("caption") or ""
+            return f"{reply_prefix}[Forwarded from {fwd_name}]\n{fwd_text}"
+
+        text = message.get("text")
+        if text:
+            return f"{reply_prefix}{text}"
+
+        # Photo — handled separately via _upload_photo_to_workspace
+        if message.get("photo"):
+            caption = message.get("caption") or "User sent a photo"
+            return f"{reply_prefix}{caption}"
+
+        # Voice/audio — transcribe via Whisper
+        voice = message.get("voice") or message.get("audio")
+        if voice:
+            file_id = voice.get("file_id")
+            if file_id:
+                transcript = self._transcribe_voice(file_id, tenant=tenant)
+                if transcript:
+                    return f'{reply_prefix}🎤 Voice message: "{transcript}"'
+            return f"{reply_prefix}[Voice message — couldn't transcribe, please try sending as text]"
+
+        # Document — download and extract text for supported types
+        doc = message.get("document")
+        if doc:
+            return f"{reply_prefix}{self._extract_document_text(doc)}"
+
+        # Sticker
+        if message.get("sticker"):
+            emoji = message["sticker"].get("emoji", "")
+            return f"{reply_prefix}[User sent a sticker {emoji}]"
+
+        # Video — include metadata
+        video = message.get("video") or message.get("video_note")
+        if video:
+            duration = video.get("duration", 0)
+            file_size = video.get("file_size", 0)
+            size_mb = f"{file_size / (1024 * 1024):.1f}" if file_size else "?"
+            caption = message.get("caption") or ""
+            meta = f"[User sent a video ({duration}s, {size_mb} MB)]"
+            if caption:
+                meta += f"\nCaption: {caption}"
+            return f"{reply_prefix}{meta}"
+
+        # Location
+        loc = message.get("location")
+        if loc:
+            lat = loc.get("latitude", 0)
+            lng = loc.get("longitude", 0)
+            venue = message.get("venue")
+            if venue:
+                name = venue.get("title", "")
+                addr = venue.get("address", "")
+                return f"{reply_prefix}📍 User shared a venue: {name} — {addr} ({lat}, {lng}) https://maps.google.com/maps?q={lat},{lng}"
+            return (
+                f"{reply_prefix}📍 User shared their location: {lat}, {lng} https://maps.google.com/maps?q={lat},{lng}"
+            )
+
+        # Contact
+        contact = message.get("contact")
+        if contact:
+            name = f"{contact.get('first_name', '')} {contact.get('last_name', '')}".strip()
+            phone = contact.get("phone_number", "")
+            return f"{reply_prefix}📇 User shared a contact: {name} ({phone})"
+
+        return None
+
+    def _extract_document_text(self, doc: dict) -> str:
+        """Extract document info. Downloads text-based files for content extraction."""
+        file_name = doc.get("file_name", "unknown")
+        mime_type = doc.get("mime_type", "")
+        file_size = doc.get("file_size", 0)
+        file_id = doc.get("file_id")
+
+        # Size limit: 10MB
+        if file_size > 10 * 1024 * 1024:
+            return f"[User sent a document: {file_name} ({file_size / (1024 * 1024):.1f} MB) — too large to process]"
+
+        # Text-based files we can read
+        text_extensions = {
+            ".txt",
+            ".md",
+            ".csv",
+            ".json",
+            ".xml",
+            ".html",
+            ".py",
+            ".js",
+            ".ts",
+            ".yaml",
+            ".yml",
+            ".toml",
+            ".log",
+        }
+        text_mimes = {"text/", "application/json", "application/xml", "application/yaml"}
+
+        ext = ""
+        if "." in file_name:
+            ext = "." + file_name.rsplit(".", 1)[-1].lower()
+
+        is_text = ext in text_extensions or any(mime_type.startswith(m) for m in text_mimes)
+
+        if not is_text or not file_id:
+            return f"[User sent a document: {file_name} ({mime_type})]"
+
+        # Download and read content
+        assert self._http is not None
+        try:
+            resp = self._http.post(
+                f"{self._api_base}/getFile",
+                json={"file_id": file_id},
+                timeout=10,
+            )
+            if not resp.is_success:
+                return f"[User sent a document: {file_name} — download failed]"
+
+            file_path = resp.json().get("result", {}).get("file_path")
+            if not file_path:
+                return f"[User sent a document: {file_name} — download failed]"
+
+            file_url = f"https://api.telegram.org/file/bot{self.bot_token}/{file_path}"
+            dl_resp = self._http.get(file_url, timeout=15)
+            if not dl_resp.is_success:
+                return f"[User sent a document: {file_name} — download failed]"
+
+            content = dl_resp.content.decode("utf-8", errors="replace")
+            # Truncate very long files
+            if len(content) > 10000:
+                content = content[:10000] + "\n\n[... truncated, file continues ...]"
+
+            return f"📄 Document: {file_name}\n```\n{content}\n```"
+
+        except Exception:
+            logger.exception("Failed to download document %s", file_name)
+            return f"[User sent a document: {file_name} — download failed]"
+
+    def _wait_for_container_ready(self, tenant: Tenant, timeout: int = 120) -> bool:
+        """Poll the container's health endpoint until it's up or timeout expires.
+
+        Returns True if the container came up within the timeout, False otherwise.
+        """
+        import time as _time
+
+        deadline = _time.time() + timeout
+        fqdn = tenant.container_fqdn
+        if not fqdn:
+            return False
+        url = f"https://{fqdn}/health"
+        from apps.cron.gateway_client import get_gateway_token_for_tenant
+
+        internal_key = get_gateway_token_for_tenant(tenant)
+        while _time.time() < deadline:
+            try:
+                resp = httpx.get(url, headers={"X-NBHD-Internal-Key": internal_key}, timeout=5)
+                if resp.status_code < 500:
+                    return True
+            except Exception:
+                pass
+            _time.sleep(5)
+        return False
+
+    def _handle_container_restart(self, chat_id: int, tenant: Tenant, message_text: str) -> None:
+        """Handle a container that's restarting — notify user and retry the message once it's back up."""
+        if chat_id in self._update_in_progress:
+            # Already handling a restart for this user — don't double-notify
+            return
+        self._update_in_progress.add(chat_id)
+        tenant.refresh_from_db(fields=["status"])
+        lang = getattr(tenant.user, "language", None) or "en"
+        if tenant.status == "provisioning":
+            self._send_message(chat_id, error_msg(lang, "telegram_provisioning_almost_ready"))
+        else:
+            self._send_message(chat_id, error_msg(lang, "telegram_restarting"))
+
+        def _retry():
+            try:
+                if self._wait_for_container_ready(tenant, timeout=120):
+                    # Pass ``raw_user_text=message_text`` so the dropped-message
+                    # apology quotes the user's actual words instead of the
+                    # ``[System: assistant was restarting…]`` framing.
+                    context_msg = (
+                        f"[System: assistant was restarting when this arrived. User's message:]\n{message_text}"
+                    )
+                    self._send_typing(chat_id)
+                    self._forward_to_container(chat_id, tenant, context_msg, raw_user_text=message_text)
+                else:
+                    self._send_message(chat_id, error_msg(lang, "telegram_resend_after_failed_wait"))
+            finally:
+                self._update_in_progress.discard(chat_id)
+
+        threading.Thread(target=_retry, daemon=True).start()
+
+    def _forward_to_container(
+        self,
+        chat_id: int,
+        tenant: Tenant,
+        message_text: str,
+        raw_user_text: str | None = None,
+        is_image: bool = False,
+        provider_event_id: int | str | None = None,
+    ) -> None:
+        """Pre-process the message and enqueue it on the per-tenant
+        serialization queue.
+
+        We DON'T POST to the container here anymore — that happens in
+        ``apps.router.pending_queue.drain_pending_messages_for_tenant_task``
+        (PR #431). The queue serializes per
+        ``(tenant, channel, chat_id)`` so two messages arriving in quick
+        succession from the same chat never land overlapping turns at
+        the OpenClaw claude-cli backend (which would reject the second
+        with "Claude CLI live session is already handling a turn" and
+        either silently fall back to MiniMax or — post-#427 — error
+        out).
+
+        Pre-flight state checks (provisioning, container_fqdn) stay
+        synchronous so we can give the user immediate feedback instead
+        of enqueuing a row that's guaranteed to fail. Typing indicator
+        is fired once before enqueuing; the drain task fires another
+        right before the slow POST so the user keeps seeing activity.
+        """
+        from apps.router.pending_queue import enqueue_message_for_tenant
+
+        # Preserve the user-meaningful text for the dropped-message apology.
+        # ``message_text`` accumulates workspace/transition/datetime/chat markers
+        # below, all of which are agent-only metadata. If we let it stand in
+        # for the excerpt, the apology shows "It started with: '[Now: …'"
+        # which is useless for jogging the user's memory.
+        # Track whether raw_user_text aliases message_text so we can avoid a
+        # redundant NER inference pass below (FA-1015).
+        _raw_aliases_message = raw_user_text is None
+        raw_user_text = raw_user_text if raw_user_text is not None else message_text
+
+        lang = getattr(tenant.user, "language", None) or "en"
+        if not tenant.container_fqdn or tenant.status == "provisioning":
+            self._send_message(chat_id, error_msg(lang, "provisioning_setup"))
+            return
+
+        # Redact PII from the user's text BEFORE the agent-only markers are
+        # prepended below — so the third-party LLM provider never sees the
+        # raw name/email/phone the subscriber typed. We redact the bare
+        # ``message_text`` (photo prefix + session-recall context, if any)
+        # and the apology excerpt, but NOT the proactive/datetime/chat
+        # markers added afterwards (running the NER detector over those
+        # structural markers makes it misfire). The checked redactor
+        # mints/reuses ``[PERSON_N]`` placeholders against the tenant's
+        # ``pii_entity_map``; outbound rehydration is already wired in the
+        # relay path so the user still sees the real values. Its text remains
+        # fail-open while the outcome records whether redaction completed.
+        from apps.pii.redactor import redact_user_message_checked
+
+        message_redaction = redact_user_message_checked(message_text, tenant)
+        message_text = message_redaction.text
+        # When raw_user_text was not provided by the caller it was aliased to
+        # the same string as message_text (above). In that case reuse the
+        # already-redacted message_text rather than running a second identical
+        # DeBERTa NER pass over the same content.
+        raw_redaction = (
+            message_redaction if _raw_aliases_message else redact_user_message_checked(raw_user_text, tenant)
+        )
+        raw_user_text = raw_redaction.text
+
+        user_tz = tenant.user.timezone or "UTC"
+
+        # Chat sessionKey is flat: one continuous session per user.
+        # Workspace-based chat routing was removed 2026-05-20 — see
+        # docs/implementation/remove-workspace-chat-routing.md. Cron
+        # isolation lives at sessionTarget="isolated" + isolatedSession=True
+        # on the cron job config, not in user_param.
+        user_param = str(chat_id)
+
+        # Inject current time so the agent always knows "now"
+        # Surface any proactive outbound (cron-fired or otherwise) sent
+        # to this user in the last 24h so the agent can thread the reply
+        # back to it. Tenant-scoped (transport-agnostic) — see
+        # apps.router.proactive_context.
+        from apps.router.proactive_context import surface_proactive_context
+        from apps.router.services import (
+            build_chat_context_marker,
+            build_datetime_context,
+            get_forwarding_timeout,
+        )
+
+        proactive_block = surface_proactive_context(tenant=tenant)
+
+        # Mark this as a conversational turn (not a scheduled cron run) so the
+        # agent skips the heavy AGENTS.md "Session Start" auto-context-load.
+        # Cron prompts already include their own "load full context" preamble
+        # in apps/orchestrator/config_generator.py — they stay heavy on purpose.
+        message_text = (
+            proactive_block + build_datetime_context(user_tz) + build_chat_context_marker("telegram") + message_text
+        )
+
+        # Resolve forwarding timeout solely for the typing/nudge timing
+        # below. The drain task re-resolves the actual chat-completion
+        # timeout itself (using ``_resolve_chat_timeout`` which respects
+        # BYO Claude + reasoning models — see PR #430).
+        _chat_timeout, _is_reasoning = get_forwarding_timeout(tenant)
+
+        # One typing pulse now so the user sees immediate activity. The
+        # drain task fires another pulse right before its POST.
+        # NOTE: pre-#431 this was a 5s repeating typing thread plus a
+        # 45s "still thinking" nudge for reasoning models. Both went
+        # away when forwarding moved into the queue — Telegram's typing
+        # indicator auto-clears after ~5s, so during a 30-150s BYO
+        # Claude turn the user only sees activity briefly. Restoring
+        # the heartbeat / nudge from inside the drain task is a
+        # follow-up; not blocking the warm-tenant serialization fix.
+        self._send_typing(chat_id)
+
+        payload = {
+            "message_text": message_text,
+            "user_param": user_param,
+            "user_timezone": user_tz,
+            "provider_event_id": provider_event_id,
+            "redaction": {
+                "confirmed": raw_redaction.confirmed,
+                "reason": raw_redaction.reason,
+            },
+        }
+        if is_image:
+            # Force a singleton batch: the [Photo attached: <path>] marker lives
+            # ONLY in message_text, but a coalesced batch rebuilds content from
+            # each row's user_text (no marker) — so a coalesced photo turn would
+            # silently drop the image. Mirrors the iOS ingress + is_voice.
+            payload["is_image"] = True
+
+        enqueue_message_for_tenant(
+            tenant=tenant,
+            channel="telegram",
+            channel_user_id=str(chat_id),
+            payload=payload,
+            user_text_excerpt=raw_user_text,
+        )
+
+    # Gateway error strings that should be treated as empty responses
+    _GATEWAY_ERROR_STRINGS = frozenset(
+        {
+            "No response from OpenClaw.",
+            "No response from OpenClaw",
+        }
+    )
+
+    def _extract_ai_response(self, result: dict) -> str | None:
+        """Extract the AI response text from a chat completions response.
+
+        Returns None if the response is empty or contains a gateway
+        error string (e.g. 'No response from OpenClaw.').
+        """
+        try:
+            choices = result.get("choices", [])
+            if choices:
+                text = choices[0].get("message", {}).get("content")
+                if text and text.strip() not in self._GATEWAY_ERROR_STRINGS:
+                    return text
+        except (IndexError, KeyError, TypeError):
+            pass
+        return None
+
+    def _record_usage(self, tenant: Tenant, result: dict) -> None:
+        """Record token usage from the webhook response."""
+        usage = result.get("usage")
+        if not isinstance(usage, dict) or not usage:
+            model = result.get("model", "")
+            if model:
+                logger.warning(
+                    "USAGE_MISSING tenant=%s model=%s result_keys=%s — "
+                    "container returned a response but no usage object",
+                    tenant.id,
+                    model,
+                    list(result.keys()),
+                )
+            else:
+                logger.warning(
+                    "USAGE_MISSING tenant=%s result_keys=%s — no usage object and no model in response",
+                    tenant.id,
+                    list(result.keys()),
+                )
+            return
+
+        input_tokens = usage.get("prompt_tokens", 0) or usage.get("input_tokens", 0) or 0
+        output_tokens = usage.get("completion_tokens", 0) or usage.get("output_tokens", 0) or 0
+        model_used = resolve_model_for_attribution(tenant, result)
+
+        if not (input_tokens or output_tokens):
+            logger.warning(
+                "USAGE_ZERO tenant=%s model=%s usage_keys=%s — usage object present but token counts are zero",
+                tenant.id,
+                model_used,
+                list(usage.keys()),
+            )
+            return
+
+        try:
+            record_usage(
+                tenant=tenant,
+                event_type="message",
+                input_tokens=int(input_tokens),
+                output_tokens=int(output_tokens),
+                model_used=model_used,
+            )
+        except Exception:
+            logger.exception("Failed to record usage for tenant %s", tenant.id)
+
+    def _send_budget_exhausted(self, chat_id: int, tenant: Tenant, reason: str) -> None:
+        """Send budget exhausted message."""
+        frontend_url = getattr(settings, "FRONTEND_URL", "https://neighborhoodunited.org").rstrip("/")
+        lang = getattr(getattr(tenant, "user", None), "language", None) or "en"
+
+        if reason == "global":
+            msg_key = "budget_unavailable"
+            kwargs: dict[str, str] = {}
+        else:
+            msg_key = "budget_exhausted_trial" if tenant.is_trial else "budget_exhausted_paid"
+            kwargs = {"plus_message": "", "billing_url": f"{frontend_url}/billing"}
+
+        self._send_message(chat_id, error_msg(lang, msg_key, **kwargs))
+
+    def _handle_extraction_callback(self, update: dict, tenant: Tenant) -> None:
+        """Handle PendingExtraction approve/dismiss callbacks."""
+        from .extraction_callbacks import handle_extraction_callback
+
+        try:
+            import json as _json
+
+            json_response = handle_extraction_callback(update, tenant)
+            response_data = _json.loads(json_response.content)
+            if response_data:
+                self._execute_telegram_response(response_data)
+        except Exception:
+            logger.exception("Error handling extraction callback")
+            callback_id = update["callback_query"].get("id")
+            if callback_id:
+                lang = getattr(tenant.user, "language", None) or "en"
+                self._answer_callback_query(callback_id, error_msg(lang, "forwarding_error"))
+
+    def _handle_task_action_callback(self, update: dict, tenant: Tenant) -> None:
+        """Handle reconciliation ``PendingTaskAction`` undo callbacks.
+
+        Bridges the webhook-style handler into the poller path the same way
+        ``_handle_extraction_callback`` does: the handler performs the undo +
+        edits the channel message itself, and returns an ``answerCallbackQuery``
+        response dict which we execute so the tapped button stops spinning.
+        """
+        from .task_action_callbacks import handle_task_action_callback
+
+        try:
+            import json as _json
+
+            json_response = handle_task_action_callback(update, tenant)
+            response_data = _json.loads(json_response.content)
+            if response_data:
+                self._execute_telegram_response(response_data)
+        except Exception:
+            logger.exception("Error handling task_action callback")
+            callback_id = update["callback_query"].get("id")
+            if callback_id:
+                lang = getattr(tenant.user, "language", None) or "en"
+                self._answer_callback_query(callback_id, error_msg(lang, "forwarding_error"))
+
+    def _handle_gate_callback(
+        self,
+        update: dict,
+        tenant: Tenant,
+        callback_data: str,
+        callback_id: str,
+        chat_id: int,
+    ) -> None:
+        """Handle action gate approve/deny callbacks."""
+        from apps.actions.messaging import update_gate_message
+        from apps.actions.models import ActionAuditLog, ActionStatus, PendingAction
+
+        try:
+            # Parse: gate_approve:123 or gate_deny:123
+            parts = callback_data.split(":")
+            if len(parts) != 2:
+                self._answer_callback_query(callback_id, "Invalid callback")
+                return
+
+            action_str, action_id_str = parts[0], parts[1]
+            is_approve = action_str == "gate_approve"
+            action_id = int(action_id_str)
+
+            action = PendingAction.objects.get(id=action_id, tenant=tenant)
+
+            # Already resolved?
+            if action.status != ActionStatus.PENDING:
+                self._answer_callback_query(callback_id, f"Already {action.status}")
+                return
+
+            # Expired? Use conditional UPDATE so the sweep cannot have already
+            # flipped the row between our is_expired check and the write.
+            if action.is_expired:
+                updated = PendingAction.objects.filter(
+                    id=action.id,
+                    status=ActionStatus.PENDING,
+                ).update(status=ActionStatus.EXPIRED)
+                if updated:
+                    action.status = ActionStatus.EXPIRED
+                    ActionAuditLog.objects.create(
+                        tenant=tenant,
+                        action_type=action.action_type,
+                        action_payload=action.action_payload,
+                        display_summary=action.display_summary,
+                        pii_receipts=action.pii_receipts,
+                        result=ActionStatus.EXPIRED,
+                    )
+                    update_gate_message(action)
+                self._answer_callback_query(callback_id, "⏰ Expired")
+                return
+
+            # Apply response using a conditional UPDATE so the sweep cannot
+            # clobber an approve that lands at the deadline boundary.
+            from django.utils import timezone
+
+            now = timezone.now()
+            new_status = ActionStatus.APPROVED if is_approve else ActionStatus.DENIED
+            updated = PendingAction.objects.filter(
+                id=action.id,
+                status=ActionStatus.PENDING,
+            ).update(status=new_status, responded_at=now)
+            if not updated:
+                # Sweep flipped EXPIRED between our read and write; treat as expired.
+                action.refresh_from_db(fields=["status"])
+                self._answer_callback_query(callback_id, f"Already {action.status}")
+                return
+            action.status = new_status
+            action.responded_at = now
+
+            ActionAuditLog.objects.create(
+                tenant=tenant,
+                action_type=action.action_type,
+                action_payload=action.action_payload,
+                display_summary=action.display_summary,
+                pii_receipts=action.pii_receipts,
+                result=action.status,
+                responded_at=now,
+            )
+
+            update_gate_message(action)
+
+            icon = "✅" if is_approve else "❌"
+            label = "Approved" if is_approve else "Denied"
+            self._answer_callback_query(callback_id, f"{icon} {label}")
+
+            logger.info(
+                "Gate callback: tenant=%s action=%s result=%s",
+                tenant.id,
+                action_id,
+                action.status,
+            )
+
+        except PendingAction.DoesNotExist:
+            self._answer_callback_query(callback_id, "Action not found")
+        except Exception:
+            logger.exception("Error handling gate callback")
+            lang = getattr(tenant.user, "language", None) or "en"
+            self._answer_callback_query(callback_id, error_msg(lang, "forwarding_error"))
+
+    def _handle_lesson_callback(self, update: dict, tenant: Tenant) -> None:
+        """Handle lesson approval callback queries via the existing handler.
+
+        The existing handle_lesson_callback returns a JsonResponse; we extract
+        the JSON content and execute the Telegram method it describes.
+        """
+        from .lesson_callbacks import handle_lesson_callback
+
+        try:
+            json_response = handle_lesson_callback(update, tenant)
+            # JsonResponse stores rendered content; parse it back
+            import json as _json
+
+            response_data = _json.loads(json_response.content)
+            if response_data:
+                self._execute_telegram_response(response_data)
+        except Exception:
+            logger.exception("Error handling lesson callback")
+            callback_id = update["callback_query"].get("id")
+            if callback_id:
+                lang = getattr(tenant.user, "language", None) or "en"
+                self._answer_callback_query(callback_id, error_msg(lang, "forwarding_error"))
+
+    def _handle_friend_callback(self, update: dict, tenant: Tenant) -> None:
+        """Handle wave accept/decline callbacks via the shared handler.
+
+        ``handle_friend_callback`` returns a JsonResponse describing a Telegram
+        method (editMessageText / answerCallbackQuery); we replay it, same as
+        the lesson-callback path."""
+        from .friends_callbacks import handle_friend_callback
+
+        try:
+            json_response = handle_friend_callback(update, tenant)
+            import json as _json
+
+            response_data = _json.loads(json_response.content)
+            if response_data:
+                self._execute_telegram_response(response_data)
+        except Exception:
+            logger.exception("Error handling friend callback")
+            callback_id = update["callback_query"].get("id")
+            if callback_id:
+                lang = getattr(tenant.user, "language", None) or "en"
+                self._answer_callback_query(callback_id, error_msg(lang, "forwarding_error"))

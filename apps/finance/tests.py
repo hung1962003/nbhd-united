@@ -1,0 +1,2472 @@
+"""Finance module tests — services, models, runtime views, consumer views, snapshots."""
+
+from __future__ import annotations
+
+from datetime import UTC, date
+from decimal import Decimal
+from unittest import TestCase as UnitTestCase
+
+from django.test import TestCase, override_settings
+from rest_framework.test import APIClient
+from rest_framework_simplejwt.tokens import RefreshToken
+
+from apps.tenants.services import create_tenant
+from apps.tenants.test_utils import seed_internal_key
+
+from .models import FinanceAccount, FinanceSnapshot, FinanceTransaction, PayoffPlan
+from .services import DebtInput, calculate_payoff, compare_strategies
+
+# ═════════════════════════════════════════════════════════════════════
+# 1. Payoff Calculation Service (pure math, no DB)
+# ═════════════════════════════════════════════════════════════════════
+
+
+class PayoffCalculationTests(UnitTestCase):
+    """Test the core payoff calculation engine."""
+
+    def _make_debts(self):
+        return [
+            DebtInput(
+                nickname="High Rate CC",
+                balance=Decimal("5000"),
+                interest_rate=Decimal("24.99"),
+                minimum_payment=Decimal("100"),
+            ),
+            DebtInput(
+                nickname="Low Rate Loan",
+                balance=Decimal("10000"),
+                interest_rate=Decimal("5.5"),
+                minimum_payment=Decimal("200"),
+            ),
+            DebtInput(
+                nickname="Small Balance CC",
+                balance=Decimal("1500"),
+                interest_rate=Decimal("18.0"),
+                minimum_payment=Decimal("50"),
+            ),
+        ]
+
+    def test_snowball_smallest_first(self):
+        """Snowball should target smallest balance first."""
+        debts = self._make_debts()
+        result = calculate_payoff(debts, Decimal("600"), "snowball", date(2026, 4, 1))
+
+        self.assertEqual(result.strategy, "snowball")
+        self.assertGreater(result.payoff_months, 0)
+        self.assertGreater(result.total_interest, Decimal("0"))
+        self.assertEqual(len(result.schedule), result.payoff_months)
+
+        first_month = result.schedule[0]
+        payments = {a.nickname: a.payment for a in first_month.accounts}
+        # Small Balance CC ($1500) is targeted — should get more than minimum
+        self.assertGreater(payments["Small Balance CC"], Decimal("50"))
+
+    def test_avalanche_highest_rate_first(self):
+        """Avalanche should target highest interest rate first."""
+        debts = self._make_debts()
+        result = calculate_payoff(debts, Decimal("600"), "avalanche", date(2026, 4, 1))
+
+        self.assertEqual(result.strategy, "avalanche")
+        first_month = result.schedule[0]
+        payments = {a.nickname: a.payment for a in first_month.accounts}
+        # High Rate CC (24.99%) is targeted — should get more than minimum
+        self.assertGreater(payments["High Rate CC"], Decimal("100"))
+
+    def test_avalanche_saves_most_interest(self):
+        """Avalanche should always have lowest total interest."""
+        debts = self._make_debts()
+        results = compare_strategies(debts, Decimal("600"), date(2026, 4, 1))
+        self.assertLessEqual(
+            results["avalanche"].total_interest,
+            results["snowball"].total_interest,
+        )
+
+    def test_empty_debts(self):
+        result = calculate_payoff([], Decimal("500"), "snowball")
+        self.assertEqual(result.payoff_months, 0)
+        self.assertEqual(result.total_interest, Decimal("0"))
+        self.assertEqual(result.schedule, [])
+
+    def test_single_debt_zero_interest(self):
+        debts = [
+            DebtInput(
+                nickname="Card", balance=Decimal("1000"), interest_rate=Decimal("0"), minimum_payment=Decimal("100")
+            ),
+        ]
+        result = calculate_payoff(debts, Decimal("500"), "snowball", date(2026, 4, 1))
+        self.assertEqual(result.payoff_months, 2)
+        self.assertEqual(result.total_interest, Decimal("0"))
+        self.assertEqual(result.payoff_date, date(2026, 6, 1))
+
+    def test_budget_less_than_minimums(self):
+        debts = [
+            DebtInput(
+                nickname="A", balance=Decimal("5000"), interest_rate=Decimal("10"), minimum_payment=Decimal("200")
+            ),
+            DebtInput(
+                nickname="B", balance=Decimal("3000"), interest_rate=Decimal("15"), minimum_payment=Decimal("150")
+            ),
+        ]
+        result = calculate_payoff(debts, Decimal("300"), "avalanche", date(2026, 4, 1))
+        self.assertGreater(result.payoff_months, 0)
+
+    def test_compare_strategies_returns_all_three(self):
+        results = compare_strategies(self._make_debts(), Decimal("600"))
+        self.assertEqual(set(results.keys()), {"snowball", "avalanche", "hybrid"})
+
+    def test_schedule_balance_decreases(self):
+        result = calculate_payoff(self._make_debts(), Decimal("600"), "avalanche", date(2026, 4, 1))
+        for i in range(1, len(result.schedule)):
+            self.assertLessEqual(
+                result.schedule[i].total_remaining,
+                result.schedule[i - 1].total_remaining,
+            )
+
+    def test_payoff_date_is_correct(self):
+        start = date(2026, 4, 1)
+        result = calculate_payoff(self._make_debts(), Decimal("600"), "snowball", start)
+        from dateutil.relativedelta import relativedelta
+
+        self.assertEqual(result.payoff_date, start + relativedelta(months=result.payoff_months))
+
+    def test_final_balance_is_zero(self):
+        result = calculate_payoff(self._make_debts(), Decimal("600"), "avalanche", date(2026, 4, 1))
+        last_month = result.schedule[-1]
+        self.assertEqual(last_month.total_remaining, Decimal("0"))
+        for a in last_month.accounts:
+            self.assertEqual(a.balance, Decimal("0"))
+
+
+# ═════════════════════════════════════════════════════════════════════
+# 2. Model Property Tests
+# ═════════════════════════════════════════════════════════════════════
+
+
+class FinanceAccountModelTests(TestCase):
+    def setUp(self):
+        self.tenant = create_tenant(display_name="Model Test", telegram_chat_id=900001)
+
+    def test_is_debt_for_credit_card(self):
+        account = FinanceAccount.objects.create(
+            tenant=self.tenant,
+            account_type="credit_card",
+            nickname="CC",
+            current_balance=Decimal("1000"),
+        )
+        self.assertTrue(account.is_debt)
+
+    def test_is_debt_false_for_savings(self):
+        account = FinanceAccount.objects.create(
+            tenant=self.tenant,
+            account_type="savings",
+            nickname="Savings",
+            current_balance=Decimal("5000"),
+        )
+        self.assertFalse(account.is_debt)
+
+    def test_payoff_progress_with_original_balance(self):
+        account = FinanceAccount.objects.create(
+            tenant=self.tenant,
+            account_type="credit_card",
+            nickname="CC",
+            current_balance=Decimal("600"),
+            original_balance=Decimal("1000"),
+        )
+        self.assertAlmostEqual(account.payoff_progress, 40.0)
+
+    def test_payoff_progress_fully_paid(self):
+        account = FinanceAccount.objects.create(
+            tenant=self.tenant,
+            account_type="credit_card",
+            nickname="CC",
+            current_balance=Decimal("0"),
+            original_balance=Decimal("1000"),
+        )
+        self.assertAlmostEqual(account.payoff_progress, 100.0)
+
+    def test_payoff_progress_none_without_original(self):
+        account = FinanceAccount.objects.create(
+            tenant=self.tenant,
+            account_type="credit_card",
+            nickname="CC",
+            current_balance=Decimal("1000"),
+        )
+        self.assertIsNone(account.payoff_progress)
+
+    def test_payoff_progress_none_for_savings(self):
+        account = FinanceAccount.objects.create(
+            tenant=self.tenant,
+            account_type="savings",
+            nickname="Sav",
+            current_balance=Decimal("5000"),
+            original_balance=Decimal("1000"),
+        )
+        self.assertIsNone(account.payoff_progress)
+
+    def test_soft_delete(self):
+        account = FinanceAccount.objects.create(
+            tenant=self.tenant,
+            account_type="credit_card",
+            nickname="CC",
+            current_balance=Decimal("1000"),
+        )
+        account.is_active = False
+        account.save()
+        active = FinanceAccount.objects.filter(tenant=self.tenant, is_active=True)
+        self.assertEqual(active.count(), 0)
+
+
+class FinanceSnapshotModelTests(TestCase):
+    def setUp(self):
+        self.tenant = create_tenant(display_name="Snap Test", telegram_chat_id=900002)
+
+    def test_unique_together_tenant_date(self):
+        FinanceSnapshot.objects.create(
+            tenant=self.tenant,
+            date=date(2026, 4, 1),
+            total_debt=Decimal("5000"),
+            total_savings=Decimal("0"),
+        )
+        from django.db import IntegrityError
+
+        with self.assertRaises(IntegrityError):
+            FinanceSnapshot.objects.create(
+                tenant=self.tenant,
+                date=date(2026, 4, 1),
+                total_debt=Decimal("4500"),
+                total_savings=Decimal("0"),
+            )
+
+
+# ═════════════════════════════════════════════════════════════════════
+# 3. Runtime View Tests (OpenClaw plugin → Django)
+# ═════════════════════════════════════════════════════════════════════
+
+
+@override_settings(NBHD_INTERNAL_API_KEY="test-key")
+class RuntimeFinanceViewTests(TestCase):
+    def setUp(self):
+        self.tenant = create_tenant(display_name="Runtime Finance", telegram_chat_id=900010)
+        seed_internal_key(self.tenant)
+        self.other_tenant = create_tenant(display_name="Other", telegram_chat_id=900011)
+
+    def _headers(self, tenant_id=None, key="test-key"):
+        return {
+            "HTTP_X_NBHD_INTERNAL_KEY": key,
+            "HTTP_X_NBHD_TENANT_ID": tenant_id or str(self.tenant.id),
+        }
+
+    def _url(self, suffix):
+        return f"/api/v1/finance/runtime/{self.tenant.id}{suffix}"
+
+    # ── Auth ────────────────────────────────────────────────────────
+
+    def test_accounts_requires_auth(self):
+        response = self.client.get(self._url("/accounts/"))
+        self.assertEqual(response.status_code, 401)
+
+    def test_accounts_rejects_wrong_key(self):
+        response = self.client.get(self._url("/accounts/"), **self._headers(key="wrong"))
+        self.assertEqual(response.status_code, 401)
+
+    def test_accounts_rejects_tenant_scope_mismatch(self):
+        response = self.client.get(
+            self._url("/accounts/"),
+            **self._headers(tenant_id=str(self.other_tenant.id)),
+        )
+        self.assertEqual(response.status_code, 401)
+
+    # ── Accounts CRUD ───────────────────────────────────────────────
+
+    def test_create_account(self):
+        response = self.client.post(
+            self._url("/accounts/"),
+            data={
+                "nickname": "Chase Card",
+                "account_type": "credit_card",
+                "current_balance": 4200,
+                "interest_rate": 22.9,
+                "minimum_payment": 120,
+            },
+            content_type="application/json",
+            **self._headers(),
+        )
+        self.assertEqual(response.status_code, 201)
+        body = response.json()
+        self.assertEqual(body["nickname"], "Chase Card")
+        self.assertTrue(body["created"])
+        # original_balance should be auto-set
+        account = FinanceAccount.objects.get(id=body["id"])
+        self.assertEqual(account.original_balance, Decimal("4200"))
+
+    def test_upsert_account_by_nickname(self):
+        """Second create with same nickname should update, not duplicate."""
+        self.client.post(
+            self._url("/accounts/"),
+            data={"nickname": "Chase Card", "account_type": "credit_card", "current_balance": 4200},
+            content_type="application/json",
+            **self._headers(),
+        )
+        response = self.client.post(
+            self._url("/accounts/"),
+            data={"nickname": "chase card", "account_type": "credit_card", "current_balance": 3800},
+            content_type="application/json",
+            **self._headers(),
+        )
+        self.assertEqual(response.status_code, 200)
+        self.assertFalse(response.json()["created"])
+        self.assertEqual(
+            FinanceAccount.objects.filter(tenant=self.tenant, is_active=True).count(),
+            1,
+        )
+        self.assertEqual(
+            FinanceAccount.objects.first().current_balance,
+            Decimal("3800"),
+        )
+
+    def test_create_account_requires_nickname(self):
+        response = self.client.post(
+            self._url("/accounts/"),
+            data={"account_type": "credit_card", "current_balance": 1000},
+            content_type="application/json",
+            **self._headers(),
+        )
+        self.assertEqual(response.status_code, 400)
+
+    def test_create_account_requires_balance(self):
+        response = self.client.post(
+            self._url("/accounts/"),
+            data={"nickname": "Card", "account_type": "credit_card"},
+            content_type="application/json",
+            **self._headers(),
+        )
+        self.assertEqual(response.status_code, 400)
+
+    def test_invalid_account_type_defaults_to_other_debt(self):
+        response = self.client.post(
+            self._url("/accounts/"),
+            data={"nickname": "Stuff", "account_type": "magic_beans", "current_balance": 500},
+            content_type="application/json",
+            **self._headers(),
+        )
+        self.assertEqual(response.status_code, 201)
+        self.assertEqual(
+            FinanceAccount.objects.first().account_type,
+            "other_debt",
+        )
+
+    def test_list_accounts(self):
+        FinanceAccount.objects.create(
+            tenant=self.tenant,
+            account_type="credit_card",
+            nickname="CC1",
+            current_balance=Decimal("1000"),
+        )
+        FinanceAccount.objects.create(
+            tenant=self.tenant,
+            account_type="savings",
+            nickname="Sav1",
+            current_balance=Decimal("5000"),
+        )
+        response = self.client.get(self._url("/accounts/"), **self._headers())
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(len(response.json()["accounts"]), 2)
+
+    # ── Tenant Isolation ────────────────────────────────────────────
+
+    def test_accounts_isolated_by_tenant(self):
+        FinanceAccount.objects.create(
+            tenant=self.tenant,
+            account_type="credit_card",
+            nickname="My Card",
+            current_balance=Decimal("1000"),
+        )
+        FinanceAccount.objects.create(
+            tenant=self.other_tenant,
+            account_type="credit_card",
+            nickname="Their Card",
+            current_balance=Decimal("2000"),
+        )
+        response = self.client.get(self._url("/accounts/"), **self._headers())
+        accounts = response.json()["accounts"]
+        self.assertEqual(len(accounts), 1)
+        self.assertEqual(accounts[0]["nickname"], "My Card")
+
+    # ── Transactions ────────────────────────────────────────────────
+
+    def test_record_payment_updates_balance(self):
+        FinanceAccount.objects.create(
+            tenant=self.tenant,
+            account_type="credit_card",
+            nickname="Chase Card",
+            current_balance=Decimal("4200"),
+        )
+        response = self.client.post(
+            self._url("/transactions/"),
+            data={"account_nickname": "Chase Card", "amount": 500},
+            content_type="application/json",
+            **self._headers(),
+        )
+        self.assertEqual(response.status_code, 201)
+        body = response.json()
+        self.assertEqual(body["new_balance"], "3700.00")
+        self.assertEqual(body["transaction_type"], "payment")
+        self.assertEqual(FinanceTransaction.objects.count(), 1)
+
+    def test_record_charge_increases_balance(self):
+        FinanceAccount.objects.create(
+            tenant=self.tenant,
+            account_type="credit_card",
+            nickname="CC",
+            current_balance=Decimal("1000"),
+        )
+        response = self.client.post(
+            self._url("/transactions/"),
+            data={"account_nickname": "CC", "amount": 200, "transaction_type": "charge"},
+            content_type="application/json",
+            **self._headers(),
+        )
+        self.assertEqual(response.status_code, 201)
+        self.assertEqual(response.json()["new_balance"], "1200.00")
+
+    def test_payment_cannot_go_below_zero(self):
+        FinanceAccount.objects.create(
+            tenant=self.tenant,
+            account_type="credit_card",
+            nickname="CC",
+            current_balance=Decimal("100"),
+        )
+        response = self.client.post(
+            self._url("/transactions/"),
+            data={"account_nickname": "CC", "amount": 500},
+            content_type="application/json",
+            **self._headers(),
+        )
+        self.assertEqual(response.status_code, 201)
+        self.assertEqual(response.json()["new_balance"], "0.00")
+
+    def test_transaction_fuzzy_nickname_match(self):
+        FinanceAccount.objects.create(
+            tenant=self.tenant,
+            account_type="credit_card",
+            nickname="Chase Sapphire Preferred",
+            current_balance=Decimal("3000"),
+        )
+        response = self.client.post(
+            self._url("/transactions/"),
+            data={"account_nickname": "chase sapphire", "amount": 100},
+            content_type="application/json",
+            **self._headers(),
+        )
+        self.assertEqual(response.status_code, 201)
+        self.assertEqual(response.json()["account_nickname"], "Chase Sapphire Preferred")
+
+    def test_transaction_unknown_account_returns_404(self):
+        response = self.client.post(
+            self._url("/transactions/"),
+            data={"account_nickname": "Nonexistent", "amount": 100},
+            content_type="application/json",
+            **self._headers(),
+        )
+        self.assertEqual(response.status_code, 404)
+
+    # ── Dedup guard ─────────────────────────────────────────────────
+
+    def test_duplicate_payment_returns_existing_row(self):
+        """Same (account, type, amount, date) twice → second call returns the first row,
+        does not double-debit balance, does not insert a new transaction.
+
+        Models the 2026-05 incident where agent retries after silent timeouts
+        triple-recorded the same Nelnet confirmation."""
+        FinanceAccount.objects.create(
+            tenant=self.tenant,
+            account_type="student_loan",
+            nickname="Loan A",
+            current_balance=Decimal("1000"),
+            original_balance=Decimal("1000"),
+        )
+        payload = {
+            "account_nickname": "Loan A",
+            "amount": 50,
+            "date": "2026-05-06",
+            "description": "Confirmation #1",
+        }
+        first = self.client.post(
+            self._url("/transactions/"),
+            data=payload,
+            content_type="application/json",
+            **self._headers(),
+        )
+        self.assertEqual(first.status_code, 201)
+        self.assertFalse(first.json()["duplicate"])
+
+        # Same call again — different description, but same (account, type, amount, date)
+        second = self.client.post(
+            self._url("/transactions/"),
+            data={**payload, "description": "Nelnet conf 1"},
+            content_type="application/json",
+            **self._headers(),
+        )
+        self.assertEqual(second.status_code, 200)
+        body = second.json()
+        self.assertTrue(body["duplicate"])
+        self.assertEqual(body["transaction_id"], first.json()["transaction_id"])
+        self.assertEqual(body["existing_description"], "Confirmation #1")
+
+        # Exactly one row inserted, balance debited once
+        self.assertEqual(FinanceTransaction.objects.count(), 1)
+        self.assertEqual(
+            FinanceAccount.objects.get(nickname="Loan A").current_balance,
+            Decimal("950"),
+        )
+
+    def test_different_amount_same_day_creates_new_row(self):
+        """A $38 and a $105 payment to the same loan on the same day are NOT duplicates."""
+        FinanceAccount.objects.create(
+            tenant=self.tenant,
+            account_type="student_loan",
+            nickname="Loan A",
+            current_balance=Decimal("1000"),
+        )
+        for amount in (38, 105):
+            response = self.client.post(
+                self._url("/transactions/"),
+                data={"account_nickname": "Loan A", "amount": amount, "date": "2026-05-06"},
+                content_type="application/json",
+                **self._headers(),
+            )
+            self.assertEqual(response.status_code, 201)
+            self.assertFalse(response.json()["duplicate"])
+        self.assertEqual(FinanceTransaction.objects.count(), 2)
+        self.assertEqual(
+            FinanceAccount.objects.get(nickname="Loan A").current_balance,
+            Decimal("857"),
+        )
+
+    def test_same_amount_different_day_creates_new_row(self):
+        """Same amount on different dates is a separate legitimate payment."""
+        FinanceAccount.objects.create(
+            tenant=self.tenant,
+            account_type="student_loan",
+            nickname="Loan A",
+            current_balance=Decimal("1000"),
+        )
+        for day in ("2026-05-06", "2026-06-06"):
+            response = self.client.post(
+                self._url("/transactions/"),
+                data={"account_nickname": "Loan A", "amount": 50, "date": day},
+                content_type="application/json",
+                **self._headers(),
+            )
+            self.assertEqual(response.status_code, 201)
+        self.assertEqual(FinanceTransaction.objects.count(), 2)
+
+    # ── Balance Update ──────────────────────────────────────────────
+
+    def test_update_balance(self):
+        FinanceAccount.objects.create(
+            tenant=self.tenant,
+            account_type="credit_card",
+            nickname="CC",
+            current_balance=Decimal("4200"),
+        )
+        response = self.client.post(
+            self._url("/balance/"),
+            data={"account_nickname": "CC", "new_balance": 3800},
+            content_type="application/json",
+            **self._headers(),
+        )
+        self.assertEqual(response.status_code, 200)
+        body = response.json()
+        self.assertEqual(body["old_balance"], "4200.00")
+        self.assertEqual(body["new_balance"], "3800.00")
+
+    def test_update_balance_unknown_account(self):
+        response = self.client.post(
+            self._url("/balance/"),
+            data={"account_nickname": "Ghost", "new_balance": 100},
+            content_type="application/json",
+            **self._headers(),
+        )
+        self.assertEqual(response.status_code, 404)
+
+    # ── Archive / Unarchive ─────────────────────────────────────────
+
+    def test_archive_account_by_nickname(self):
+        account = FinanceAccount.objects.create(
+            tenant=self.tenant,
+            account_type="student_loan",
+            nickname="Federal Student Loans",
+            current_balance=Decimal("39706.91"),
+        )
+        response = self.client.post(
+            self._url("/accounts/archive/"),
+            data={"account_nickname": "Federal Student Loans"},
+            content_type="application/json",
+            **self._headers(),
+        )
+        self.assertEqual(response.status_code, 200)
+        body = response.json()
+        self.assertTrue(body["archived"])
+        self.assertEqual(body["account_nickname"], "Federal Student Loans")
+        self.assertEqual(body["previous_balance"], "39706.91")
+        account.refresh_from_db()
+        self.assertFalse(account.is_active)
+
+    def test_archive_account_fuzzy_match(self):
+        FinanceAccount.objects.create(
+            tenant=self.tenant,
+            account_type="student_loan",
+            nickname="Federal Student Loans",
+            current_balance=Decimal("1000"),
+        )
+        response = self.client.post(
+            self._url("/accounts/archive/"),
+            data={"account_nickname": "federal student"},
+            content_type="application/json",
+            **self._headers(),
+        )
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()["account_nickname"], "Federal Student Loans")
+
+    def test_archive_account_not_found(self):
+        response = self.client.post(
+            self._url("/accounts/archive/"),
+            data={"account_nickname": "Ghost"},
+            content_type="application/json",
+            **self._headers(),
+        )
+        self.assertEqual(response.status_code, 404)
+
+    def test_archive_account_tenant_isolation(self):
+        FinanceAccount.objects.create(
+            tenant=self.other_tenant,
+            account_type="credit_card",
+            nickname="Their Card",
+            current_balance=Decimal("500"),
+        )
+        response = self.client.post(
+            self._url("/accounts/archive/"),
+            data={"account_nickname": "Their Card"},
+            content_type="application/json",
+            **self._headers(),
+        )
+        self.assertEqual(response.status_code, 404)
+
+    def test_archive_account_requires_nickname(self):
+        response = self.client.post(
+            self._url("/accounts/archive/"),
+            data={},
+            content_type="application/json",
+            **self._headers(),
+        )
+        self.assertEqual(response.status_code, 400)
+
+    def test_archive_excludes_from_payoff_calculation(self):
+        """Archived debts should not appear in payoff calculations."""
+        FinanceAccount.objects.create(
+            tenant=self.tenant,
+            account_type="credit_card",
+            nickname="Active CC",
+            current_balance=Decimal("2000"),
+            interest_rate=Decimal("20"),
+            minimum_payment=Decimal("50"),
+        )
+        FinanceAccount.objects.create(
+            tenant=self.tenant,
+            account_type="student_loan",
+            nickname="Old Loan",
+            current_balance=Decimal("10000"),
+            interest_rate=Decimal("5"),
+            minimum_payment=Decimal("100"),
+            is_active=False,
+        )
+        response = self.client.post(
+            self._url("/payoff/calculate/"),
+            data={"monthly_budget": 400, "strategy": "avalanche"},
+            content_type="application/json",
+            **self._headers(),
+        )
+        self.assertEqual(response.status_code, 200)
+        schedule = response.json()["results"]["avalanche"]["schedule"]
+        first_month_accounts = {a["nickname"] for a in schedule[0]["accounts"]}
+        self.assertIn("Active CC", first_month_accounts)
+        self.assertNotIn("Old Loan", first_month_accounts)
+
+    def test_unarchive_account(self):
+        account = FinanceAccount.objects.create(
+            tenant=self.tenant,
+            account_type="credit_card",
+            nickname="CC",
+            current_balance=Decimal("1234.56"),
+            is_active=False,
+        )
+        response = self.client.post(
+            self._url("/accounts/unarchive/"),
+            data={"account_nickname": "CC"},
+            content_type="application/json",
+            **self._headers(),
+        )
+        self.assertEqual(response.status_code, 200)
+        body = response.json()
+        self.assertTrue(body["unarchived"])
+        self.assertEqual(body["current_balance"], "1234.56")
+        account.refresh_from_db()
+        self.assertTrue(account.is_active)
+
+    def test_unarchive_name_collision(self):
+        """Cannot unarchive if an active account already has that nickname."""
+        FinanceAccount.objects.create(
+            tenant=self.tenant,
+            account_type="credit_card",
+            nickname="Chase Card",
+            current_balance=Decimal("3000"),
+        )
+        FinanceAccount.objects.create(
+            tenant=self.tenant,
+            account_type="credit_card",
+            nickname="chase card",
+            current_balance=Decimal("500"),
+            is_active=False,
+        )
+        response = self.client.post(
+            self._url("/accounts/unarchive/"),
+            data={"account_nickname": "chase card"},
+            content_type="application/json",
+            **self._headers(),
+        )
+        self.assertEqual(response.status_code, 409)
+        self.assertEqual(response.json()["error"], "name_collision")
+
+    def test_unarchive_ignores_active_accounts(self):
+        """Unarchive scoped to archived rows — cannot target an active one."""
+        FinanceAccount.objects.create(
+            tenant=self.tenant,
+            account_type="credit_card",
+            nickname="Active",
+            current_balance=Decimal("100"),
+        )
+        response = self.client.post(
+            self._url("/accounts/unarchive/"),
+            data={"account_nickname": "Active"},
+            content_type="application/json",
+            **self._headers(),
+        )
+        self.assertEqual(response.status_code, 404)
+
+    def test_list_accounts_archived_only(self):
+        FinanceAccount.objects.create(
+            tenant=self.tenant,
+            account_type="credit_card",
+            nickname="Active CC",
+            current_balance=Decimal("1000"),
+        )
+        FinanceAccount.objects.create(
+            tenant=self.tenant,
+            account_type="student_loan",
+            nickname="Old Loan",
+            current_balance=Decimal("5000"),
+            is_active=False,
+        )
+        response = self.client.get(
+            self._url("/accounts/") + "?archived=true",
+            **self._headers(),
+        )
+        self.assertEqual(response.status_code, 200)
+        accounts = response.json()["accounts"]
+        self.assertEqual(len(accounts), 1)
+        self.assertEqual(accounts[0]["nickname"], "Old Loan")
+        self.assertFalse(accounts[0]["is_active"])
+
+    def test_list_accounts_archived_all(self):
+        FinanceAccount.objects.create(
+            tenant=self.tenant,
+            account_type="credit_card",
+            nickname="Active",
+            current_balance=Decimal("100"),
+        )
+        FinanceAccount.objects.create(
+            tenant=self.tenant,
+            account_type="credit_card",
+            nickname="Gone",
+            current_balance=Decimal("200"),
+            is_active=False,
+        )
+        response = self.client.get(
+            self._url("/accounts/") + "?archived=all",
+            **self._headers(),
+        )
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(len(response.json()["accounts"]), 2)
+
+    # ── Payoff Calculation ──────────────────────────────────────────
+
+    def test_payoff_calculate_all_strategies(self):
+        FinanceAccount.objects.create(
+            tenant=self.tenant,
+            account_type="credit_card",
+            nickname="CC",
+            current_balance=Decimal("5000"),
+            interest_rate=Decimal("20"),
+            minimum_payment=Decimal("100"),
+        )
+        FinanceAccount.objects.create(
+            tenant=self.tenant,
+            account_type="auto_loan",
+            nickname="Car",
+            current_balance=Decimal("8000"),
+            interest_rate=Decimal("6"),
+            minimum_payment=Decimal("200"),
+        )
+        response = self.client.post(
+            self._url("/payoff/calculate/"),
+            data={"monthly_budget": 600},
+            content_type="application/json",
+            **self._headers(),
+        )
+        self.assertEqual(response.status_code, 200)
+        results = response.json()["results"]
+        self.assertEqual(set(results.keys()), {"snowball", "avalanche", "hybrid"})
+        for strategy in results.values():
+            self.assertGreater(strategy["payoff_months"], 0)
+            self.assertIn("schedule", strategy)
+
+    def test_payoff_calculate_single_strategy(self):
+        FinanceAccount.objects.create(
+            tenant=self.tenant,
+            account_type="credit_card",
+            nickname="CC",
+            current_balance=Decimal("3000"),
+            interest_rate=Decimal("18"),
+            minimum_payment=Decimal("80"),
+        )
+        response = self.client.post(
+            self._url("/payoff/calculate/"),
+            data={"monthly_budget": 500, "strategy": "avalanche"},
+            content_type="application/json",
+            **self._headers(),
+        )
+        self.assertEqual(response.status_code, 200)
+        results = response.json()["results"]
+        self.assertEqual(list(results.keys()), ["avalanche"])
+
+    def test_payoff_save_creates_plan_and_deactivates_old(self):
+        FinanceAccount.objects.create(
+            tenant=self.tenant,
+            account_type="credit_card",
+            nickname="CC",
+            current_balance=Decimal("3000"),
+            interest_rate=Decimal("18"),
+            minimum_payment=Decimal("80"),
+        )
+        # Create initial plan
+        old_plan = PayoffPlan.objects.create(
+            tenant=self.tenant,
+            strategy="snowball",
+            monthly_budget=Decimal("500"),
+            total_debt=Decimal("3000"),
+            total_interest=Decimal("200"),
+            payoff_months=7,
+            payoff_date=date(2026, 11, 1),
+            is_active=True,
+        )
+        # Save a new plan
+        response = self.client.post(
+            self._url("/payoff/calculate/"),
+            data={"monthly_budget": 500, "strategy": "avalanche", "save": True},
+            content_type="application/json",
+            **self._headers(),
+        )
+        self.assertEqual(response.status_code, 200)
+        old_plan.refresh_from_db()
+        self.assertFalse(old_plan.is_active)
+        new_plan = PayoffPlan.objects.filter(tenant=self.tenant, is_active=True).first()
+        self.assertIsNotNone(new_plan)
+        self.assertEqual(new_plan.strategy, "avalanche")
+
+    def test_payoff_no_debts_returns_empty(self):
+        # Only a savings account, no debts
+        FinanceAccount.objects.create(
+            tenant=self.tenant,
+            account_type="savings",
+            nickname="Sav",
+            current_balance=Decimal("5000"),
+        )
+        response = self.client.post(
+            self._url("/payoff/calculate/"),
+            data={"monthly_budget": 500},
+            content_type="application/json",
+            **self._headers(),
+        )
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()["results"], {})
+
+    def test_payoff_requires_monthly_budget(self):
+        response = self.client.post(
+            self._url("/payoff/calculate/"),
+            data={},
+            content_type="application/json",
+            **self._headers(),
+        )
+        self.assertEqual(response.status_code, 400)
+
+    # ── Summary ─────────────────────────────────────────────────────
+
+    def test_summary_aggregates_correctly(self):
+        FinanceAccount.objects.create(
+            tenant=self.tenant,
+            account_type="credit_card",
+            nickname="CC1",
+            current_balance=Decimal("3000"),
+            interest_rate=Decimal("20"),
+            minimum_payment=Decimal("80"),
+        )
+        FinanceAccount.objects.create(
+            tenant=self.tenant,
+            account_type="auto_loan",
+            nickname="Car",
+            current_balance=Decimal("8000"),
+            interest_rate=Decimal("6"),
+            minimum_payment=Decimal("200"),
+        )
+        FinanceAccount.objects.create(
+            tenant=self.tenant,
+            account_type="savings",
+            nickname="Emergency",
+            current_balance=Decimal("2500"),
+        )
+        PayoffPlan.objects.create(
+            tenant=self.tenant,
+            strategy="avalanche",
+            monthly_budget=Decimal("500"),
+            total_debt=Decimal("11000"),
+            total_interest=Decimal("1500"),
+            payoff_months=24,
+            payoff_date=date(2028, 4, 1),
+            is_active=True,
+        )
+
+        response = self.client.get(self._url("/summary/"), **self._headers())
+        self.assertEqual(response.status_code, 200)
+        body = response.json()
+        self.assertEqual(body["total_debt"], "11000.00")
+        self.assertEqual(body["total_savings"], "2500.00")
+        self.assertEqual(body["total_minimum_payments"], "280.00")
+        self.assertEqual(body["debt_account_count"], 2)
+        self.assertEqual(body["savings_account_count"], 1)
+        self.assertEqual(len(body["accounts"]), 3)
+        self.assertIsNotNone(body["active_plan"])
+        self.assertEqual(body["active_plan"]["strategy"], "avalanche")
+
+    def test_summary_no_active_plan(self):
+        FinanceAccount.objects.create(
+            tenant=self.tenant,
+            account_type="credit_card",
+            nickname="CC",
+            current_balance=Decimal("1000"),
+        )
+        response = self.client.get(self._url("/summary/"), **self._headers())
+        body = response.json()
+        self.assertIsNone(body["active_plan"])
+
+    def test_summary_isolated_by_tenant(self):
+        FinanceAccount.objects.create(
+            tenant=self.other_tenant,
+            account_type="credit_card",
+            nickname="Their Card",
+            current_balance=Decimal("9999"),
+        )
+        response = self.client.get(self._url("/summary/"), **self._headers())
+        body = response.json()
+        self.assertEqual(body["total_debt"], "0")
+        self.assertEqual(len(body["accounts"]), 0)
+
+
+# ═════════════════════════════════════════════════════════════════════
+# 4. Consumer API Tests (frontend, JWT auth)
+# ═════════════════════════════════════════════════════════════════════
+
+
+class ConsumerFinanceViewTests(TestCase):
+    def setUp(self):
+        self.tenant = create_tenant(display_name="Consumer", telegram_chat_id=900020)
+        self.other_tenant = create_tenant(display_name="Other Consumer", telegram_chat_id=900021)
+        self.client = APIClient()
+        token = RefreshToken.for_user(self.tenant.user)
+        self.client.credentials(HTTP_AUTHORIZATION=f"Bearer {token.access_token}")
+
+    def test_dashboard_requires_auth(self):
+        unauthed = APIClient()
+        response = unauthed.get("/api/v1/finance/dashboard/")
+        self.assertEqual(response.status_code, 401)
+
+    def test_dashboard_empty(self):
+        response = self.client.get("/api/v1/finance/dashboard/")
+        self.assertEqual(response.status_code, 200)
+        body = response.json()
+        self.assertEqual(body["total_debt"], "0.00")
+        self.assertEqual(body["total_savings"], "0.00")
+        self.assertEqual(body["accounts"], [])
+        self.assertIsNone(body["active_plan"])
+
+    def test_dashboard_aggregation(self):
+        FinanceAccount.objects.create(
+            tenant=self.tenant,
+            account_type="credit_card",
+            nickname="CC",
+            current_balance=Decimal("5000"),
+            original_balance=Decimal("8000"),
+            interest_rate=Decimal("20"),
+            minimum_payment=Decimal("120"),
+        )
+        FinanceAccount.objects.create(
+            tenant=self.tenant,
+            account_type="savings",
+            nickname="Sav",
+            current_balance=Decimal("2000"),
+        )
+        response = self.client.get("/api/v1/finance/dashboard/")
+        self.assertEqual(response.status_code, 200)
+        body = response.json()
+        self.assertEqual(body["total_debt"], "5000.00")
+        self.assertEqual(body["total_savings"], "2000.00")
+        self.assertEqual(body["debt_account_count"], 1)
+        self.assertEqual(body["savings_account_count"], 1)
+        self.assertEqual(len(body["accounts"]), 2)
+        # Payoff progress should be included
+        cc = next(a for a in body["accounts"] if a["nickname"] == "CC")
+        self.assertAlmostEqual(cc["payoff_progress"], 37.5)
+
+    def test_dashboard_excludes_inactive_accounts(self):
+        FinanceAccount.objects.create(
+            tenant=self.tenant,
+            account_type="credit_card",
+            nickname="Active",
+            current_balance=Decimal("1000"),
+            is_active=True,
+        )
+        FinanceAccount.objects.create(
+            tenant=self.tenant,
+            account_type="credit_card",
+            nickname="Deleted",
+            current_balance=Decimal("2000"),
+            is_active=False,
+        )
+        response = self.client.get("/api/v1/finance/dashboard/")
+        body = response.json()
+        self.assertEqual(len(body["accounts"]), 1)
+        self.assertEqual(body["accounts"][0]["nickname"], "Active")
+
+    def test_dashboard_isolated_by_tenant(self):
+        FinanceAccount.objects.create(
+            tenant=self.other_tenant,
+            account_type="credit_card",
+            nickname="Not Mine",
+            current_balance=Decimal("9999"),
+        )
+        response = self.client.get("/api/v1/finance/dashboard/")
+        self.assertEqual(len(response.json()["accounts"]), 0)
+
+    # ── Transaction POST (money movement, JWT path) ─────────────────
+
+    def test_record_payment_by_nickname_updates_balance(self):
+        FinanceAccount.objects.create(
+            tenant=self.tenant,
+            account_type="credit_card",
+            nickname="Chase Card",
+            current_balance=Decimal("4200"),
+        )
+        response = self.client.post(
+            "/api/v1/finance/transactions/",
+            data={"account_nickname": "Chase Card", "amount": 500},
+            format="json",
+        )
+        self.assertEqual(response.status_code, 201)
+        body = response.json()
+        self.assertEqual(body["new_balance"], "3700.00")
+        self.assertEqual(body["transaction_type"], "payment")
+        self.assertFalse(body["duplicate"])
+        self.assertEqual(FinanceTransaction.objects.filter(tenant=self.tenant).count(), 1)
+
+    def test_record_payment_by_account_id(self):
+        account = FinanceAccount.objects.create(
+            tenant=self.tenant,
+            account_type="student_loan",
+            nickname="Loan",
+            current_balance=Decimal("1000"),
+        )
+        response = self.client.post(
+            "/api/v1/finance/transactions/",
+            data={"account_id": str(account.id), "amount": 250},
+            format="json",
+        )
+        self.assertEqual(response.status_code, 201)
+        body = response.json()
+        self.assertEqual(body["new_balance"], "750.00")
+        self.assertEqual(body["account_id"], str(account.id))
+
+    def test_record_payment_by_account_field_alias(self):
+        # The DRF FK field name `account` (what the OpenClaw + iOS tools send)
+        # is accepted as an alias for `account_id`.
+        account = FinanceAccount.objects.create(
+            tenant=self.tenant,
+            account_type="student_loan",
+            nickname="Loan",
+            current_balance=Decimal("1000"),
+        )
+        response = self.client.post(
+            "/api/v1/finance/transactions/",
+            data={"account": str(account.id), "amount": 250},
+            format="json",
+        )
+        self.assertEqual(response.status_code, 201)
+        self.assertEqual(response.json()["new_balance"], "750.00")
+
+    def test_record_charge_increases_balance(self):
+        FinanceAccount.objects.create(
+            tenant=self.tenant,
+            account_type="credit_card",
+            nickname="CC",
+            current_balance=Decimal("1000"),
+        )
+        response = self.client.post(
+            "/api/v1/finance/transactions/",
+            data={"account_nickname": "CC", "amount": 200, "transaction_type": "charge"},
+            format="json",
+        )
+        self.assertEqual(response.status_code, 201)
+        self.assertEqual(response.json()["new_balance"], "1200.00")
+
+    def test_transaction_requires_amount(self):
+        FinanceAccount.objects.create(
+            tenant=self.tenant,
+            account_type="credit_card",
+            nickname="CC",
+            current_balance=Decimal("1000"),
+        )
+        response = self.client.post(
+            "/api/v1/finance/transactions/",
+            data={"account_nickname": "CC"},
+            format="json",
+        )
+        self.assertEqual(response.status_code, 400)
+
+    def test_transaction_unknown_account_returns_404(self):
+        response = self.client.post(
+            "/api/v1/finance/transactions/",
+            data={"account_nickname": "Nonexistent", "amount": 100},
+            format="json",
+        )
+        self.assertEqual(response.status_code, 404)
+
+    def test_transaction_invalid_date_returns_400(self):
+        FinanceAccount.objects.create(
+            tenant=self.tenant,
+            account_type="credit_card",
+            nickname="CC",
+            current_balance=Decimal("1000"),
+        )
+        response = self.client.post(
+            "/api/v1/finance/transactions/",
+            data={"account_nickname": "CC", "amount": 100, "date": "not-a-date"},
+            format="json",
+        )
+        self.assertEqual(response.status_code, 400)
+
+    def test_duplicate_transaction_returns_existing_row(self):
+        """A re-recorded (account, type, amount, date) returns the first row
+        with duplicate=True + HTTP 200, no second debit — proving the JWT path
+        shares the runtime dedup guard."""
+        FinanceAccount.objects.create(
+            tenant=self.tenant,
+            account_type="student_loan",
+            nickname="Loan A",
+            current_balance=Decimal("1000"),
+        )
+        payload = {
+            "account_nickname": "Loan A",
+            "amount": 50,
+            "date": "2026-05-06",
+            "description": "Confirmation #1",
+        }
+        first = self.client.post("/api/v1/finance/transactions/", data=payload, format="json")
+        self.assertEqual(first.status_code, 201)
+        self.assertFalse(first.json()["duplicate"])
+
+        second = self.client.post(
+            "/api/v1/finance/transactions/",
+            data={**payload, "description": "dup retry"},
+            format="json",
+        )
+        self.assertEqual(second.status_code, 200)
+        self.assertTrue(second.json()["duplicate"])
+        self.assertEqual(second.json()["transaction_id"], first.json()["transaction_id"])
+        self.assertEqual(FinanceTransaction.objects.filter(tenant=self.tenant).count(), 1)
+        self.assertEqual(
+            FinanceAccount.objects.get(nickname="Loan A").current_balance,
+            Decimal("950"),
+        )
+
+    def test_transaction_requires_auth(self):
+        unauthed = APIClient()
+        response = unauthed.post(
+            "/api/v1/finance/transactions/",
+            data={"account_nickname": "X", "amount": 1},
+            format="json",
+        )
+        self.assertEqual(response.status_code, 401)
+
+    def test_cannot_post_to_other_tenants_account(self):
+        other_account = FinanceAccount.objects.create(
+            tenant=self.other_tenant,
+            account_type="credit_card",
+            nickname="Theirs",
+            current_balance=Decimal("500"),
+        )
+        response = self.client.post(
+            "/api/v1/finance/transactions/",
+            data={"account_id": str(other_account.id), "amount": 100},
+            format="json",
+        )
+        self.assertEqual(response.status_code, 404)
+        self.assertEqual(
+            FinanceAccount.objects.get(id=other_account.id).current_balance,
+            Decimal("500"),
+        )
+
+    def test_accounts_list(self):
+        FinanceAccount.objects.create(
+            tenant=self.tenant,
+            account_type="credit_card",
+            nickname="CC",
+            current_balance=Decimal("3000"),
+        )
+        response = self.client.get("/api/v1/finance/accounts/")
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(len(response.json()), 1)
+
+    def test_account_create(self):
+        response = self.client.post(
+            "/api/v1/finance/accounts/",
+            data={
+                "nickname": "New Card",
+                "account_type": "credit_card",
+                "current_balance": "2500.00",
+                "interest_rate": "19.99",
+            },
+            format="json",
+        )
+        self.assertEqual(response.status_code, 201)
+        self.assertEqual(response.json()["nickname"], "New Card")
+        self.assertEqual(FinanceAccount.objects.count(), 1)
+
+    def test_accounts_list_q_name_search_case_insensitive(self):
+        FinanceAccount.objects.create(
+            tenant=self.tenant,
+            account_type="credit_card",
+            nickname="Chase Sapphire",
+            current_balance=Decimal("3000"),
+        )
+        FinanceAccount.objects.create(
+            tenant=self.tenant,
+            account_type="savings",
+            nickname="Emergency Fund",
+            current_balance=Decimal("5000"),
+        )
+        response = self.client.get("/api/v1/finance/accounts/?q=chase")
+        self.assertEqual(response.status_code, 200)
+        body = response.json()
+        self.assertEqual([a["nickname"] for a in body], ["Chase Sapphire"])
+        # Stable UUID id the EntityQuery keys on is present.
+        self.assertIn("id", body[0])
+
+    def test_accounts_list_q_scoped_to_tenant(self):
+        FinanceAccount.objects.create(
+            tenant=self.tenant,
+            account_type="credit_card",
+            nickname="Shared Name",
+            current_balance=Decimal("100"),
+        )
+        FinanceAccount.objects.create(
+            tenant=self.other_tenant,
+            account_type="credit_card",
+            nickname="Shared Name",
+            current_balance=Decimal("999"),
+        )
+        response = self.client.get("/api/v1/finance/accounts/?q=shared")
+        self.assertEqual(len(response.json()), 1)
+
+    def test_accounts_list_q_no_match_returns_empty(self):
+        FinanceAccount.objects.create(
+            tenant=self.tenant,
+            account_type="credit_card",
+            nickname="Chase Sapphire",
+            current_balance=Decimal("3000"),
+        )
+        response = self.client.get("/api/v1/finance/accounts/?q=zzz")
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json(), [])
+
+    def test_accounts_list_q_capped_at_20(self):
+        for i in range(25):
+            FinanceAccount.objects.create(
+                tenant=self.tenant,
+                account_type="credit_card",
+                nickname=f"Card {i:02d}",
+                current_balance=Decimal("10"),
+            )
+        response = self.client.get("/api/v1/finance/accounts/?q=card")
+        self.assertEqual(len(response.json()), 20)
+
+    def test_account_patch(self):
+        account = FinanceAccount.objects.create(
+            tenant=self.tenant,
+            account_type="credit_card",
+            nickname="CC",
+            current_balance=Decimal("5000"),
+        )
+        response = self.client.patch(
+            f"/api/v1/finance/accounts/{account.id}/",
+            data={"current_balance": "4500.00"},
+            format="json",
+        )
+        self.assertEqual(response.status_code, 200)
+        account.refresh_from_db()
+        self.assertEqual(account.current_balance, Decimal("4500.00"))
+
+    def test_account_delete_soft_deletes(self):
+        account = FinanceAccount.objects.create(
+            tenant=self.tenant,
+            account_type="credit_card",
+            nickname="CC",
+            current_balance=Decimal("1000"),
+        )
+        response = self.client.delete(f"/api/v1/finance/accounts/{account.id}/")
+        self.assertEqual(response.status_code, 204)
+        account.refresh_from_db()
+        self.assertFalse(account.is_active)
+
+    def test_accounts_list_archived_query_param(self):
+        FinanceAccount.objects.create(
+            tenant=self.tenant,
+            account_type="credit_card",
+            nickname="Active",
+            current_balance=Decimal("500"),
+        )
+        FinanceAccount.objects.create(
+            tenant=self.tenant,
+            account_type="student_loan",
+            nickname="Archived",
+            current_balance=Decimal("2000"),
+            is_active=False,
+        )
+        active_response = self.client.get("/api/v1/finance/accounts/")
+        self.assertEqual(len(active_response.json()), 1)
+        self.assertEqual(active_response.json()[0]["nickname"], "Active")
+
+        archived_response = self.client.get("/api/v1/finance/accounts/?archived=true")
+        self.assertEqual(archived_response.status_code, 200)
+        body = archived_response.json()
+        self.assertEqual(len(body), 1)
+        self.assertEqual(body[0]["nickname"], "Archived")
+        self.assertFalse(body[0]["is_active"])
+
+    def test_account_patch_unarchive(self):
+        """PATCH {is_active: true} should restore an archived account."""
+        account = FinanceAccount.objects.create(
+            tenant=self.tenant,
+            account_type="credit_card",
+            nickname="CC",
+            current_balance=Decimal("1000"),
+            is_active=False,
+        )
+        response = self.client.patch(
+            f"/api/v1/finance/accounts/{account.id}/",
+            data={"is_active": True},
+            format="json",
+        )
+        self.assertEqual(response.status_code, 200)
+        account.refresh_from_db()
+        self.assertTrue(account.is_active)
+
+    def test_account_detail_404_for_other_tenant(self):
+        account = FinanceAccount.objects.create(
+            tenant=self.other_tenant,
+            account_type="credit_card",
+            nickname="Not Mine",
+            current_balance=Decimal("9999"),
+        )
+        response = self.client.patch(
+            f"/api/v1/finance/accounts/{account.id}/",
+            data={"current_balance": "0"},
+            format="json",
+        )
+        self.assertEqual(response.status_code, 404)
+
+    def test_transactions_list(self):
+        account = FinanceAccount.objects.create(
+            tenant=self.tenant,
+            account_type="credit_card",
+            nickname="CC",
+            current_balance=Decimal("3000"),
+        )
+        FinanceTransaction.objects.create(
+            tenant=self.tenant,
+            account=account,
+            transaction_type="payment",
+            amount=Decimal("200"),
+            date=date(2026, 3, 15),
+        )
+        response = self.client.get("/api/v1/finance/transactions/")
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(len(response.json()), 1)
+
+    def test_payoff_plans_list(self):
+        PayoffPlan.objects.create(
+            tenant=self.tenant,
+            strategy="avalanche",
+            monthly_budget=Decimal("500"),
+            total_debt=Decimal("10000"),
+            total_interest=Decimal("1200"),
+            payoff_months=22,
+            payoff_date=date(2028, 1, 1),
+            is_active=True,
+        )
+        response = self.client.get("/api/v1/finance/payoff-plans/")
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(len(response.json()), 1)
+
+    def test_snapshots_list(self):
+        FinanceSnapshot.objects.create(
+            tenant=self.tenant,
+            date=date(2026, 3, 1),
+            total_debt=Decimal("10000"),
+            total_savings=Decimal("2000"),
+        )
+        response = self.client.get("/api/v1/finance/snapshots/")
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(len(response.json()), 1)
+
+
+# ═════════════════════════════════════════════════════════════════════
+# 5. Snapshot Cron Tests
+# ═════════════════════════════════════════════════════════════════════
+
+
+class SnapshotServiceTests(TestCase):
+    def setUp(self):
+        self.tenant = create_tenant(display_name="Snap", telegram_chat_id=900030)
+        self.tenant.finance_enabled = True
+        self.tenant.status = "active"
+        self.tenant.save()
+
+    def test_creates_snapshot_for_active_finance_tenant(self):
+        FinanceAccount.objects.create(
+            tenant=self.tenant,
+            account_type="credit_card",
+            nickname="CC",
+            current_balance=Decimal("5000"),
+        )
+        FinanceAccount.objects.create(
+            tenant=self.tenant,
+            account_type="savings",
+            nickname="Sav",
+            current_balance=Decimal("2000"),
+        )
+
+        from .snapshot import create_monthly_snapshots
+
+        count = create_monthly_snapshots(date(2026, 4, 1))
+
+        self.assertEqual(count, 1)
+        snap = FinanceSnapshot.objects.get(tenant=self.tenant, date=date(2026, 4, 1))
+        self.assertEqual(snap.total_debt, Decimal("5000"))
+        self.assertEqual(snap.total_savings, Decimal("2000"))
+        self.assertEqual(len(snap.accounts_json), 2)
+
+    def test_idempotent_no_duplicate_snapshots(self):
+        FinanceAccount.objects.create(
+            tenant=self.tenant,
+            account_type="credit_card",
+            nickname="CC",
+            current_balance=Decimal("3000"),
+        )
+        from .snapshot import create_monthly_snapshots
+
+        create_monthly_snapshots(date(2026, 4, 1))
+        count = create_monthly_snapshots(date(2026, 4, 1))
+        self.assertEqual(count, 0)  # duplicate skipped → nothing newly created
+        self.assertEqual(
+            FinanceSnapshot.objects.filter(tenant=self.tenant).count(),
+            1,
+        )
+
+    def test_skips_tenants_without_accounts(self):
+        from .snapshot import create_monthly_snapshots
+
+        count = create_monthly_snapshots(date(2026, 4, 1))
+        # Tenant has finance_enabled but no accounts — should skip and not count
+        self.assertEqual(count, 0)  # nothing created (no-accounts skip returns None)
+        self.assertEqual(FinanceSnapshot.objects.count(), 0)
+
+    def test_skips_tenants_with_finance_disabled(self):
+        self.tenant.finance_enabled = False
+        self.tenant.save()
+        FinanceAccount.objects.create(
+            tenant=self.tenant,
+            account_type="credit_card",
+            nickname="CC",
+            current_balance=Decimal("1000"),
+        )
+        from .snapshot import create_monthly_snapshots
+
+        count = create_monthly_snapshots(date(2026, 4, 1))
+        self.assertEqual(count, 0)
+        self.assertEqual(FinanceSnapshot.objects.count(), 0)
+
+    @override_settings(GRAVITY_ENABLED=False)
+    def test_skips_tenants_when_gravity_paused(self):
+        # Privacy contract: the platform-wide Gravity kill switch (GRAVITY_ENABLED
+        # off) must suppress snapshots even for a finance_enabled tenant with real
+        # accounts. A snapshot here would persist debt data during the pause.
+        FinanceAccount.objects.create(
+            tenant=self.tenant,
+            account_type="credit_card",
+            nickname="CC",
+            current_balance=Decimal("9999"),
+        )
+        from .snapshot import create_monthly_snapshots
+
+        count = create_monthly_snapshots(date(2026, 4, 1))
+        self.assertEqual(count, 0)
+        self.assertEqual(FinanceSnapshot.objects.count(), 0)
+
+    def test_aggregates_previous_month_payments(self):
+        account = FinanceAccount.objects.create(
+            tenant=self.tenant,
+            account_type="credit_card",
+            nickname="CC",
+            current_balance=Decimal("4000"),
+        )
+        FinanceTransaction.objects.create(
+            tenant=self.tenant,
+            account=account,
+            transaction_type="payment",
+            amount=Decimal("300"),
+            date=date(2026, 3, 10),
+        )
+        FinanceTransaction.objects.create(
+            tenant=self.tenant,
+            account=account,
+            transaction_type="payment",
+            amount=Decimal("200"),
+            date=date(2026, 3, 25),
+        )
+        # This one is from February — should NOT be included
+        FinanceTransaction.objects.create(
+            tenant=self.tenant,
+            account=account,
+            transaction_type="payment",
+            amount=Decimal("100"),
+            date=date(2026, 2, 15),
+        )
+
+        from .snapshot import create_monthly_snapshots
+
+        create_monthly_snapshots(date(2026, 4, 1))
+        snap = FinanceSnapshot.objects.get(tenant=self.tenant)
+        self.assertEqual(snap.total_payments_this_month, Decimal("500"))
+
+
+# ═════════════════════════════════════════════════════════════════════
+# 7. Phase 1 — Gravity proactive parity (welcome cron + weekly check-in)
+# ═════════════════════════════════════════════════════════════════════
+
+
+class FinanceSettingsViewTests(TestCase):
+    """Toggling finance_enabled writes the config and signals restart_required.
+
+    Mirrors the Fuel toggle UX (apps/fuel/views.py). The plugin allow-list
+    in the OpenClaw config flips when this flag flips, which means the
+    running session can't see the new tools until the container restarts.
+    The settings endpoint queues an apply_single_tenant_config so the
+    file share is current; the frontend then prompts the user and POSTs
+    to /api/v1/finance/restart/ which performs the actual restart and
+    schedules the welcome.
+    """
+
+    def setUp(self):
+        from unittest.mock import patch as _patch
+
+        self.tenant = create_tenant(display_name="GravityToggle", telegram_chat_id=900200)
+        self.client = APIClient()
+        token = RefreshToken.for_user(self.tenant.user)
+        self.client.credentials(HTTP_AUTHORIZATION=f"Bearer {token.access_token}")
+        self._patch = _patch
+        # Tenant defaults to finance_enabled=False — flip it explicitly when needed.
+        self.tenant.finance_enabled = False
+        self.tenant.container_id = "oc-test-gravity"
+        self.tenant.save(update_fields=["finance_enabled", "container_id"])
+
+    def test_first_enable_writes_config_and_signals_restart(self):
+        with self._patch("apps.cron.publish.publish_task") as mock_publish:
+            response = self.client.patch(
+                "/api/v1/finance/settings/",
+                {"finance_enabled": True},
+                format="json",
+            )
+        self.assertEqual(response.status_code, 200)
+        payload = response.json()
+        self.assertTrue(payload["finance_enabled"])
+        self.assertTrue(payload["restart_required"])
+        # Config file written to the share so the next revision picks it up.
+        # Welcome is NOT scheduled here — that fires from /restart/ AFTER the
+        # container has come back, so the plugin is loaded when it lands.
+        mock_publish.assert_called_once_with(
+            "apply_single_tenant_config",
+            str(self.tenant.id),
+        )
+
+    def test_first_enable_without_container_does_not_signal_restart(self):
+        # Pre-provisioned tenants have no container_id; nothing to restart.
+        self.tenant.container_id = ""
+        self.tenant.save(update_fields=["container_id"])
+        with self._patch("apps.cron.publish.publish_task"):
+            response = self.client.patch(
+                "/api/v1/finance/settings/",
+                {"finance_enabled": True},
+                format="json",
+            )
+        self.assertEqual(response.status_code, 200)
+        self.assertFalse(response.json()["restart_required"])
+
+    def test_re_enable_idempotent_does_not_signal_restart(self):
+        # Already enabled — toggling on a second time is a no-op for the plugin
+        # allow list, so the frontend should not prompt for a restart.
+        self.tenant.finance_enabled = True
+        self.tenant.save(update_fields=["finance_enabled"])
+
+        with self._patch("apps.cron.publish.publish_task"):
+            response = self.client.patch(
+                "/api/v1/finance/settings/",
+                {"finance_enabled": True},
+                format="json",
+            )
+        self.assertEqual(response.status_code, 200)
+        self.assertFalse(response.json()["restart_required"])
+
+    def test_disable_signals_restart(self):
+        # Disabling also flips the allow list (plugin must be unloaded), so
+        # restart is required just like enable.
+        self.tenant.finance_enabled = True
+        self.tenant.save(update_fields=["finance_enabled"])
+
+        with self._patch("apps.cron.publish.publish_task"):
+            response = self.client.patch(
+                "/api/v1/finance/settings/",
+                {"finance_enabled": False},
+                format="json",
+            )
+        self.assertEqual(response.status_code, 200)
+        self.assertTrue(response.json()["restart_required"])
+
+
+class FinanceRestartViewTests(TestCase):
+    """POST /api/v1/finance/restart/ performs the container restart that
+    actually picks up plugin allow-list changes, then schedules the welcome
+    cron once the container has had time to come back up.
+    """
+
+    def setUp(self):
+        from unittest.mock import patch as _patch
+
+        self.tenant = create_tenant(display_name="GravityRestart", telegram_chat_id=900201)
+        self.client = APIClient()
+        token = RefreshToken.for_user(self.tenant.user)
+        self.client.credentials(HTTP_AUTHORIZATION=f"Bearer {token.access_token}")
+        self._patch = _patch
+        self.tenant.finance_enabled = True
+        self.tenant.container_id = "oc-test-gravity-restart"
+        self.tenant.save(update_fields=["finance_enabled", "container_id"])
+
+    def test_restart_calls_azure_and_schedules_welcome(self):
+        with (
+            self._patch("apps.orchestrator.azure_client.restart_container_app") as mock_restart,
+            self._patch("apps.cron.publish.publish_task") as mock_publish,
+        ):
+            response = self.client.post("/api/v1/finance/restart/")
+        self.assertEqual(response.status_code, 200)
+        self.assertTrue(response.json()["restarted"])
+        mock_restart.assert_called_once_with(self.tenant.container_id)
+        # Welcome scheduled 90s out so the container has time for cold start
+        # before the agent is asked to fire it.
+        mock_publish.assert_called_once_with(
+            "schedule_finance_welcome",
+            str(self.tenant.id),
+            delay_seconds=90,
+        )
+
+    def test_restart_no_container_returns_400(self):
+        self.tenant.container_id = ""
+        self.tenant.save(update_fields=["container_id"])
+        response = self.client.post("/api/v1/finance/restart/")
+        self.assertEqual(response.status_code, 400)
+
+    def test_restart_failure_returns_502(self):
+        with self._patch(
+            "apps.orchestrator.azure_client.restart_container_app",
+            side_effect=Exception("simulated Azure error"),
+        ):
+            response = self.client.post("/api/v1/finance/restart/")
+        self.assertEqual(response.status_code, 502)
+        self.assertEqual(response.json()["error"], "restart_failed")
+
+    def test_restart_when_disabled_does_not_schedule_welcome(self):
+        # User disabled Gravity → restarted to drop the plugin → no welcome.
+        self.tenant.finance_enabled = False
+        self.tenant.save(update_fields=["finance_enabled"])
+        with (
+            self._patch("apps.orchestrator.azure_client.restart_container_app"),
+            self._patch("apps.cron.publish.publish_task") as mock_publish,
+        ):
+            response = self.client.post("/api/v1/finance/restart/")
+        self.assertEqual(response.status_code, 200)
+        mock_publish.assert_not_called()
+
+
+class GravityWeeklyCheckinSeedJobTests(TestCase):
+    """The weekly cron is gated on tenant.finance_enabled at seed-time."""
+
+    def setUp(self):
+        self.tenant = create_tenant(display_name="GravityCron", telegram_chat_id=900201)
+
+    def test_absent_when_finance_disabled(self):
+        from apps.orchestrator.config_generator import build_cron_seed_jobs
+
+        self.tenant.finance_enabled = False
+        self.tenant.save(update_fields=["finance_enabled"])
+        jobs = build_cron_seed_jobs(self.tenant)
+        names = {j["name"] for j in jobs}
+        self.assertNotIn("Gravity Weekly Check-in", names)
+
+    def test_present_when_finance_enabled(self):
+        from apps.orchestrator.config_generator import build_cron_seed_jobs
+
+        self.tenant.finance_enabled = True
+        self.tenant.save(update_fields=["finance_enabled"])
+        jobs = build_cron_seed_jobs(self.tenant)
+        weekly = next((j for j in jobs if j["name"] == "Gravity Weekly Check-in"), None)
+        self.assertIsNotNone(weekly)
+        # Sunday at 19:00 in user's timezone.
+        self.assertEqual(weekly["schedule"]["expr"], "0 19 * * 0")
+        # Foreground (Phase 2 sync) so summary lands in main session.
+        self.assertIn("FINAL STEP", weekly["payload"]["message"])
+        # Prompt mentions the Gravity terminology and pulls from USER.md.
+        self.assertIn("Gravity", weekly["payload"]["message"])
+        self.assertIn("USER.md", weekly["payload"]["message"])
+
+
+class FinanceWelcomePromptTests(UnitTestCase):
+    """Sanity-check the static welcome prompt content (no DB)."""
+
+    def test_welcome_prompt_avoids_questions(self):
+        from apps.finance.views import _FINANCE_WELCOME_PROMPT
+
+        self.assertIn("Gravity", _FINANCE_WELCOME_PROMPT)
+        self.assertIn("nbhd_send_to_user", _FINANCE_WELCOME_PROMPT)
+        # Explicit instruction to not ask questions in welcome.
+        self.assertIn("Do NOT ask questions", _FINANCE_WELCOME_PROMPT)
+
+
+class FinanceWelcomeIdempotencyTests(TestCase):
+    """``_schedule_finance_welcome`` skips when a welcome cron already exists.
+
+    Re-toggling the feature flag (off→on) while a previous welcome is still
+    pending would otherwise create a duplicate cron in the container.
+    """
+
+    def setUp(self):
+        from unittest.mock import patch as _patch
+
+        self.tenant = create_tenant(display_name="Idem", telegram_chat_id=900250)
+        self.tenant.container_fqdn = "oc-test.example.com"
+        self.tenant.save(update_fields=["container_fqdn"])
+        self._patch = _patch
+
+    def _fresh_welcome_cron(self):
+        """Build a cron job dict whose next fire is within the 1-day window."""
+        from datetime import datetime, timedelta
+
+        soon = datetime.now(UTC) + timedelta(minutes=2)
+        expr = f"{soon.minute} {soon.hour} {soon.day} {soon.month} *"
+        return {
+            "name": "_finance:welcome",
+            "schedule": {"kind": "cron", "expr": expr, "tz": "UTC"},
+        }
+
+    def _stale_welcome_cron(self):
+        """Build a cron job whose next fire is ~1 year away (annual recurrence
+        kicked in because the date already passed)."""
+        from datetime import datetime, timedelta
+
+        past = datetime.now(UTC) - timedelta(days=7)
+        expr = f"{past.minute} {past.hour} {past.day} {past.month} *"
+        return {
+            "id": "finance-welcome-id",
+            "name": "_finance:welcome",
+            "schedule": {"kind": "cron", "expr": expr, "tz": "UTC"},
+        }
+
+    def test_skips_when_welcome_already_pending(self):
+        """A cron whose next fire is within the 1-day window means a welcome
+        is queued and we should not re-schedule."""
+        from apps.finance.views import _schedule_finance_welcome
+        from apps.orchestrator.welcome_scheduler import WelcomeStatus
+
+        with (
+            self._patch(
+                "apps.cron.gateway_client.cron_get",
+                return_value=self._fresh_welcome_cron(),
+            ),
+            self._patch("apps.cron.gateway_client.invoke_gateway_tool") as mock_invoke,
+        ):
+            status = _schedule_finance_welcome(self.tenant)
+
+        self.assertEqual(status, WelcomeStatus.SKIPPED_PENDING)
+        # cron.add was NOT called because welcome is already pending.
+        for call in mock_invoke.call_args_list:
+            self.assertNotEqual(call.args[1] if len(call.args) > 1 else call.kwargs.get("tool"), "cron.add")
+
+    def test_skips_when_welcome_already_delivered(self):
+        """welcomes_sent['finance'] set → no re-schedule even if no pending cron."""
+        from apps.finance.views import _schedule_finance_welcome
+        from apps.orchestrator.welcome_scheduler import WelcomeStatus
+
+        self.tenant.welcomes_sent = {"finance": "2026-05-07T03:00:00+00:00"}
+        self.tenant.save(update_fields=["welcomes_sent"])
+
+        with (
+            self._patch("apps.cron.gateway_client.cron_get", return_value=None),
+            self._patch("apps.cron.gateway_client.invoke_gateway_tool") as mock_invoke,
+        ):
+            status = _schedule_finance_welcome(self.tenant)
+
+        self.assertEqual(status, WelcomeStatus.SKIPPED_ALREADY_DELIVERED)
+        # No cron.add — already delivered.
+        for call in mock_invoke.call_args_list:
+            self.assertNotEqual(call.args[1] if len(call.args) > 1 else call.kwargs.get("tool"), "cron.add")
+
+    def test_schedules_when_no_welcome_pending(self):
+        from apps.finance.views import _schedule_finance_welcome
+        from apps.orchestrator.welcome_scheduler import WelcomeStatus
+
+        with (
+            self._patch("apps.cron.gateway_client.cron_get", return_value=None),
+            self._patch("apps.cron.gateway_client.invoke_gateway_tool") as mock_invoke,
+        ):
+            status = _schedule_finance_welcome(self.tenant)
+
+        self.assertEqual(status, WelcomeStatus.SCHEDULED)
+        mock_invoke.assert_called_once()
+        args, _kwargs = mock_invoke.call_args
+        # invoke_gateway_tool(tenant, "cron.add", {"job": {...}})
+        self.assertEqual(args[1], "cron.add")
+        self.assertEqual(args[2]["job"]["name"], "_finance:welcome")
+        # Prompt has been formatted with the tenant id (no unfilled placeholders).
+        message = args[2]["job"]["payload"]["message"]
+        self.assertIn(str(self.tenant.id), message)
+        self.assertNotIn("{tenant_id}", message)
+        self.tenant.refresh_from_db()
+        self.assertIn("finance", self.tenant.welcomes_sent)
+
+    def test_replaces_stale_welcome_cron(self):
+        """A welcome cron whose next fire is far in the future (annual
+        recurrence picked up because the original date already passed)
+        gets removed and re-added.
+
+        Reproduces the canary incident on 2026-05-07: the original Apr 25
+        one-shot fired but the agent crashed mid-turn and never self-removed
+        the cron. Without freshness-aware idempotency, the stale cron blocks
+        re-scheduling for a year (next fire = Apr 25, 2027).
+        """
+        from apps.finance.views import _schedule_finance_welcome
+        from apps.orchestrator.welcome_scheduler import WelcomeStatus
+
+        stale_job = self._stale_welcome_cron()
+
+        with (
+            self._patch(
+                "apps.cron.gateway_client.cron_get",
+                return_value=stale_job,
+            ),
+            self._patch("apps.cron.gateway_client.invoke_gateway_tool", return_value={}) as mock_invoke,
+        ):
+            status = _schedule_finance_welcome(self.tenant)
+
+        self.assertEqual(status, WelcomeStatus.REPLACED_STALE)
+        tools_called = [call.args[1] for call in mock_invoke.call_args_list if len(call.args) > 1]
+        # Both remove (to clear the stale row) and add (fresh schedule).
+        self.assertIn("cron.remove", tools_called)
+        self.assertIn("cron.add", tools_called)
+        remove_call = next(call for call in mock_invoke.call_args_list if call.args[1] == "cron.remove")
+        self.assertEqual(remove_call.args[2], {"jobId": "finance-welcome-id"})
+        # Order matters: remove must precede add so the gateway doesn't
+        # see a name collision.
+        self.assertLess(tools_called.index("cron.remove"), tools_called.index("cron.add"))
+        self.tenant.refresh_from_db()
+        self.assertIn("finance", self.tenant.welcomes_sent)
+
+    def test_raises_on_gateway_failure(self):
+        """Transport failures bubble up so backfill telemetry is honest.
+
+        Phase 1 swallowed all exceptions inside the helper, which made the
+        deploy backfill report ``finance: 1`` even when scheduling silently
+        failed. The watchdog and the management command both need real
+        exceptions to count "failed" correctly.
+        """
+        from apps.cron.gateway_client import GatewayError
+        from apps.finance.views import _schedule_finance_welcome
+
+        with (
+            self._patch("apps.cron.gateway_client.cron_get", return_value=None),
+            self._patch(
+                "apps.cron.gateway_client.invoke_gateway_tool",
+                side_effect=GatewayError("simulated transport failure"),
+            ),
+            self.assertRaises(GatewayError),
+        ):
+            _schedule_finance_welcome(self.tenant)
+        self.tenant.refresh_from_db()
+        self.assertNotIn("finance", self.tenant.welcomes_sent)
+
+
+class FinanceSettingsViewClearsDeliveryFlagTests(TestCase):
+    """Re-enabling Gravity (off→on) clears any prior welcomes_sent['finance']
+    so the welcome re-fires for users who want to retest the experience.
+    """
+
+    def setUp(self):
+        from unittest.mock import patch as _patch
+
+        self.tenant = create_tenant(display_name="Toggle", telegram_chat_id=900260)
+        self.client = APIClient()
+        token = RefreshToken.for_user(self.tenant.user)
+        self.client.credentials(HTTP_AUTHORIZATION=f"Bearer {token.access_token}")
+        self._patch = _patch
+
+    def test_off_to_on_clears_delivery_marker(self):
+        # Pretend a previous welcome was delivered, then user disabled.
+        self.tenant.finance_enabled = False
+        self.tenant.welcomes_sent = {"finance": "2026-05-07T03:00:00+00:00"}
+        self.tenant.save(update_fields=["finance_enabled", "welcomes_sent"])
+
+        with self._patch("apps.cron.publish.publish_task"):
+            response = self.client.patch(
+                "/api/v1/finance/settings/",
+                {"finance_enabled": True},
+                format="json",
+            )
+        self.assertEqual(response.status_code, 200)
+        self.tenant.refresh_from_db()
+        self.assertNotIn("finance", self.tenant.welcomes_sent)
+
+
+class RuntimeWelcomeMarkViewTests(TestCase):
+    """The agent calls /api/v1/tenants/runtime/<id>/welcomes/<feature>/ after
+    a successful nbhd_send_to_user, which sets the delivery timestamp.
+    """
+
+    def setUp(self):
+        from django.test import override_settings
+
+        self.tenant = create_tenant(display_name="MarkAck", telegram_chat_id=900270)
+        self.client = APIClient()
+        self._override = override_settings(NBHD_INTERNAL_API_KEY="test-internal-key")
+        self._override.enable()
+        seed_internal_key(self.tenant, key="test-internal-key")
+
+    def tearDown(self):
+        self._override.disable()
+
+    def _post(self, feature: str, *, key="test-internal-key", tenant_id=None):
+        return self.client.post(
+            f"/api/v1/tenants/runtime/{tenant_id or self.tenant.id}/welcomes/{feature}/",
+            format="json",
+            HTTP_X_NBHD_INTERNAL_KEY=key,
+            HTTP_X_NBHD_TENANT_ID=str(tenant_id or self.tenant.id),
+        )
+
+    def test_marks_finance_delivered(self):
+        response = self._post("finance")
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()["feature"], "finance")
+        self.tenant.refresh_from_db()
+        self.assertIn("finance", self.tenant.welcomes_sent)
+
+    def test_marks_fuel_delivered(self):
+        response = self._post("fuel")
+        self.assertEqual(response.status_code, 200)
+        self.tenant.refresh_from_db()
+        self.assertIn("fuel", self.tenant.welcomes_sent)
+
+    def test_unknown_feature_400(self):
+        response = self._post("widgets")
+        self.assertEqual(response.status_code, 400)
+
+    def test_missing_internal_key_401(self):
+        response = self._post("finance", key="")
+        self.assertEqual(response.status_code, 401)
+
+    def test_wrong_internal_key_401(self):
+        response = self._post("finance", key="wrong-key")
+        self.assertEqual(response.status_code, 401)
+
+
+# ═════════════════════════════════════════════════════════════════════
+# dedupe_finance_transactions management command
+# ═════════════════════════════════════════════════════════════════════
+
+
+class DedupeFinanceTransactionsCommandTests(TestCase):
+    """Backfill sweep that cleans up the May 2026 duplicate-Nelnet incident.
+
+    See dedupe_finance_transactions.py docstring for context.
+    """
+
+    def setUp(self):
+        from io import StringIO
+
+        self.tenant = create_tenant(display_name="DedupeTest", telegram_chat_id=900280)
+        self.other_tenant = create_tenant(display_name="DedupeOther", telegram_chat_id=900281)
+        self.account = FinanceAccount.objects.create(
+            tenant=self.tenant,
+            account_type="student_loan",
+            nickname="Loan A",
+            current_balance=Decimal("900"),
+            original_balance=Decimal("1000"),
+        )
+        # Three rows = one real, two duplicates (same amount, type, date)
+        for description in ("orig", "dup-1", "dup-2"):
+            FinanceTransaction.objects.create(
+                tenant=self.tenant,
+                account=self.account,
+                transaction_type="payment",
+                amount=Decimal("50"),
+                description=description,
+                date=date(2026, 5, 6),
+            )
+        # Sanity: a separate legitimate payment that should not be touched
+        FinanceTransaction.objects.create(
+            tenant=self.tenant,
+            account=self.account,
+            transaction_type="payment",
+            amount=Decimal("25"),
+            description="separate",
+            date=date(2026, 5, 6),
+        )
+        self.stdout = StringIO()
+
+    def _run(self, **kwargs):
+        from django.core.management import call_command
+
+        call_command("dedupe_finance_transactions", stdout=self.stdout, **kwargs)
+        return self.stdout.getvalue()
+
+    def test_dry_run_does_not_modify_state(self):
+        output = self._run()
+        self.assertIn("DRY-RUN", output)
+        # Four rows untouched (3 dup-group + 1 separate)
+        self.assertEqual(FinanceTransaction.objects.count(), 4)
+        self.account.refresh_from_db()
+        self.assertEqual(self.account.current_balance, Decimal("900"))
+
+    def test_apply_deletes_duplicates_and_restores_balance(self):
+        # Pre: account has $900 (was $1000, minus 50+50 from duplicates)
+        # Post: should keep the oldest row (description="orig"), drop the other two,
+        # and restore balance by +$100 -> $1000 (but capped at original_balance).
+        self._run(apply=True)
+        rows = list(FinanceTransaction.objects.filter(amount=Decimal("50")).values_list("description", flat=True))
+        self.assertEqual(rows, ["orig"])
+        # Separate $25 payment untouched
+        self.assertEqual(FinanceTransaction.objects.filter(amount=Decimal("25")).count(), 1)
+        self.account.refresh_from_db()
+        self.assertEqual(self.account.current_balance, Decimal("1000"))
+
+    def test_apply_caps_balance_at_original(self):
+        """Reversal must not push balance above original_balance for debt accounts."""
+        # Pre-seed: original is $500, current is $400 — single real payment plus duplicates
+        acct = FinanceAccount.objects.create(
+            tenant=self.tenant,
+            account_type="credit_card",
+            nickname="Tiny CC",
+            current_balance=Decimal("400"),
+            original_balance=Decimal("500"),
+        )
+        for _ in range(3):  # 1 canonical + 2 duplicates of $100 each — naive reversal would push to $600
+            FinanceTransaction.objects.create(
+                tenant=self.tenant,
+                account=acct,
+                transaction_type="payment",
+                amount=Decimal("100"),
+                description="x",
+                date=date(2026, 5, 1),
+            )
+        self._run(apply=True)
+        acct.refresh_from_db()
+        # Cap kicks in: 400 + 200 = 600 → clamped to original 500
+        self.assertEqual(acct.current_balance, Decimal("500"))
+
+    def test_tenant_filter_limits_scope(self):
+        other_acct = FinanceAccount.objects.create(
+            tenant=self.other_tenant,
+            account_type="student_loan",
+            nickname="Other Loan",
+            current_balance=Decimal("900"),
+            original_balance=Decimal("1000"),
+        )
+        # Duplicates on the other tenant
+        for _ in range(2):
+            FinanceTransaction.objects.create(
+                tenant=self.other_tenant,
+                account=other_acct,
+                transaction_type="payment",
+                amount=Decimal("75"),
+                description="other-dup",
+                date=date(2026, 5, 6),
+            )
+        self._run(apply=True, tenant_id=str(self.tenant.id))
+        # My tenant got cleaned…
+        self.assertEqual(
+            FinanceTransaction.objects.filter(tenant=self.tenant, amount=Decimal("50")).count(),
+            1,
+        )
+        # …the other tenant's duplicates remain
+        self.assertEqual(
+            FinanceTransaction.objects.filter(tenant=self.other_tenant).count(),
+            2,
+        )
+
+    def test_idempotent_second_run(self):
+        self._run(apply=True)
+        from io import StringIO
+
+        self.stdout = StringIO()
+        output = self._run(apply=True)
+        self.assertIn("No duplicate clusters", output)
+
+
+# ═════════════════════════════════════════════════════════════════════
+# FinanceQueryView — parameterized query for nbhd_gravity_query
+# ═════════════════════════════════════════════════════════════════════
+
+
+class FinanceQueryViewTests(TestCase):
+    """End-to-end tests for the parameterized query endpoint."""
+
+    def setUp(self):
+        from django.test import override_settings
+
+        self.tenant = create_tenant(display_name="QueryT", telegram_chat_id=901000)
+        self.other_tenant = create_tenant(display_name="QueryOther", telegram_chat_id=901001)
+        self._override = override_settings(NBHD_INTERNAL_API_KEY="test-internal-key")
+        self._override.enable()
+        seed_internal_key(self.tenant, key="test-internal-key")
+
+        self.aj = FinanceAccount.objects.create(
+            tenant=self.tenant,
+            account_type="student_loan",
+            nickname="Student Loan AJ",
+            current_balance=Decimal("6806.61"),
+            original_balance=Decimal("7808.69"),
+            interest_rate=Decimal("6.55"),
+            minimum_payment=Decimal("38.34"),
+            due_day=15,
+        )
+        self.ak = FinanceAccount.objects.create(
+            tenant=self.tenant,
+            account_type="student_loan",
+            nickname="Student Loan AK",
+            current_balance=Decimal("2047.05"),
+            original_balance=Decimal("2083.12"),
+            interest_rate=Decimal("6.41"),
+            minimum_payment=Decimal("11.12"),
+            due_day=15,
+        )
+        FinanceAccount.objects.create(
+            tenant=self.tenant,
+            account_type="savings",
+            nickname="Emergency Fund",
+            current_balance=Decimal("500"),
+        )
+        for amount, txn_date, acct in (
+            (Decimal("38.34"), date(2026, 5, 6), self.aj),
+            (Decimal("105.00"), date(2026, 5, 6), self.aj),
+            (Decimal("11.12"), date(2026, 5, 6), self.ak),
+            (Decimal("38.34"), date(2026, 5, 13), self.aj),
+        ):
+            FinanceTransaction.objects.create(
+                tenant=self.tenant,
+                account=acct,
+                transaction_type="payment",
+                amount=amount,
+                description="payment",
+                date=txn_date,
+            )
+        PayoffPlan.objects.create(
+            tenant=self.tenant,
+            strategy="avalanche",
+            monthly_budget=Decimal("400"),
+            total_debt=Decimal("9891.74"),
+            total_interest=Decimal("2000"),
+            payoff_months=36,
+            payoff_date=date(2029, 5, 1),
+            is_active=True,
+        )
+
+    def tearDown(self):
+        self._override.disable()
+
+    def _post(self, body, *, tenant_id=None, key="test-internal-key"):
+        tid = tenant_id or str(self.tenant.id)
+        return self.client.post(
+            f"/api/v1/finance/runtime/{tid}/query/",
+            data=body,
+            content_type="application/json",
+            HTTP_X_NBHD_INTERNAL_KEY=key,
+            HTTP_X_NBHD_TENANT_ID=tid,
+        )
+
+    def test_missing_key_401(self):
+        self.assertEqual(self._post({"resource": "accounts"}, key="").status_code, 401)
+
+    def test_response_envelope_has_meta(self):
+        r = self._post({"resource": "accounts"})
+        self.assertEqual(r.status_code, 200)
+        meta = r.json()["meta"]
+        for k in (
+            "schema_version",
+            "computed_at",
+            "tenant_tz",
+            "as_of",
+            "window_resolved_to",
+            "row_count",
+            "has_more",
+            "query_hash",
+        ):
+            self.assertIn(k, meta)
+
+    def test_accounts_default_returns_active(self):
+        r = self._post({"resource": "accounts"})
+        nicks = sorted(row["nickname"] for row in r.json()["data"])
+        self.assertEqual(nicks, ["Emergency Fund", "Student Loan AJ", "Student Loan AK"])
+
+    def test_accounts_filter_is_debt(self):
+        r = self._post({"resource": "accounts", "filter": {"is_debt": True}})
+        nicks = sorted(row["nickname"] for row in r.json()["data"])
+        self.assertEqual(nicks, ["Student Loan AJ", "Student Loan AK"])
+
+    def test_accounts_filter_unknown_key_400(self):
+        r = self._post({"resource": "accounts", "filter": {"colour": "red"}})
+        self.assertEqual(r.status_code, 400)
+        self.assertEqual(r.json()["error"], "unknown_filter_keys")
+
+    def test_accounts_fields_projection_keeps_identifier(self):
+        r = self._post({"resource": "accounts", "fields": ["nickname"]})
+        row = r.json()["data"][0]
+        self.assertIn("id", row)
+        self.assertIn("nickname", row)
+        self.assertNotIn("interest_rate", row)
+
+    def test_accounts_amounts_serialized_as_strings(self):
+        r = self._post({"resource": "accounts", "filter": {"nickname": "Student Loan AJ"}})
+        row = r.json()["data"][0]
+        self.assertEqual(row["current_balance"], "6806.61")
+
+    def test_transactions_requires_window(self):
+        r = self._post({"resource": "transactions"})
+        self.assertEqual(r.status_code, 400)
+        self.assertEqual(r.json()["error"], "window_required")
+
+    def test_transactions_between_window_filters_by_date(self):
+        r = self._post(
+            {
+                "resource": "transactions",
+                "window": {"kind": "between", "value": ["2026-05-10", "2026-05-20"]},
+            }
+        )
+        dates = sorted({row["date"] for row in r.json()["data"]})
+        self.assertEqual(dates, ["2026-05-13"])
+
+    def test_transactions_all_window_returns_everything(self):
+        r = self._post({"resource": "transactions", "window": {"kind": "all"}})
+        self.assertEqual(r.json()["meta"]["row_count"], 4)
+
+    def test_transactions_filter_by_account_nickname_fuzzy(self):
+        r = self._post(
+            {
+                "resource": "transactions",
+                "window": {"kind": "all"},
+                "filter": {"account_nickname": "loan ak"},
+            }
+        )
+        rows = r.json()["data"]
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["account_nickname"], "Student Loan AK")
+
+    def test_transactions_unknown_account_returns_empty(self):
+        r = self._post(
+            {
+                "resource": "transactions",
+                "window": {"kind": "all"},
+                "filter": {"account_nickname": "Ghost Loan"},
+            }
+        )
+        self.assertEqual(r.status_code, 200)
+        self.assertEqual(r.json()["meta"]["row_count"], 0)
+
+    def test_transactions_aggregate_sum_no_group(self):
+        r = self._post(
+            {
+                "resource": "transactions",
+                "window": {"kind": "all"},
+                "aggregate": "sum",
+                "aggregate_field": "amount",
+            }
+        )
+        data = r.json()["data"]
+        self.assertEqual(len(data), 1)
+        self.assertEqual(data[0]["value"], "192.80")
+        self.assertEqual(data[0]["count"], 4)
+
+    def test_transactions_aggregate_sum_group_by_account(self):
+        r = self._post(
+            {
+                "resource": "transactions",
+                "window": {"kind": "all"},
+                "aggregate": "sum",
+                "aggregate_field": "amount",
+                "group_by": "account_nickname",
+            }
+        )
+        data = r.json()["data"]
+        by_nick = {row["group"]["account_nickname"]: row["value"] for row in data}
+        self.assertEqual(by_nick["Student Loan AJ"], "181.68")
+        self.assertEqual(by_nick["Student Loan AK"], "11.12")
+
+    def test_aggregate_count_no_field_required(self):
+        r = self._post({"resource": "transactions", "window": {"kind": "all"}, "aggregate": "count"})
+        self.assertEqual(r.json()["data"][0]["value"], 4)
+
+    def test_aggregate_sum_requires_field(self):
+        r = self._post({"resource": "transactions", "window": {"kind": "all"}, "aggregate": "sum"})
+        self.assertEqual(r.status_code, 400)
+        self.assertEqual(r.json()["error"], "aggregate_field_required")
+
+    def test_aggregate_field_without_aggregate_400(self):
+        r = self._post(
+            {
+                "resource": "transactions",
+                "window": {"kind": "all"},
+                "aggregate_field": "amount",
+            }
+        )
+        self.assertEqual(r.status_code, 400)
+
+    def test_group_by_without_aggregate_400(self):
+        r = self._post(
+            {
+                "resource": "transactions",
+                "window": {"kind": "all"},
+                "group_by": "transaction_type",
+            }
+        )
+        self.assertEqual(r.status_code, 400)
+
+    def test_plan_default_returns_active(self):
+        r = self._post({"resource": "plan"})
+        data = r.json()["data"]
+        self.assertEqual(len(data), 1)
+        self.assertEqual(data[0]["strategy"], "avalanche")
+        self.assertEqual(data[0]["monthly_budget"], "400.00")
+
+    def test_order_by_unknown_field_400(self):
+        r = self._post({"resource": "accounts", "order_by": "magic"})
+        self.assertEqual(r.status_code, 400)
+        self.assertEqual(r.json()["error"], "invalid_order_by")
+
+    def test_same_request_produces_same_hash(self):
+        body = {"resource": "transactions", "window": {"kind": "all"}}
+        a = self._post(body).json()["meta"]["query_hash"]
+        b = self._post(body).json()["meta"]["query_hash"]
+        self.assertEqual(a, b)
+
+    def test_different_filter_produces_different_hash(self):
+        a = self._post({"resource": "transactions", "window": {"kind": "all"}}).json()["meta"]["query_hash"]
+        b = self._post(
+            {
+                "resource": "transactions",
+                "window": {"kind": "all"},
+                "filter": {"transaction_type": "payment"},
+            }
+        ).json()["meta"]["query_hash"]
+        self.assertNotEqual(a, b)
+
+    def test_limit_caps_results_and_flags_has_more(self):
+        r = self._post({"resource": "transactions", "window": {"kind": "all"}, "limit": 2})
+        self.assertEqual(r.json()["meta"]["row_count"], 2)
+        self.assertTrue(r.json()["meta"]["has_more"])
+
+    def test_other_tenants_data_not_visible(self):
+        FinanceAccount.objects.create(
+            tenant=self.other_tenant,
+            account_type="credit_card",
+            nickname="Other Tenant Card",
+            current_balance=Decimal("999"),
+        )
+        r = self._post({"resource": "accounts"})
+        nicks = [row["nickname"] for row in r.json()["data"]]
+        self.assertNotIn("Other Tenant Card", nicks)
+
+
+class FinanceEnvelopeTenantLocalDateTests(TestCase):
+    """render_finance windows due dates against tenant-local today, not UTC.
+
+    Regression: the section used ``date.today()`` (UTC), so a tenant east/west
+    of UTC could window due dates against the wrong calendar day. Patching
+    ``tenant_today`` proves the window now keys off tenant-local time — the old
+    UTC call would have ignored the patch entirely.
+    """
+
+    def setUp(self):
+        self.tenant = create_tenant(display_name="FinEnvTZ", telegram_chat_id=900911)
+
+    def _debt(self, nickname, due_day):
+        return FinanceAccount.objects.create(
+            tenant=self.tenant,
+            account_type="credit_card",
+            nickname=nickname,
+            current_balance=Decimal("1200.00"),
+            minimum_payment=Decimal("50.00"),
+            due_day=due_day,
+            is_active=True,
+        )
+
+    def test_due_window_keys_off_tenant_today(self):
+        from unittest.mock import patch
+
+        import apps.finance.envelope as fe
+
+        self._debt("SoonCC", due_day=28)
+
+        # Pinned tenant-local 25th: due day 28 is 3 days out -> inside the 7d window.
+        with patch.object(fe, "tenant_today", return_value=date(2026, 6, 25)):
+            body = fe.render_finance(self.tenant)
+        self.assertIn("Upcoming due dates", body)
+        self.assertIn("SoonCC", body.split("**Upcoming due dates**", 1)[1])
+
+        # Pinned tenant-local 20th: now 8 days out -> outside the window, section
+        # drops. The old UTC ``date.today()`` ignored this patch entirely, so the
+        # window could never have tracked the tenant's actual calendar day.
+        with patch.object(fe, "tenant_today", return_value=date(2026, 6, 20)):
+            body2 = fe.render_finance(self.tenant)
+        self.assertNotIn("Upcoming due dates", body2)

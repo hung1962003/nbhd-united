@@ -1,0 +1,152 @@
+"""Serializers for the typed Goal/Task lifecycle (PR feat/journal-typed-lifecycle)."""
+
+from __future__ import annotations
+
+from rest_framework import serializers
+
+from .models import Goal, Task
+
+
+class _RehydrateTitleDescriptionMixin:
+    """Rehydrate PII placeholders in ``title``/``description`` on output.
+
+    Opt-in via ``context={"rehydrate": True}``. These serializers back BOTH the
+    owner-facing endpoints (``apps.journal.lifecycle_views``) AND the agent /
+    runtime endpoints (``apps.integrations.runtime_views``). The runtime path
+    MUST keep titles/descriptions in placeholder space so the model never sees
+    real PII, so rehydration is never unconditional — only the owner views set
+    the flag. The tenant is read from context (owner views pass it) and falls
+    back to the instance's ``tenant`` FK.
+    """
+
+    def to_representation(self, instance):
+        data = super().to_representation(instance)
+        if self.context.get("rehydrate"):
+            from apps.pii.authoring import resolve_receipt_values
+            from apps.pii.redactor import rehydrate_for_tenant
+
+            tenant = self.context.get("tenant") or getattr(instance, "tenant", None)
+            for field in ("title", "description"):
+                value = data.get(field)
+                if value:
+                    data[field] = rehydrate_for_tenant(tenant, value)
+            data["pii_receipts"] = resolve_receipt_values(
+                getattr(instance, "pii_receipts", {}) or {},
+                getattr(tenant, "pii_entity_map", None),
+            )
+        return data
+
+
+class _LazyTopicPKField(serializers.PrimaryKeyRelatedField):
+    """``PrimaryKeyRelatedField`` that defers ``TopicRegistry`` import past app loading.
+
+    ``apps.insights.signals`` imports from ``apps.journal.models`` at app-ready,
+    so a top-level import of ``TopicRegistry`` here creates a load-order cycle.
+    DRF's ``PrimaryKeyRelatedField.__init__`` asserts ``queryset is not None``
+    at field construction (the class body runs before the serializer's own
+    ``__init__``), so a class-body ``queryset=None`` declaration raises
+    ``AssertionError`` and breaks every Goal/Task runtime endpoint on import.
+
+    Resolving via ``get_queryset()`` runs at request time, when the app
+    registry is settled.
+    """
+
+    def __init__(self, **kwargs):
+        # Placeholder queryset satisfies DRF's not-None assert; get_queryset()
+        # supersedes it at request time.
+        kwargs.setdefault("queryset", Goal.objects.none())
+        super().__init__(**kwargs)
+
+    def get_queryset(self):
+        from apps.insights.models import TopicRegistry
+
+        return TopicRegistry.objects.all()
+
+
+class GoalSerializer(_RehydrateTitleDescriptionMixin, serializers.ModelSerializer):
+    """Read/write shape for Goal lifecycle.
+
+    Note: ``migrated_from_document`` is intentionally excluded — it's an
+    internal audit pointer that should never be exposed to the agent or UI.
+    """
+
+    parent_goal_id = serializers.PrimaryKeyRelatedField(
+        source="parent_goal",
+        queryset=Goal.objects.all(),
+        required=False,
+        allow_null=True,
+    )
+    topic_id = _LazyTopicPKField(
+        source="topic",
+        required=False,
+        allow_null=True,
+    )
+
+    class Meta:
+        model = Goal
+        fields = [
+            "id",
+            "title",
+            "description",
+            "pillar",
+            "topic_id",
+            "target",
+            "status",
+            "parent_goal_id",
+            "target_date",
+            "achieved_at",
+            "created_at",
+            "updated_at",
+        ]
+        read_only_fields = ["id", "achieved_at", "created_at", "updated_at"]
+
+    def validate(self, attrs):
+        # Scope parent_goal to the same tenant — protects against cross-tenant linkage.
+        tenant = self.context.get("tenant")
+        parent = attrs.get("parent_goal")
+        if tenant is not None and parent is not None and parent.tenant_id != tenant.id:
+            raise serializers.ValidationError({"parent_goal_id": "Parent goal must belong to the same tenant."})
+        return attrs
+
+    def create(self, validated_data):
+        tenant = self.context["tenant"]
+        return Goal.objects.create(tenant=tenant, **validated_data)
+
+
+class TaskSerializer(_RehydrateTitleDescriptionMixin, serializers.ModelSerializer):
+    """Read/write shape for Task lifecycle."""
+
+    parent_goal_id = serializers.PrimaryKeyRelatedField(
+        source="parent_goal",
+        queryset=Goal.objects.all(),
+        required=False,
+        allow_null=True,
+    )
+
+    class Meta:
+        model = Task
+        fields = [
+            "id",
+            "title",
+            "description",
+            "pillar",
+            "status",
+            "due_date",
+            "completed_at",
+            "parent_goal_id",
+            "related_ref",
+            "created_at",
+            "updated_at",
+        ]
+        read_only_fields = ["id", "completed_at", "created_at", "updated_at"]
+
+    def validate(self, attrs):
+        tenant = self.context.get("tenant")
+        parent = attrs.get("parent_goal")
+        if tenant is not None and parent is not None and parent.tenant_id != tenant.id:
+            raise serializers.ValidationError({"parent_goal_id": "Parent goal must belong to the same tenant."})
+        return attrs
+
+    def create(self, validated_data):
+        tenant = self.context["tenant"]
+        return Task.objects.create(tenant=tenant, **validated_data)

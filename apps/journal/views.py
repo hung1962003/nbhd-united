@@ -1,0 +1,754 @@
+"""User-facing Journal API views."""
+
+from __future__ import annotations
+
+import datetime
+import logging
+from uuid import UUID
+
+from django.http import Http404
+from django.utils import timezone
+from rest_framework import status
+from rest_framework.pagination import PageNumberPagination
+from rest_framework.permissions import IsAuthenticated
+from rest_framework.response import Response
+from rest_framework.views import APIView
+
+from apps.common.cache import tenant_cache
+from apps.tenants.models import Tenant
+
+from .md_utils import append_entry_markdown, parse_daily_note, serialise_daily_note
+from .models import DailyNote, Document, JournalEntry, NoteTemplate, PendingExtraction, WeeklyReview
+
+logger = logging.getLogger(__name__)
+from .serializers import (
+    DailyNoteEntryInputSerializer,
+    DailyNoteEntryPatchSerializer,
+    DailyNoteTemplateSerializer,
+    JournalEntrySerializer,
+    MemoryPatchSerializer,
+    NoteTemplateSerializer,
+    WeeklyReviewSerializer,
+)
+from .services import (
+    get_or_seed_note_template,
+    set_daily_note_section,
+    set_daily_note_sections,
+    upsert_default_daily_note,
+)
+
+
+def _get_tenant_for_user(user) -> Tenant:
+    try:
+        return user.tenant
+    except Tenant.DoesNotExist as exc:
+        raise Http404("Tenant not found.") from exc
+
+
+def _get_entry_for_tenant(*, tenant: Tenant, entry_id: UUID) -> JournalEntry:
+    try:
+        return JournalEntry.objects.get(id=entry_id, tenant=tenant)
+    except JournalEntry.DoesNotExist as exc:
+        raise Http404("Journal entry not found.") from exc
+
+
+def _get_weekly_review_for_tenant(*, tenant: Tenant, review_id: UUID) -> WeeklyReview:
+    try:
+        return WeeklyReview.objects.get(id=review_id, tenant=tenant)
+    except WeeklyReview.DoesNotExist as exc:
+        raise Http404("Weekly review not found.") from exc
+
+
+DEPRECATION_HEADERS = {
+    "Deprecation": "true",
+    "Warning": '299 - "This endpoint is kept for backward compatibility only."',
+}
+
+
+def _rehydrate_daily_note_entries_in_place(tenant: Tenant, entries: list[dict]) -> None:
+    from apps.pii.redactor import rehydrate_for_tenant
+
+    for entry in entries:
+        for key in ("author_label", "content", "mood"):
+            if entry.get(key):
+                entry[key] = rehydrate_for_tenant(tenant, entry[key])
+
+
+def _note_template_response(note: DailyNote, *, include_entries: bool = False) -> dict:
+    from apps.pii.authoring import resolve_receipt_values
+    from apps.pii.redactor import rehydrate_for_tenant
+
+    tenant = note.tenant
+    template, sections = get_or_seed_note_template(
+        tenant=tenant,
+        date_value=note.date,
+        markdown=note.markdown,
+    )
+    # Owner-facing serve boundary: note.markdown + section bodies are stored in
+    # PII placeholder space (the assistant authors them on redacted input), so
+    # rehydrate the user-visible strings back to real values. Template names are
+    # owner-authored; ids/slugs remain structured config. ``sections`` is a fresh
+    # copy from get_or_seed_note_template, so mutating in place is safe.
+    for section in sections:
+        for key in ("title", "content"):
+            if section.get(key):
+                section[key] = rehydrate_for_tenant(tenant, section[key])
+    payload = {
+        "date": str(note.date),
+        "markdown": rehydrate_for_tenant(tenant, note.markdown),
+        "template_id": str(template.id),
+        "template_slug": template.slug,
+        "template_name": rehydrate_for_tenant(tenant, template.name),
+        "sections": sections,
+        "pii_receipts": resolve_receipt_values(note.pii_receipts, tenant.pii_entity_map),
+    }
+    if include_entries:
+        entries = parse_daily_note(note.markdown)
+        _rehydrate_daily_note_entries_in_place(tenant, entries)
+        payload["entries"] = entries
+    return payload
+
+
+# ---------------------------------------------------------------------------
+# Legacy JournalEntry views (untouched)
+# ---------------------------------------------------------------------------
+
+
+class JournalEntryListCreateView(APIView):
+    permission_classes = [IsAuthenticated]
+
+    @tenant_cache(ttl=60, tag="journal")
+    def get(self, request):
+        tenant = _get_tenant_for_user(request.user)
+        queryset = JournalEntry.objects.filter(tenant=tenant).order_by("-date", "-created_at")
+
+        date_from = request.query_params.get("date_from")
+        date_to = request.query_params.get("date_to")
+        if date_from:
+            try:
+                queryset = queryset.filter(date__gte=datetime.date.fromisoformat(date_from))
+            except ValueError:
+                pass
+        if date_to:
+            try:
+                queryset = queryset.filter(date__lte=datetime.date.fromisoformat(date_to))
+            except ValueError:
+                pass
+
+        paginator = PageNumberPagination()
+        page = paginator.paginate_queryset(queryset, request, view=self)
+        serializer = JournalEntrySerializer(page, many=True, context={"tenant": tenant})
+        return paginator.get_paginated_response(serializer.data)
+
+    def post(self, request):
+        tenant = _get_tenant_for_user(request.user)
+        serializer = JournalEntrySerializer(data=request.data, context={"tenant": tenant})
+        serializer.is_valid(raise_exception=True)
+        serializer.save()
+        return Response(serializer.data, status=status.HTTP_201_CREATED)
+
+
+class JournalEntryDetailView(APIView):
+    permission_classes = [IsAuthenticated]
+
+    def get(self, request, entry_id: UUID):
+        tenant = _get_tenant_for_user(request.user)
+        entry = _get_entry_for_tenant(tenant=tenant, entry_id=entry_id)
+        return Response(JournalEntrySerializer(entry, context={"tenant": tenant}).data)
+
+    def patch(self, request, entry_id: UUID):
+        tenant = _get_tenant_for_user(request.user)
+        entry = _get_entry_for_tenant(tenant=tenant, entry_id=entry_id)
+        serializer = JournalEntrySerializer(entry, data=request.data, partial=True, context={"tenant": tenant})
+        serializer.is_valid(raise_exception=True)
+        updated = serializer.save()
+        return Response(JournalEntrySerializer(updated, context={"tenant": tenant}).data)
+
+    def delete(self, request, entry_id: UUID):
+        tenant = _get_tenant_for_user(request.user)
+        entry = _get_entry_for_tenant(tenant=tenant, entry_id=entry_id)
+        entry.delete()
+        return Response(status=status.HTTP_204_NO_CONTENT)
+
+
+# ---------------------------------------------------------------------------
+# Daily Note views (markdown-first)
+# ---------------------------------------------------------------------------
+
+
+class DailyNoteView(APIView):
+    """GET /api/v1/journal/daily/<date>/ — sectionized + legacy entries."""
+
+    permission_classes = [IsAuthenticated]
+
+    def get(self, request, date: str):
+        tenant = _get_tenant_for_user(request.user)
+        try:
+            d = datetime.date.fromisoformat(date)
+        except ValueError:
+            return Response({"error": "Invalid date format. Use YYYY-MM-DD."}, status=400)
+
+        note = upsert_default_daily_note(tenant=tenant, note_date=d)
+
+        return Response(_note_template_response(note))
+
+
+class DailyNoteEntryListView(APIView):
+    """POST /api/v1/journal/daily/<date>/entries/ — append an entry.
+
+    .. deprecated:: Use DailyNoteSectionView or log-append instead.
+    """
+
+    permission_classes = [IsAuthenticated]
+
+    def post(self, request, date: str):
+        tenant = _get_tenant_for_user(request.user)
+        try:
+            d = datetime.date.fromisoformat(date)
+        except ValueError:
+            return Response({"error": "Invalid date format."}, status=400)
+
+        serializer = DailyNoteEntryInputSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        data = serializer.validated_data
+
+        note = upsert_default_daily_note(tenant=tenant, note_date=d)
+
+        time_str = data.get("time") or timezone.now().strftime("%H:%M")
+        from apps.pii.authoring import author_json_paths
+
+        authored = author_json_paths(
+            tenant,
+            {
+                "content": data["content"],
+                "mood": data.get("mood") or "",
+                "author_label": request.user.display_name,
+            },
+            paths=(("content",), ("mood",), ("author_label",)),
+            seam="journal.daily_note.entry.create.owner",
+            writer="owner",
+            field="markdown",
+            model_label="journal.DailyNote",
+            flag_off_legacy_redaction=False,
+        )
+        note.markdown = append_entry_markdown(
+            note.markdown,
+            time=time_str,
+            author="human",
+            content=authored.value["content"],
+            mood=authored.value["mood"] or None,
+            energy=data.get("energy"),
+            date_str=str(d),
+            author_label=authored.value["author_label"],
+        )
+        from .document_authoring import merge_field_receipt
+
+        note.pii_receipts = merge_field_receipt(
+            note.pii_receipts,
+            "markdown",
+            authored.receipt,
+            stored_text=note.markdown,
+        )
+        note.save(update_fields=["markdown", "pii_receipts", "updated_at"])
+
+        entries = _note_template_response(note, include_entries=True)["entries"]
+        return Response(
+            {"date": date, "entries": entries},
+            status=status.HTTP_201_CREATED,
+            headers=DEPRECATION_HEADERS,
+        )
+
+
+class DailyNoteEntryDetailView(APIView):
+    """PATCH/DELETE /api/v1/journal/daily/<date>/entries/<index>/
+
+    .. deprecated:: Use DailyNoteSectionView instead.
+    """
+
+    permission_classes = [IsAuthenticated]
+
+    def patch(self, request, date: str, index: int):
+        tenant = _get_tenant_for_user(request.user)
+        try:
+            d = datetime.date.fromisoformat(date)
+        except ValueError:
+            return Response({"error": "Invalid date format."}, status=400)
+
+        note = DailyNote.objects.filter(tenant=tenant, date=d).first()
+        if not note:
+            raise Http404("Daily note not found.")
+
+        entries = parse_daily_note(note.markdown)
+        if index < 0 or index >= len(entries):
+            return Response({"error": "Entry index out of range."}, status=404)
+
+        serializer = DailyNoteEntryPatchSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+
+        entry = entries[index]
+        for field in ("content", "mood", "energy"):
+            if field in serializer.validated_data:
+                entry[field] = serializer.validated_data[field]
+
+        from apps.pii.authoring import author_text
+
+        authored = author_text(
+            tenant,
+            serialise_daily_note(str(d), entries),
+            seam="journal.daily_note.entry.update.owner",
+            writer="owner",
+            field="markdown",
+            model_label="journal.DailyNote",
+            flag_off_legacy_redaction=False,
+        )
+        note.markdown = authored.text
+        note.pii_receipts = {**(note.pii_receipts or {}), "markdown": authored.receipt}
+        note.save(update_fields=["markdown", "pii_receipts", "updated_at"])
+
+        _rehydrate_daily_note_entries_in_place(tenant, entries)
+        return Response(
+            {"date": date, "entries": entries},
+            headers=DEPRECATION_HEADERS,
+        )
+
+    def delete(self, request, date: str, index: int):
+        tenant = _get_tenant_for_user(request.user)
+        try:
+            d = datetime.date.fromisoformat(date)
+        except ValueError:
+            return Response({"error": "Invalid date format."}, status=400)
+
+        note = DailyNote.objects.filter(tenant=tenant, date=d).first()
+        if not note:
+            raise Http404("Daily note not found.")
+
+        entries = parse_daily_note(note.markdown)
+        if index < 0 or index >= len(entries):
+            return Response({"error": "Entry index out of range."}, status=404)
+
+        entries.pop(index)
+        note.markdown = serialise_daily_note(str(d), entries)
+        from .document_authoring import refresh_field_redactions
+
+        note.pii_receipts = refresh_field_redactions(note.pii_receipts, "markdown", note.markdown)
+        note.save(update_fields=["markdown", "pii_receipts", "updated_at"])
+
+        _rehydrate_daily_note_entries_in_place(tenant, entries)
+        return Response(
+            {"date": date, "entries": entries},
+            headers=DEPRECATION_HEADERS,
+        )
+
+
+class DailyNoteTemplateView(APIView):
+    """GET/PUT sectionized daily note payload by template sections."""
+
+    permission_classes = [IsAuthenticated]
+
+    def get(self, request, date: str):
+        tenant = _get_tenant_for_user(request.user)
+        try:
+            d = datetime.date.fromisoformat(date)
+        except ValueError:
+            return Response({"error": "Invalid date format. Use YYYY-MM-DD."}, status=400)
+
+        note = upsert_default_daily_note(tenant=tenant, note_date=d)
+        return Response(_note_template_response(note))
+
+    def put(self, request, date: str):
+        tenant = _get_tenant_for_user(request.user)
+        try:
+            d = datetime.date.fromisoformat(date)
+        except ValueError:
+            return Response({"error": "Invalid date format. Use YYYY-MM-DD."}, status=400)
+
+        template_id = request.data.get("template_id")
+        sections = request.data.get("sections")
+        if not isinstance(sections, list):
+            return Response({"error": "sections must be an array."}, status=400)
+
+        note = upsert_default_daily_note(tenant=tenant, note_date=d)
+        template = note.template
+        if template_id:
+            template = NoteTemplate.objects.filter(tenant=tenant, id=template_id).first()
+            if template is None:
+                return Response({"error": "template not found."}, status=404)
+
+        try:
+            serializer = DailyNoteTemplateSerializer(
+                data={
+                    "date": str(d),
+                    "template_id": str(template.id) if template else None,
+                    "template_slug": template.slug if template else "",
+                    "template_name": template.name if template else "",
+                    "markdown": request.data.get("markdown", ""),
+                    "sections": sections,
+                }
+            )
+            serializer.is_valid(raise_exception=True)
+        except Exception as exc:
+            return Response({"error": "Invalid payload.", "detail": str(exc)}, status=400)
+
+        section_payload = serializer.validated_data["sections"]
+        set_daily_note_sections(
+            note=note,
+            sections=section_payload,
+            writer="owner",
+            template=template,
+        )
+        note.refresh_from_db()
+        return Response(_note_template_response(note, include_entries=False), status=200)
+
+    def delete(self, request, date: str, index: int):
+        tenant = _get_tenant_for_user(request.user)
+        try:
+            d = datetime.date.fromisoformat(date)
+        except ValueError:
+            return Response({"error": "Invalid date format."}, status=400)
+
+        note = DailyNote.objects.filter(tenant=tenant, date=d).first()
+        if not note:
+            raise Http404("Daily note not found.")
+
+        entries = parse_daily_note(note.markdown)
+        if index < 0 or index >= len(entries):
+            return Response({"error": "Entry index out of range."}, status=404)
+
+        entries.pop(index)
+        note.markdown = serialise_daily_note(str(d), entries)
+        from .document_authoring import refresh_field_redactions
+
+        note.pii_receipts = refresh_field_redactions(note.pii_receipts, "markdown", note.markdown)
+        note.save(update_fields=["markdown", "pii_receipts", "updated_at"])
+
+        _rehydrate_daily_note_entries_in_place(tenant, entries)
+        return Response({"date": date, "entries": entries})
+
+
+class DailyNoteSectionView(APIView):
+    """PATCH /api/v1/journal/daily/<date>/sections/<slug>/"""
+
+    permission_classes = [IsAuthenticated]
+
+    def patch(self, request, date: str, slug: str):
+        tenant = _get_tenant_for_user(request.user)
+        try:
+            d = datetime.date.fromisoformat(date)
+        except ValueError:
+            return Response({"error": "Invalid date format. Use YYYY-MM-DD."}, status=400)
+
+        content = request.data.get("content")
+        if content is None:
+            return Response({"error": "content is required."}, status=400)
+
+        note = upsert_default_daily_note(tenant=tenant, note_date=d)
+        try:
+            note, _sections = set_daily_note_section(
+                note=note,
+                section_slug=slug,
+                content=str(content),
+                writer="owner",
+            )
+        except ValueError as exc:
+            return Response({"error": str(exc)}, status=400)
+
+        return Response(_note_template_response(note, include_entries=False))
+
+
+# ---------------------------------------------------------------------------
+# Long-Term Memory views (user-facing)
+# ---------------------------------------------------------------------------
+
+
+class MemoryView(APIView):
+    """GET/PUT /api/v1/journal/memory/ — backed by Document model."""
+
+    permission_classes = [IsAuthenticated]
+
+    def get(self, request):
+        # This view served ``doc.markdown`` RAW — the owner's long-term memory is
+        # written by the agent in placeholder space, so every mapped name read
+        # back as "[PERSON_12]" here while the same document rehydrated correctly
+        # through the Document endpoints. Owner boundary ⇒ rehydrate + receipts
+        # (directive §A3).
+        #
+        # ACTIVE bindings only. This surface is an EDITOR: whatever it renders
+        # comes straight back as a write. A retired binding rehydrated here would
+        # be re-authored on save with no substitution available (retirement pulls
+        # the value out of the known-value path), so the owner deleting an entity
+        # would be the one action that puts its real name back at rest in
+        # plaintext. The token stays literal instead — honest about the deletion,
+        # and it round-trips byte-for-byte (§A9).
+        # Receipts are resolved active-only for the SAME reason, so the two
+        # halves of this response agree: with the full map a retired
+        # placeholder still resolves to its name, and the client would draw a
+        # named entity chip over a token the body shows literally.
+        from .document_authoring import owner_receipts_active, rehydrate_active
+
+        tenant = _get_tenant_for_user(request.user)
+        doc = Document.objects.filter(tenant=tenant, kind="memory", slug="long-term").first()
+        return Response(
+            {
+                "markdown": rehydrate_active(tenant, doc.markdown) if doc else "",
+                "pii_receipts": owner_receipts_active(doc, tenant) if doc else {},
+                "updated_at": doc.updated_at.isoformat() if doc else None,
+            }
+        )
+
+    def put(self, request):
+        from django.db import transaction
+
+        from apps.pii.authoring import author_text
+
+        from .document_authoring import owner_receipts_active, rehydrate_active
+
+        tenant = _get_tenant_for_user(request.user)
+        serializer = MemoryPatchSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+
+        doc, _ = Document.objects.get_or_create(
+            tenant=tenant,
+            kind="memory",
+            slug="long-term",
+            defaults={"title": "Memory"},
+        )
+        # The GET above now hands the owner real values, so the save round-trips
+        # real values back — without authoring, this PUT would write the names
+        # the agent must never see straight back into its memory document.
+        # Authoring runs OUTSIDE the transaction: it is the PII path and may
+        # reach a detector out of process, which invariants §8 forbids inside
+        # ``atomic()``.
+        authored = author_text(
+            tenant,
+            serializer.validated_data["markdown"],
+            seam="journal.memory.put",
+            writer="owner",
+            field="markdown",
+            model_label="journal.Document",
+        )
+        with transaction.atomic():
+            # Merge onto the row read UNDER the lock, so a receipt another
+            # writer set for a field this request never touched survives.
+            doc = Document.objects.select_for_update().get(pk=doc.pk)
+            doc.markdown = authored.text
+            doc.pii_receipts = {**(doc.pii_receipts or {}), "markdown": authored.receipt}
+            doc.save(update_fields=["markdown", "pii_receipts", "updated_at"])
+
+        return Response(
+            {
+                "markdown": rehydrate_active(tenant, doc.markdown),
+                "pii_receipts": owner_receipts_active(doc, tenant),
+                "updated_at": doc.updated_at.isoformat(),
+            }
+        )
+
+
+# ---------------------------------------------------------------------------
+# Weekly Review views (user-facing)
+# ---------------------------------------------------------------------------
+
+
+class WeeklyReviewListCreateView(APIView):
+    permission_classes = [IsAuthenticated]
+
+    def get(self, request):
+        tenant = _get_tenant_for_user(request.user)
+        queryset = WeeklyReview.objects.filter(tenant=tenant).order_by("-week_start")
+        serializer = WeeklyReviewSerializer(queryset, many=True, context={"tenant": tenant})
+        return Response(serializer.data, headers=DEPRECATION_HEADERS)
+
+    def post(self, request):
+        tenant = _get_tenant_for_user(request.user)
+        serializer = WeeklyReviewSerializer(data=request.data, context={"tenant": tenant})
+        serializer.is_valid(raise_exception=True)
+        serializer.save()
+        return Response(serializer.data, status=status.HTTP_201_CREATED, headers=DEPRECATION_HEADERS)
+
+
+class WeeklyReviewDetailView(APIView):
+    permission_classes = [IsAuthenticated]
+
+    def get(self, request, review_id: UUID):
+        tenant = _get_tenant_for_user(request.user)
+        review = _get_weekly_review_for_tenant(tenant=tenant, review_id=review_id)
+        return Response(
+            WeeklyReviewSerializer(review, context={"tenant": tenant}).data,
+            headers=DEPRECATION_HEADERS,
+        )
+
+    def patch(self, request, review_id: UUID):
+        tenant = _get_tenant_for_user(request.user)
+        review = _get_weekly_review_for_tenant(tenant=tenant, review_id=review_id)
+        serializer = WeeklyReviewSerializer(review, data=request.data, partial=True, context={"tenant": tenant})
+        serializer.is_valid(raise_exception=True)
+        updated = serializer.save()
+        return Response(
+            WeeklyReviewSerializer(updated, context={"tenant": tenant}).data,
+            headers=DEPRECATION_HEADERS,
+        )
+
+    def delete(self, request, review_id: UUID):
+        tenant = _get_tenant_for_user(request.user)
+        review = _get_weekly_review_for_tenant(tenant=tenant, review_id=review_id)
+        review.delete()
+        return Response(status=status.HTTP_204_NO_CONTENT, headers=DEPRECATION_HEADERS)
+
+
+# ---------------------------------------------------------------------------
+# Template management
+# ---------------------------------------------------------------------------
+
+
+class TemplateListCreateView(APIView):
+    permission_classes = [IsAuthenticated]
+
+    def get(self, request):
+        tenant = _get_tenant_for_user(request.user)
+        templates = NoteTemplate.objects.filter(tenant=tenant).order_by("-is_default", "name")
+        serializer = NoteTemplateSerializer(
+            templates,
+            many=True,
+            context={"tenant": tenant, "rehydrate": True},
+        )
+        return Response(serializer.data)
+
+    def post(self, request):
+        tenant = _get_tenant_for_user(request.user)
+        serializer = NoteTemplateSerializer(data=request.data, context={"tenant": tenant})
+        serializer.is_valid(raise_exception=True)
+        template = serializer.save()
+        return Response(
+            NoteTemplateSerializer(template, context={"tenant": tenant, "rehydrate": True}).data,
+            status=status.HTTP_201_CREATED,
+        )
+
+
+class TemplateDetailView(APIView):
+    permission_classes = [IsAuthenticated]
+
+    def get(self, request, template_id: str):
+        tenant = _get_tenant_for_user(request.user)
+        template = NoteTemplate.objects.filter(tenant=tenant, id=template_id).first()
+        if not template:
+            return Response({"error": "template not found."}, status=404)
+        serializer = NoteTemplateSerializer(template, context={"tenant": tenant, "rehydrate": True})
+        return Response(serializer.data)
+
+    def patch(self, request, template_id: str):
+        tenant = _get_tenant_for_user(request.user)
+        template = NoteTemplate.objects.filter(tenant=tenant, id=template_id).first()
+        if not template:
+            return Response({"error": "template not found."}, status=404)
+        serializer = NoteTemplateSerializer(template, data=request.data, partial=True, context={"tenant": tenant})
+        serializer.is_valid(raise_exception=True)
+        template = serializer.save()
+
+        # Push updated skill config to the agent's container when the default template changes.
+        if template.is_default:
+            try:
+                from apps.cron.publish import publish_task
+
+                publish_task("update_tenant_config", str(tenant.id))
+            except Exception:
+                pass  # Non-blocking; config update is best-effort.
+
+        return Response(NoteTemplateSerializer(template, context={"tenant": tenant, "rehydrate": True}).data)
+
+    def delete(self, request, template_id: str):
+        tenant = _get_tenant_for_user(request.user)
+        template = NoteTemplate.objects.filter(tenant=tenant, id=template_id).first()
+        if not template:
+            return Response({"error": "template not found."}, status=404)
+        was_default = template.is_default
+        if was_default:
+            alternate = NoteTemplate.objects.filter(tenant=tenant).exclude(id=template.id).first()
+            if not alternate:
+                return Response({"error": "cannot delete the last template."}, status=400)
+            alternate.is_default = True
+            alternate.save(update_fields=["is_default"])
+
+        template.delete()
+
+        # Mirror PATCH: push updated skill config when the default template changed.
+        if was_default:
+            try:
+                from apps.cron.publish import publish_task
+
+                publish_task("update_tenant_config", str(tenant.id))
+            except Exception:
+                pass  # Non-blocking; config update is best-effort.
+
+        return Response(status=status.HTTP_204_NO_CONTENT)
+
+
+# ---------------------------------------------------------------------------
+# Pending extraction approval (web)
+# ---------------------------------------------------------------------------
+
+
+class ExtractionApproveView(APIView):
+    """POST /api/v1/journal/extractions/<uuid>/approve/ — approve a pending extraction."""
+
+    permission_classes = [IsAuthenticated]
+
+    def post(self, request, extraction_id: UUID):
+        tenant = _get_tenant_for_user(request.user)
+        pending = PendingExtraction.objects.filter(
+            id=extraction_id,
+            tenant=tenant,
+            status=PendingExtraction.Status.PENDING,
+        ).first()
+        if not pending:
+            return Response({"detail": "Not found or already processed."}, status=status.HTTP_404_NOT_FOUND)
+
+        from apps.router.extraction_callbacks import _approve_goal, _approve_task
+
+        lesson_id = None
+        try:
+            if pending.kind == PendingExtraction.Kind.GOAL:
+                _approve_goal(pending)
+            elif pending.kind == PendingExtraction.Kind.TASK:
+                _approve_task(pending)
+            elif pending.kind == PendingExtraction.Kind.PURPOSE:
+                from apps.router.extraction_callbacks import _approve_purpose
+
+                _approve_purpose(pending)
+            elif pending.kind == PendingExtraction.Kind.LESSON:
+                from apps.router.extraction_callbacks import _approve_lesson
+
+                _, lesson_id = _approve_lesson(pending)
+        except Exception:
+            logger.exception("extraction approve failed for %s", extraction_id)
+            return Response({"detail": "Approval failed."}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+
+        pending.status = PendingExtraction.Status.APPROVED
+        pending.resolved_at = timezone.now()
+        if pending.kind == PendingExtraction.Kind.LESSON and lesson_id:
+            pending.lesson_id = lesson_id
+            pending.save(update_fields=["status", "resolved_at", "lesson_id"])
+        else:
+            pending.save(update_fields=["status", "resolved_at"])
+
+        return Response({"id": str(pending.id), "status": "approved"})
+
+
+class ExtractionDismissView(APIView):
+    """POST /api/v1/journal/extractions/<uuid>/dismiss/ — dismiss a pending extraction."""
+
+    permission_classes = [IsAuthenticated]
+
+    def post(self, request, extraction_id: UUID):
+        tenant = _get_tenant_for_user(request.user)
+        pending = PendingExtraction.objects.filter(
+            id=extraction_id,
+            tenant=tenant,
+            status=PendingExtraction.Status.PENDING,
+        ).first()
+        if not pending:
+            return Response({"detail": "Not found or already processed."}, status=status.HTTP_404_NOT_FOUND)
+
+        pending.status = PendingExtraction.Status.DISMISSED
+        pending.resolved_at = timezone.now()
+        pending.save(update_fields=["status", "resolved_at"])
+
+        return Response({"id": str(pending.id), "status": "dismissed"})

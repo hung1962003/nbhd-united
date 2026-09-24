@@ -1,0 +1,91 @@
+# Core
+Django>=6.1.1,<6.2
+djangorestframework>=3.18.1
+django-cors-headers
+django-environ
+psycopg[binary]
+gunicorn
+
+# Auth
+djangorestframework-simplejwt
+PyJWT
+cryptography
+
+# Task scheduling (QStash — replaces Celery)
+qstash>=2.0
+
+# Payments
+dj-stripe>=2.11.0
+stripe
+
+# Telegram (all Bot API calls use raw httpx — see apps/router/poller.py)
+qrcode[pil]
+
+# AI / LLM
+litellm>=1.101.0,<1.101.1  # 1.82.8 compromised — supply chain attack
+openai
+tiktoken
+pgvector
+google-genai>=2.24.0    # Gemini TTS — Core pillar meditation render (apps/core/render.py)
+
+# PII redaction (outgoing LLM traffic)
+presidio-analyzer>=2.2.364    # Pattern recognizers only (credit card Luhn, IBAN checksum)
+# Neural PII detection: lakshyakh93/deberta_finetuned_pii loaded via
+# vanilla PyTorch CPU. We deliberately do NOT route through
+# `optimum.onnxruntime`: the prior INT8-quantized ONNX path produced
+# different detection output on Linux x86 (prod) than on macOS dev
+# machines, AND the optimum / transformers ABI churn broke imports
+# outright between 2026-05-07 and the model swap (#695). Vanilla
+# PyTorch CPU inference is deterministic across both platforms and
+# frees us from the optimum dependency triangle entirely.
+# transformers needs an explicit torch (or TF/JAX) backend; we use the
+# PyTorch path for AutoModelForTokenClassification. Pin to CPU-only torch
+# via the `torch` package — production images don't have CUDA.
+torch>=2.14.0,<3.0
+transformers>=5.9.0,<5.10.0
+sentencepiece>=0.2.2
+
+# HTTP client (for routing to OpenClaw instances). [http2] pulls h2 — APNs
+# speaks HTTP/2 only (see apps/common/apns.py).
+httpx[http2]
+
+# Redis cache (shared across workers/containers)
+django-redis
+
+# Managed OAuth (Composio — Google integrations)
+composio>=0.21.1
+
+# Azure SDK (for Container Apps, Key Vault, Managed Identity, Storage, Billing)
+azure-identity
+azure-mgmt-containerinstance
+azure-mgmt-appcontainers
+azure-mgmt-costmanagement>=4.0
+azure-mgmt-msi
+azure-mgmt-authorization
+azure-mgmt-storage
+azure-storage-file-share
+azure-keyvault-secrets
+azure-keyvault-keys>=4.11.2,<5
+
+# PDF text extraction (async server-side read of app-uploaded documents, so the
+# slow in-turn OpenClaw `pdf` tool no longer blocks the assistant's queue).
+# Pure Python, zero transitive dependencies — pinned exactly, and BOTH this file
+# and requirements.txt are hand-edited: pip-compile on macOS strips the
+# platform-specific pins this Linux-deployed lockfile needs.
+pypdf==6.19.0
+
+# Charts (server-side rendering for chat channels)
+matplotlib
+
+# Cron expression parsing (compute next fire time for hibernation wake)
+croniter
+
+# Error / performance monitoring (Django integration ships in the core SDK,
+# auto-enabled. Inert unless SENTRY_DSN is set — see config/settings/base.py).
+sentry-sdk>=2.69.2
+
+# Utils
+whitenoise
+django-extensions
+pip-tools
+python-dateutil

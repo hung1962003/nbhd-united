@@ -1,0 +1,73 @@
+{
+  "id": "nbhd-journal-tools",
+  "name": "NBHD Journal Tools",
+  "description": "Daily journal and long-term memory tools for the markdown-first collaborative journaling system.",
+  "contracts": {
+    "tools": [
+      "nbhd_document_get",
+      "nbhd_document_put",
+      "nbhd_document_append",
+      "nbhd_weekly_review_create",
+      "nbhd_daily_note_get",
+      "nbhd_daily_note_set_section",
+      "nbhd_daily_note_append",
+      "nbhd_memory_get",
+      "nbhd_memory_update",
+      "nbhd_journal_context",
+      "nbhd_journal_evening_checkin",
+      "nbhd_journal_search",
+      "nbhd_lesson_suggest",
+      "nbhd_lesson_search",
+      "nbhd_lessons_pending",
+      "nbhd_constellation_notes",
+      "nbhd_sessions_pending",
+      "nbhd_session_mark_processed",
+      "nbhd_platform_issue_report",
+      "nbhd_send_to_user",
+      "nbhd_cron_phase2_summary",
+      "nbhd_update_profile",
+      "nbhd_update_situation",
+      "nbhd_workspace_list",
+      "nbhd_workspace_create",
+      "nbhd_workspace_update",
+      "nbhd_workspace_delete",
+      "nbhd_goal_create",
+      "nbhd_goal_update",
+      "nbhd_goal_achieve",
+      "nbhd_goal_abandon",
+      "nbhd_goal_list",
+      "nbhd_goal_get",
+      "nbhd_purpose_list",
+      "nbhd_purpose_propose",
+      "nbhd_purpose_confirm",
+      "nbhd_purpose_update",
+      "nbhd_purpose_link_goal",
+      "nbhd_task_create",
+      "nbhd_task_update",
+      "nbhd_task_complete",
+      "nbhd_task_skip",
+      "nbhd_task_defer",
+      "nbhd_task_delete",
+      "nbhd_task_list",
+      "nbhd_task_get",
+      "nbhd_current_status",
+      "nbhd_reconcile_scan"
+    ]
+  },
+  "configSchema": {
+    "type": "object",
+    "additionalProperties": false,
+    "properties": {
+      "apiBaseUrl": {
+        "type": "string",
+        "description": "Override NBHD API base URL. Defaults to NBHD_API_BASE_URL env var."
+      },
+      "requestTimeoutMs": {
+        "type": "number",
+        "minimum": 1000,
+        "maximum": 60000,
+        "description": "HTTP timeout for NBHD runtime endpoint requests."
+      }
+    }
+  }
+}

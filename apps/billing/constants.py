@@ -1,0 +1,299 @@
+"""Model pricing constants for usage transparency.
+
+Rates are per 1M tokens in USD. Update when providers change pricing.
+"""
+
+import re
+from decimal import Decimal
+
+# ── Canonical model IDs ────────────────────────────────────────────────────
+# Change these once here; every other module imports from this file.
+
+# MiniMax M2.7 is no longer offered as a user-selectable model (replaced by
+# DeepSeek V4 Flash on 2026-06-09 — cheaper, and consolidates the "fast"
+# slot onto the DeepSeek family alongside V4 Pro). The constant + rate stay
+# so historical UsageEvent rows continue to render correctly in billing; no
+# code path adds MiniMax to a tier's allowlist anymore.
+MINIMAX_MODEL = "openrouter/minimax/minimax-m2.7"
+MINIMAX_DISPLAY = "MiniMax M2.7"
+MINIMAX_RATE = {"input": 0.28, "output": 1.20}
+
+# Kimi K2.6 is no longer offered as a user-selectable model (replaced by
+# DeepSeek V4 Pro on 2026-05-23 — cheaper output, 1M context, configurable
+# reasoning). The constant + rate stay so historical UsageEvent rows
+# continue to render correctly in billing; no code path adds Kimi to a
+# tier's allowlist anymore.
+KIMI_MODEL = "openrouter/moonshotai/kimi-k2.6"
+KIMI_DISPLAY = "Kimi 2.6"
+KIMI_RATE = {"input": 0.73, "output": 3.49}
+
+DEEPSEEK_MODEL = "openrouter/deepseek/deepseek-v4-pro"
+DEEPSEEK_DISPLAY = "DeepSeek V4 Pro"
+DEEPSEEK_RATE = {"input": 0.435, "output": 0.87}
+
+# The unversioned DeepSeek V4 Flash id is no longer selectable (repointed to the
+# 0731 snapshot on 2026-08-02). Keep its constant + original rate so historical
+# UsageEvent rows continue to render with the name and price recorded at the
+# time; no runtime allowlist references this legacy id.
+DEEPSEEK_FLASH_LEGACY_MODEL = "openrouter/deepseek/deepseek-v4-flash"
+DEEPSEEK_FLASH_LEGACY_DISPLAY = "DeepSeek V4 Flash"
+DEEPSEEK_FLASH_LEGACY_RATE = {"input": 0.065, "output": 0.26}
+
+# DeepSeek V4 Flash 0731 — the cheap/fast member of the DeepSeek family. Replaced
+# MiniMax M2.7 as the low-latency "fast" slot on 2026-06-09. Also the pinned
+# HEARTBEAT_MODEL (see config_generator): cheaper than V4 Pro, faster than the
+# reasoning leader, more capable than the Gemma worker. Not a reasoning model,
+# so it keeps the default chat timeout.
+DEEPSEEK_FLASH_MODEL = "openrouter/deepseek/deepseek-v4-flash-0731"
+DEEPSEEK_FLASH_DISPLAY = "DeepSeek V4 Flash"
+DEEPSEEK_FLASH_RATE = {"input": 0.09, "output": 0.18}
+
+# Gemma 4 31B — the cheap vision-capable worker (default compose model, agenda
+# hint fallback), and the pinned `pdfModel` for platform-key tenants. The rate
+# below is OpenRouter's live catalog price, verified 2026-08-06; it must stay in
+# sync with the `cost` block config_generator.OPENROUTER_DECLARED_MODELS emits
+# for the same model — a test pins the two together.
+GEMMA_MODEL = "openrouter/google/gemma-4-31b-it"
+GEMMA_DISPLAY = "Gemma 4 31B"
+GEMMA_RATE = {"input": 0.10, "output": 0.34}
+
+# ── Limited-time free offer ────────────────────────────────────────────────
+# NVIDIA Nemotron 3 Ultra, served as a $0 "free variant" on OpenRouter
+# (1M context, frontier-reasoning). Promoted to the default chat model ONLY
+# while OpenRouter keeps it free AND reachable — see apps/billing/model_offers.py
+# and the `model_health_check` cron. Both prompt + completion rates are 0, so it
+# never adds to a tenant's monthly cost budget. The `:free` suffix is part of
+# the OpenRouter slug; the `openrouter/` prefix is OpenClaw's routing convention
+# (stripped before the bare slug hits the OpenRouter HTTP API — see
+# apps/common/openrouter.py:normalize_model_id).
+NEMOTRON_FREE_MODEL = "openrouter/nvidia/nemotron-3-ultra-550b-a55b:free"
+NEMOTRON_FREE_DISPLAY = "Nemotron 3 Ultra (Free)"
+NEMOTRON_FREE_RATE = {"input": 0.0, "output": 0.0}
+
+# BYO subscription models — tenant pays the provider directly via their
+# Pro/Max/Plus account. Not in MODEL_RATES because NBHD doesn't bill
+# tokens for these.
+#
+# Model IDs use the canonical `anthropic/<model>` form (NOT `anthropic-cli/...`,
+# which we shipped briefly in PR #419 — that prefix doesn't exist in OpenClaw
+# 2026.4.25's registry). CLI routing is activated by the `anthropic:claude-cli`
+# **auth profile** (registered at container boot by `runtime/openclaw/entrypoint.sh`
+# via `openclaw models auth login --provider anthropic --method cli`). When that
+# profile is present, OpenClaw routes any `anthropic/<model>` request through the
+# bundled `claude` binary, which reads `CLAUDE_CODE_OAUTH_TOKEN` and bills the
+# tenant's Pro/Max subscription. Without the profile, the same model id falls
+# through to the HTTP plugin (which needs `ANTHROPIC_API_KEY`).
+ANTHROPIC_SONNET_MODEL = "anthropic/claude-sonnet-4-6"
+ANTHROPIC_SONNET_DISPLAY = "Claude Sonnet 4.6"
+
+ANTHROPIC_OPUS_MODEL = "anthropic/claude-opus-4-7"
+ANTHROPIC_OPUS_DISPLAY = "Claude Opus 4.7"
+
+# Claude Haiku 4.5 — Anthropic's small/fast model. It is NOT a tenant-selectable
+# chat model (it's in neither TIER_MODEL_CONFIGS nor the BYO extras). It only
+# ever appears on a tenant's usage rollup because PLATFORM-side system tasks —
+# the PII arbiter, galaxy copilot, lesson cluster naming, tutoring — call it via
+# OpenRouter using the shared platform key (see apps/pii/arbiter.py, which routes
+# it through apps.common.openrouter rather than any per-tenant BYO credential).
+# Those turns are metered (the platform pays OpenRouter), so haiku belongs in
+# MODEL_RATES, not BYO_MODEL_DISPLAY. The rate is Anthropic's published Claude
+# Haiku 4.5 list price ($1/MTok in, $5/MTok out), which OpenRouter passes
+# through; it matches the estimate hard-coded in apps/pii/arbiter.py. Only the
+# canonical hyphenated id is registered — canonical_model_id() folds the dotted
+# ``claude-haiku-4.5`` spelling (used by copilot / cluster_naming) onto it.
+ANTHROPIC_HAIKU_MODEL = "anthropic/claude-haiku-4-5"
+ANTHROPIC_HAIKU_DISPLAY = "Claude Haiku 4.5"
+ANTHROPIC_HAIKU_RATE = {"input": 1.0, "output": 5.0}
+
+MODEL_RATES: dict[str, dict[str, float]] = {
+    MINIMAX_MODEL: {
+        **MINIMAX_RATE,
+        "display_name": MINIMAX_DISPLAY,
+    },
+    # OpenClaw sometimes reports without the openrouter/ prefix
+    MINIMAX_MODEL.removeprefix("openrouter/"): {
+        **MINIMAX_RATE,
+        "display_name": MINIMAX_DISPLAY,
+    },
+    KIMI_MODEL: {
+        **KIMI_RATE,
+        "display_name": KIMI_DISPLAY,
+    },
+    KIMI_MODEL.removeprefix("openrouter/"): {
+        **KIMI_RATE,
+        "display_name": KIMI_DISPLAY,
+    },
+    DEEPSEEK_MODEL: {
+        **DEEPSEEK_RATE,
+        "display_name": DEEPSEEK_DISPLAY,
+    },
+    DEEPSEEK_MODEL.removeprefix("openrouter/"): {
+        **DEEPSEEK_RATE,
+        "display_name": DEEPSEEK_DISPLAY,
+    },
+    DEEPSEEK_FLASH_LEGACY_MODEL: {
+        **DEEPSEEK_FLASH_LEGACY_RATE,
+        "display_name": DEEPSEEK_FLASH_LEGACY_DISPLAY,
+    },
+    DEEPSEEK_FLASH_LEGACY_MODEL.removeprefix("openrouter/"): {
+        **DEEPSEEK_FLASH_LEGACY_RATE,
+        "display_name": DEEPSEEK_FLASH_LEGACY_DISPLAY,
+    },
+    DEEPSEEK_FLASH_MODEL: {
+        **DEEPSEEK_FLASH_RATE,
+        "display_name": DEEPSEEK_FLASH_DISPLAY,
+    },
+    DEEPSEEK_FLASH_MODEL.removeprefix("openrouter/"): {
+        **DEEPSEEK_FLASH_RATE,
+        "display_name": DEEPSEEK_FLASH_DISPLAY,
+    },
+    GEMMA_MODEL: {
+        **GEMMA_RATE,
+        "display_name": GEMMA_DISPLAY,
+    },
+    GEMMA_MODEL.removeprefix("openrouter/"): {
+        **GEMMA_RATE,
+        "display_name": GEMMA_DISPLAY,
+    },
+    NEMOTRON_FREE_MODEL: {
+        **NEMOTRON_FREE_RATE,
+        "display_name": NEMOTRON_FREE_DISPLAY,
+    },
+    NEMOTRON_FREE_MODEL.removeprefix("openrouter/"): {
+        **NEMOTRON_FREE_RATE,
+        "display_name": NEMOTRON_FREE_DISPLAY,
+    },
+    # Platform-metered (shared OpenRouter key). No openrouter/ prefix to strip
+    # and canonical_model_id normalizes the dotted spelling, so one key suffices.
+    ANTHROPIC_HAIKU_MODEL: {
+        **ANTHROPIC_HAIKU_RATE,
+        "display_name": ANTHROPIC_HAIKU_DISPLAY,
+    },
+}
+
+DEFAULT_RATE = {"input": 0.3, "output": 1.2, "display_name": "Unknown Model"}
+
+# Display-only map for models we don't bill but want to attribute properly.
+# BYO subscription models are zero-cost on our side (the tenant pays the
+# provider directly), so they don't belong in MODEL_RATES — but the usage
+# rollup still needs a human-readable label for them. Includes the dotted
+# variants OpenRouter sometimes reports back (e.g. ``claude-sonnet-4.6``
+# instead of the canonical hyphenated ``claude-sonnet-4-6``).
+BYO_MODEL_DISPLAY: dict[str, str] = {
+    ANTHROPIC_SONNET_MODEL: ANTHROPIC_SONNET_DISPLAY,
+    ANTHROPIC_SONNET_MODEL.replace("-4-6", "-4.6"): ANTHROPIC_SONNET_DISPLAY,
+    ANTHROPIC_OPUS_MODEL: ANTHROPIC_OPUS_DISPLAY,
+    ANTHROPIC_OPUS_MODEL.replace("-4-7", "-4.7"): ANTHROPIC_OPUS_DISPLAY,
+}
+
+
+def display_name_for_model(model_used: str) -> str:
+    """Return the display name for a stored ``model_used`` string.
+
+    Looks up MODEL_RATES (billed models) first, then BYO_MODEL_DISPLAY
+    (subscription-paid models), then falls back to the raw value so new
+    or unmapped models surface as their id rather than "Unknown Model".
+    Empty strings still return "Unknown Model" as the explicit fallback.
+    """
+    if not model_used:
+        return DEFAULT_RATE["display_name"]
+    rate = MODEL_RATES.get(model_used)
+    if rate is not None:
+        return rate["display_name"]
+    byo = BYO_MODEL_DISPLAY.get(model_used)
+    if byo is not None:
+        return byo
+    return model_used
+
+
+# A dotted version token that immediately follows a hyphen, e.g. the ``-4.5`` in
+# ``claude-haiku-4.5``. Rewritten to the hyphenated ``-4-5`` form. Anchoring on a
+# leading hyphen keeps provider/model slugs that legitimately contain a dot after
+# a letter (``minimax-m2.7``, ``kimi-k2.6``) untouched.
+_VERSION_DOT_RE = re.compile(r"-(\d+)\.(\d+)")
+
+
+def canonical_model_id(model_used: str) -> str:
+    """Return a single canonical spelling for a raw ``model_used`` string.
+
+    OpenClaw usage payloads report the same model under several spellings: with
+    or without the ``openrouter/`` routing prefix, mixed casing, and dotted vs
+    hyphenated version suffixes (``claude-haiku-4.5`` vs ``claude-haiku-4-5``).
+    Grouping or pricing on the raw string splits one model into duplicate rows
+    and misses rate-table lookups, so both the write path (``record_usage``) and
+    the read path (``get_usage_summary``) canonicalize first and agree on a key.
+
+    Steps: trim + lowercase, strip a leading ``openrouter/`` routing prefix
+    (mirroring the dual keys enumerated in ``MODEL_RATES``), and rewrite dotted
+    version tokens (``-N.M`` → ``-N-M``). Provider slashes, ``:free`` suffixes,
+    and any non-version content are left untouched.
+    """
+    if not model_used:
+        return ""
+    canonical = model_used.strip().lower().removeprefix("openrouter/")
+    return _VERSION_DOT_RE.sub(r"-\1-\2", canonical)
+
+
+# ── Reasoning / slow-inference models ─────────────────────────────────────
+# These models have longer time-to-first-token and generation times.
+# The router gives them a higher forwarding timeout and sends a
+# "still thinking" notice so users know the system hasn't stalled.
+REASONING_MODELS: set[str] = {
+    DEEPSEEK_MODEL,
+    DEEPSEEK_MODEL.removeprefix("openrouter/"),
+    # Nemotron 3 Ultra (free): 550B frontier-reasoning model with a longer
+    # time-to-first-token, and free-tier rate limiting can stretch it further.
+    # Give it the reasoning timeout + "still thinking" notice so buffered
+    # delivery doesn't bail and trigger a fallback to a paid model mid-turn.
+    NEMOTRON_FREE_MODEL,
+    NEMOTRON_FREE_MODEL.removeprefix("openrouter/"),
+}
+
+# ── BYO slow models ──────────────────────────────────────────────────────
+# Anthropic Claude routed through OpenClaw's `claude` CLI backend on a
+# tenant's Pro/Max subscription. Cold-start of the CLI session plus the
+# full agent context (memory + journal + finance + fuel + google + line +
+# telegram MCP plugins) regularly takes 150s+ for the first turn after a
+# wake — well past the 120s default. These get the longer reasoning-model
+# timeout so buffered-delivery doesn't bail and trigger a QStash retry
+# storm that the OpenClaw CLI backend would then fall back off to MiniMax.
+BYO_SLOW_MODELS: set[str] = {
+    ANTHROPIC_SONNET_MODEL,
+    ANTHROPIC_OPUS_MODEL,
+}
+
+DEFAULT_CHAT_TIMEOUT = 120.0  # seconds — standard models
+REASONING_MODEL_TIMEOUT = 240.0  # seconds — reasoning + BYO Claude (within gunicorn 300s)
+
+# Monthly token budget (informational — enforcement uses TIER_COST_BUDGETS).
+TIER_TOKEN_BUDGETS: dict[str, int] = {
+    "starter": 5_000_000,
+}
+
+# Monthly cost budget in USD.  Enforcement compares
+# estimated_cost_this_month against this cap.
+TIER_COST_BUDGETS: dict[str, float] = {
+    # ~$5 of metered usage (DeepSeek V4 Pro @ $0.435/$0.87 per 1M).
+    # The cap amount itself is under review (business decision pending).
+    "starter": 5.00,
+}
+
+# ── Prepaid credit top-ups ─────────────────────────────────────────────────
+# Tenants can buy prepaid credit (USD) that EXTENDS their monthly included
+# allowance (TIER_COST_BUDGETS) once it's spent. Purchased credit persists
+# across months (does not reset, does not expire). See apps/billing/credits.py
+# and CONTINUITY_credits.md.
+#
+# Packs are SERVER-DEFINED and the ONLY thing the client may pick (by id). The
+# checkout endpoint and the webhook both re-derive the granted amount from this
+# table — never from client input or session metadata. ``price_cents`` is what
+# Stripe charges; ``credit_dollars`` is the usable credit granted. The price is
+# set above the credit value so the spread covers Stripe fees (2.9% + $0.30)
+# and a small platform margin — TUNE THESE for the margin you want; the only
+# hard invariant (enforced by a test) is price_cents >= credit_dollars * 100.
+
+CREDIT_PACKS: dict[str, dict] = {
+    "credit_5": {"price_cents": 600, "credit_dollars": Decimal("5.00"), "label": "$5 of credit"},
+    "credit_10": {"price_cents": 1100, "credit_dollars": Decimal("10.00"), "label": "$10 of credit"},
+    "credit_25": {"price_cents": 2700, "credit_dollars": Decimal("25.00"), "label": "$25 of credit"},
+}

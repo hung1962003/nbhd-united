@@ -1,0 +1,28 @@
+Hi {{ display_name }},
+
+Chat in the NBHD app on your iPhone — or connect Telegram or LINE.
+
+Your assistant is set up. If you signed up on your iPhone, just open the NBHD app — your assistant is already saying hello. Prefer messaging apps? Connect Telegram or LINE from your dashboard and chat there too.
+
+Open the NBHD app:
+
+  {{ app_store_url }}
+
+Connect Telegram or LINE:
+
+  {{ settings_url }}
+
+Some things to try first:
+
+  • Ask     "What can you help me with?"
+  • Log     "I ran 5K this morning"
+  • Plan    "Remind me to drink water at 8am every day"
+  • Just chat   "Hi, who are you?"
+{% if video_url %}
+Prefer a quick walkthrough? Watch the 2-min intro:
+
+  {{ video_url }}
+{% endif %}
+Questions or stuck? Just reply to this email — we read every one.
+
+— NBHD United

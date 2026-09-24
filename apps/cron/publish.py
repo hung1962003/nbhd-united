@@ -1,0 +1,238 @@
+"""
+Helper to publish on-demand tasks via QStash.
+
+Replaces Celery's .delay() for async task execution. QStash sends an HTTP
+POST to the cron trigger endpoint, which executes the task synchronously.
+QStash handles retries natively (3 retries by default).
+
+For fan-out patterns (e.g. apply-pending-configs iterating all tenants),
+use ``publish_batch()`` to send all tasks in a single HTTP call instead
+of N serial calls that block the Django worker.
+"""
+
+from __future__ import annotations
+
+import logging
+from typing import Any
+
+import httpx
+from django.conf import settings
+
+logger = logging.getLogger(__name__)
+
+
+def _publish_log_context(task_name: str, args, kwargs):
+    context = {"task_name": task_name}
+    if task_name == "provision_tenant" and args:
+        context["tenant_id"] = str(args[0])
+    if "tenant_id" in kwargs:
+        context["tenant_id"] = str(kwargs["tenant_id"])
+    if "user_id" in kwargs:
+        context["user_id"] = str(kwargs["user_id"])
+    return context
+
+
+# QStash rejects an ``Upstash-Deduplication-Id`` header containing
+# whitespace or ``:`` with a 400 "DeduplicationId cannot contain ':'".
+# Caught these literal characters in the field; reject early with the
+# offending value so the failing call-site is unambiguous instead of
+# surfacing as a generic 400 deep inside the SDK.
+_DEDUP_FORBIDDEN = (":", " ", "\t", "\n", "\r")
+
+QSTASH_CONNECT_TIMEOUT_SECONDS = 2.5
+QSTASH_READ_TIMEOUT_SECONDS = 1.0
+QSTASH_WRITE_TIMEOUT_SECONDS = 1.0
+QSTASH_POOL_TIMEOUT_SECONDS = 0.25
+QSTASH_TOTAL_TIMEOUT_SECONDS = 10.0
+QSTASH_PUBLISH_RETRIES = 1
+QSTASH_RETRY_BACKOFF_MS = 100
+
+# One QStash client per (process, token). Constructing a client per publish
+# re-handshakes TLS to Upstash (~150-400ms) inside the request that called
+# publish_task — pure per-message latency. httpx.Client (used internally by
+# the SDK) is thread-safe, so sharing across gthread workers is fine.
+_qstash_client: tuple[str, Any] | None = None
+
+
+def _get_qstash_client(token: str):
+    global _qstash_client
+    if _qstash_client is None or _qstash_client[0] != token:
+        from qstash import QStash
+
+        client = QStash(
+            token=token,
+            retry={
+                "retries": QSTASH_PUBLISH_RETRIES,
+                "backoff": lambda _attempt: QSTASH_RETRY_BACKOFF_MS,
+            },
+        )
+        # qstash-py 3.4 does not expose timeout injection. Replace its private
+        # transport client explicitly: the SDK default is 5s connect, 600s for
+        # all other phases, plus five retries — far beyond request budgets.
+        client.http._client.close()
+        client.http._client = httpx.Client(
+            timeout=httpx.Timeout(
+                connect=QSTASH_CONNECT_TIMEOUT_SECONDS,
+                read=QSTASH_READ_TIMEOUT_SECONDS,
+                write=QSTASH_WRITE_TIMEOUT_SECONDS,
+                pool=QSTASH_POOL_TIMEOUT_SECONDS,
+            )
+        )
+        _qstash_client = (token, client)
+    return _qstash_client[1]
+
+
+def publish_task(
+    task_name: str,
+    *args,
+    idempotency_key: str | None = None,
+    delay_seconds: int | None = None,
+    retries: int | None = None,
+    **kwargs,
+):
+    """
+    Publish a one-off task to QStash for async execution.
+
+    This replaces `some_task.delay(arg1, arg2)` with
+    `publish_task("some_task", arg1, arg2)`.
+
+    Args:
+        task_name: URL-safe task name (must be in TASK_MAP).
+        idempotency_key: Optional key for QStash deduplication. QStash will
+            discard duplicate messages with the same key within a time window.
+            Use this for broadcast-style tasks to prevent double delivery.
+            Must not contain ``:`` or whitespace — QStash rejects either
+            with a 400 ``"DeduplicationId cannot contain ':'"``.
+        retries: Optional QStash retry count. Defaults to 3 (QStash's
+            default). Set to 0 or 1 for tasks that already do their own
+            application-level retry / per-message attempt cap and where
+            external retries would compound the problem (e.g. duplicate
+            chat completions while a slow turn is still in flight).
+        *args, **kwargs: Arguments passed to the task function.
+    """
+    if idempotency_key is not None and any(c in idempotency_key for c in _DEDUP_FORBIDDEN):
+        raise ValueError(
+            f"idempotency_key={idempotency_key!r} contains a character QStash rejects "
+            f"in 'Upstash-Deduplication-Id' (':' or whitespace). Use '-' or '_' instead."
+        )
+
+    qstash_token = getattr(settings, "QSTASH_TOKEN", "")
+    api_base_url = getattr(settings, "API_BASE_URL", "")
+    log_context = _publish_log_context(task_name, args, kwargs)
+
+    if not qstash_token or not api_base_url:
+        # Fallback: execute synchronously (useful in development)
+        logger.warning(
+            "QStash not configured - executing task synchronously",
+            extra=log_context,
+        )
+        from .views import TASK_MAP, execute_task_sync
+
+        task_path = TASK_MAP[task_name]
+        return execute_task_sync(task_path, *args, **kwargs)
+
+    try:
+        client = _get_qstash_client(qstash_token)
+        url = f"{api_base_url}/api/cron/trigger/{task_name}/"
+
+        publish_kwargs: dict = {
+            "url": url,
+            "body": {"args": list(args), "kwargs": kwargs},
+            "retries": retries if retries is not None else 3,
+        }
+        if idempotency_key:
+            publish_kwargs["deduplication_id"] = idempotency_key
+        if delay_seconds:
+            publish_kwargs["delay"] = f"{delay_seconds}s"
+
+        client.message.publish_json(**publish_kwargs)
+        logger.info(
+            "Published task to QStash",
+            extra={**log_context, "url": url},
+        )
+    except Exception:
+        logger.exception("Failed to publish task to QStash", extra=log_context)
+        raise
+
+
+def publish_batch(
+    tasks: list[tuple[str, tuple, dict[str, Any]] | tuple[str, tuple, dict[str, Any], str]],
+    delay_seconds: int | None = None,
+) -> int:
+    """
+    Publish multiple tasks to QStash in a single HTTP call.
+
+    Each task is a tuple of ``(task_name, args, kwargs)`` or
+    ``(task_name, args, kwargs, deduplication_id)``.  Uses QStash's
+    ``batch_json`` API to avoid serial HTTP calls that block the Django
+    worker.
+
+    Args:
+        delay_seconds: Optional delay before QStash delivers the messages.
+            Use this to ensure earlier batches complete before this batch runs.
+
+    Returns the number of successfully enqueued tasks.
+
+    Example::
+
+        publish_batch([
+            ("apply_single_tenant_config", (str(t.id),), {}),
+            ("broadcast_single_tenant", (str(t.id), msg), {}, "key-abc"),
+        ])
+    """
+    if not tasks:
+        return 0
+
+    # Validate dedup ids upfront so a malformed key fails identically in
+    # the sync-fallback (tests / dev) and the QStash path (prod) instead
+    # of slipping through unchecked when QSTASH_TOKEN is unset.
+    for task in tasks:
+        dedup_id = task[3] if len(task) > 3 else None
+        if dedup_id and any(c in dedup_id for c in _DEDUP_FORBIDDEN):
+            raise ValueError(
+                f"batch dedup_id={dedup_id!r} contains a character QStash rejects "
+                f"in 'Upstash-Deduplication-Id' (':' or whitespace)."
+            )
+
+    qstash_token = getattr(settings, "QSTASH_TOKEN", "")
+    api_base_url = getattr(settings, "API_BASE_URL", "")
+
+    if not qstash_token or not api_base_url:
+        logger.warning("QStash not configured - executing %d tasks synchronously", len(tasks))
+        from .views import TASK_MAP, execute_task_sync
+
+        count = 0
+        for task in tasks:
+            task_name, args, kwargs = task[0], task[1], task[2]
+            try:
+                task_path = TASK_MAP[task_name]
+                execute_task_sync(task_path, *args, **kwargs)
+                count += 1
+            except Exception:
+                logger.exception("Sync fallback failed for %s", task_name)
+        return count
+
+    try:
+        client = _get_qstash_client(qstash_token)
+        messages = []
+        for task in tasks:
+            task_name, args, kwargs = task[0], task[1], task[2]
+            dedup_id = task[3] if len(task) > 3 else None
+            url = f"{api_base_url}/api/cron/trigger/{task_name}/"
+            msg: dict[str, Any] = {
+                "url": url,
+                "body": {"args": list(args), "kwargs": kwargs},
+                "retries": 3,
+            }
+            if dedup_id:
+                msg["deduplication_id"] = dedup_id
+            if delay_seconds:
+                msg["delay"] = f"{delay_seconds}s"
+            messages.append(msg)
+
+        results = client.message.batch_json(messages)
+        logger.info("Batch published %d tasks to QStash", len(results))
+        return len(results)
+    except Exception:
+        logger.exception("Failed to batch publish %d tasks to QStash", len(tasks))
+        raise

@@ -1,0 +1,696 @@
+"""Telegram webhook endpoint — routes to correct OpenClaw instance."""
+
+import asyncio
+import hmac
+import json
+import logging
+
+from django.conf import settings
+from django.http import HttpResponse, HttpResponseBadRequest, HttpResponseForbidden, HttpResponseNotFound, JsonResponse
+from django.utils import timezone
+from django.views.decorators.csrf import csrf_exempt
+from django.views.decorators.http import require_POST
+
+from apps.billing.services import (
+    check_budget,
+    record_usage,
+    resolve_model_for_attribution,
+)
+from apps.common.eval_sink import suppresses_real_transport
+from apps.tenants.models import Tenant
+
+from .error_messages import error_msg
+from .lesson_callbacks import handle_lesson_callback
+from .services import (
+    extract_chat_id,
+    forward_to_openclaw,
+    handle_start_command,
+    is_rate_limited,
+    resolve_tenant_by_chat_id,
+    send_onboarding_link,
+)
+
+logger = logging.getLogger(__name__)
+
+
+def _capture_telegram_webhook_transcript(
+    tenant: Tenant,
+    *,
+    update_id: object,
+    raw_user_text: str,
+    result: object,
+) -> None:
+    """Fail-closed capture for the live Telegram webhook path."""
+    if not getattr(tenant, "recall_capture_enabled", False):
+        return
+
+    try:
+        from apps.pii.redactor import (
+            RedactionOutcome,
+            as_confirmed,
+            confirm_assistant_output,
+            redact_user_message_checked,
+        )
+        from apps.router.pending_queue import _extract_ai_response
+        from apps.transcripts.capture import (
+            capture_transcript_event,
+            derive_turn_id,
+            quarantine_transcript_event,
+        )
+        from apps.transcripts.models import TranscriptEvent
+
+        source_event_id = str(update_id or "")
+        turn_id = derive_turn_id(
+            tenant.id,
+            TranscriptEvent.SourceType.TELEGRAM_WEBHOOK,
+            source_event_id,
+        )
+        occurred_at = timezone.now()
+        user_outcome = redact_user_message_checked(raw_user_text, tenant)
+        confirmed_user = as_confirmed(user_outcome)
+        if confirmed_user is not None:
+            capture_transcript_event(
+                tenant=tenant,
+                source_type=TranscriptEvent.SourceType.TELEGRAM_WEBHOOK,
+                source_event_id=source_event_id,
+                role=TranscriptEvent.Role.USER,
+                channel=TranscriptEvent.Channel.TELEGRAM,
+                turn_id=turn_id,
+                occurred_at=occurred_at,
+                redaction=confirmed_user,
+                thread_key="telegram",
+            )
+        else:
+            quarantine_transcript_event(
+                tenant=tenant,
+                source_type=TranscriptEvent.SourceType.TELEGRAM_WEBHOOK,
+                source_event_id=source_event_id,
+                channel=TranscriptEvent.Channel.TELEGRAM,
+                outcome=user_outcome,
+                turn_id=turn_id,
+                occurred_at=occurred_at,
+                thread_key="telegram",
+            )
+
+        assistant_text = _extract_ai_response(result)
+        if assistant_text:
+            assistant_occurred_at = timezone.now()
+            confirmed_assistant = confirm_assistant_output(tenant, assistant_text)
+            if confirmed_assistant is not None:
+                capture_transcript_event(
+                    tenant=tenant,
+                    source_type=TranscriptEvent.SourceType.ASSISTANT_REPLY,
+                    source_event_id=source_event_id,
+                    role=TranscriptEvent.Role.ASSISTANT,
+                    channel=TranscriptEvent.Channel.TELEGRAM,
+                    turn_id=turn_id,
+                    occurred_at=assistant_occurred_at,
+                    redaction=confirmed_assistant,
+                    thread_key="telegram",
+                    # The webhook response asks Telegram to send this reply; no
+                    # transport success is observable inside this request.
+                    delivery_state="",
+                    model_response_ref=(str(result.get("id") or "") if isinstance(result, dict) else ""),
+                )
+            else:
+                quarantine_transcript_event(
+                    tenant=tenant,
+                    source_type=TranscriptEvent.SourceType.ASSISTANT_REPLY,
+                    source_event_id=source_event_id,
+                    channel=TranscriptEvent.Channel.TELEGRAM,
+                    outcome=RedactionOutcome(
+                        text="",
+                        confirmed=False,
+                        reason="assistant-confirm-failed",
+                    ),
+                    turn_id=turn_id,
+                    occurred_at=assistant_occurred_at,
+                    thread_key="telegram",
+                )
+    except Exception:
+        logger.exception(
+            "telegram_webhook: transcript capture failed tenant=%s update=%s",
+            str(tenant.id)[:8],
+            str(update_id)[:32],
+        )
+
+
+def _coerce_non_negative_int(value: object) -> int:
+    if isinstance(value, bool):
+        return 0
+    if isinstance(value, int) and value >= 0:
+        return value
+    if isinstance(value, float) and value.is_integer() and value >= 0:
+        return int(value)
+    if isinstance(value, str):
+        value = value.strip()
+        if not value:
+            return 0
+        try:
+            parsed = int(value)
+        except ValueError:
+            try:
+                parsed_float = float(value)
+            except ValueError:
+                return 0
+            if parsed_float.is_integer():
+                return int(parsed_float)
+            return 0
+        return parsed if parsed >= 0 else 0
+    return 0
+
+
+def _extract_usage_payload(payload: object) -> dict[str, object]:
+    if not isinstance(payload, dict):
+        return {}
+
+    usage_payload = payload.get("usage")
+    if isinstance(usage_payload, dict):
+        return usage_payload
+
+    result_payload = payload.get("result")
+    if isinstance(result_payload, dict):
+        nested = result_payload.get("usage")
+        if isinstance(nested, dict):
+            return nested
+
+    return {}
+
+
+def _record_usage_from_openclaw_result(tenant: Tenant, result: object) -> None:
+    if not isinstance(result, dict):
+        return
+
+    usage = _extract_usage_payload(result)
+    if not usage:
+        logger.warning(
+            "USAGE_MISSING tenant=%s result_keys=%s — OpenClaw response has no usage payload",
+            tenant.id,
+            list(result.keys()),
+        )
+        return
+
+    input_tokens = _coerce_non_negative_int(usage.get("input_tokens", usage.get("input")))
+    output_tokens = _coerce_non_negative_int(usage.get("output_tokens", usage.get("output")))
+    model_used = resolve_model_for_attribution(tenant, result)
+
+    if not (input_tokens or output_tokens):
+        logger.warning(
+            "USAGE_ZERO tenant=%s model=%s usage_keys=%s — usage payload present but token counts are zero",
+            tenant.id,
+            model_used,
+            list(usage.keys()),
+        )
+
+    try:
+        record_usage(
+            tenant=tenant,
+            event_type="message",
+            input_tokens=input_tokens,
+            output_tokens=output_tokens,
+            model_used=model_used,
+        )
+    except Exception:
+        logger.exception("Failed to record usage for tenant=%s after OpenClaw callback", tenant.id)
+
+
+def _hibernate_for_quota(tenant: Tenant) -> None:
+    """Hibernate a tenant's container when they exceed their budget.
+
+    Skips if already hibernated. Uses the same deactivation path as idle
+    hibernation so the container can be re-woken when budget resets.
+
+    Also fires the branded cap-exhausted email (PR #1.8) so the tenant
+    has an inbox artifact explaining when chat resumes — the in-channel
+    Telegram/LINE notification from ``_build_budget_exhausted_message``
+    is the immediate signal, the email is the durable one.
+    Email dispatch is idempotent via ``Tenant.cost_exhausted_email_sent_at``
+    and won't double-fire if this helper is called multiple times in a
+    cap cycle.
+    """
+    if tenant.hibernated_at or not tenant.container_id:
+        return
+    try:
+        from apps.orchestrator.azure_client import hibernate_container_app
+
+        hibernate_container_app(tenant.container_id)
+        Tenant.objects.filter(id=tenant.id).update(
+            hibernated_at=timezone.now(),
+        )
+        logger.info("Hibernated container %s — tenant over budget", tenant.container_id)
+    except Exception:
+        logger.exception("Failed to hibernate over-budget container %s", tenant.container_id)
+
+    try:
+        from apps.router.billing_quota_handlers import send_cost_exhausted_email
+
+        send_cost_exhausted_email(tenant)
+    except Exception:
+        logger.exception(
+            "_hibernate_for_quota: cap-exhausted email dispatch failed for tenant=%s",
+            str(tenant.id)[:8],
+        )
+
+
+def _build_budget_exhausted_message(chat_id: int, tenant: Tenant, reason: str) -> dict:
+    frontend_url = getattr(settings, "FRONTEND_URL", "https://neighborhoodunited.org").rstrip("/")
+    lang = tenant.user.language or "en"
+
+    if reason == "global":
+        msg_key = "budget_unavailable"
+        kwargs: dict[str, str] = {}
+    else:
+        msg_key = "budget_exhausted_trial" if tenant.is_trial else "budget_exhausted_paid"
+        kwargs = {"plus_message": "", "billing_url": f"{frontend_url}/billing"}
+
+    return {
+        "method": "sendMessage",
+        "chat_id": chat_id,
+        "text": error_msg(lang, msg_key, **kwargs),
+    }
+
+
+@csrf_exempt
+@require_POST
+def telegram_webhook(request):
+    """Receive Telegram updates and route to the correct OpenClaw instance.
+
+    This is the single webhook endpoint for the shared Telegram bot.
+    It looks up chat_id → container and forwards the update.
+    """
+    # Verify webhook secret
+    configured_secret = (settings.TELEGRAM_WEBHOOK_SECRET or "").strip()
+    if not configured_secret:
+        logger.error("TELEGRAM_WEBHOOK_SECRET is not configured")
+        return HttpResponse("Webhook secret not configured", status=503)
+
+    secret = request.headers.get("X-Telegram-Bot-Api-Secret-Token", "")
+    if not hmac.compare_digest(secret, configured_secret):
+        return HttpResponseForbidden("Invalid secret")
+
+    # Telegram webhooks are unauthenticated — set service-role so
+    # resolve_tenant_by_chat_id and record_usage can read/write RLS tables.
+    from apps.tenants.middleware import set_rls_context
+
+    set_rls_context(service_role=True)
+
+    try:
+        update = json.loads(request.body)
+    except json.JSONDecodeError:
+        return HttpResponseBadRequest("Invalid JSON")
+
+    # Idempotency gate — Telegram retries a webhook delivery until it
+    # gets a 2xx, so a slow turn or a transient error means the same
+    # update_id arrives again. Claim it before any side effect; a
+    # duplicate is acked with a plain 200 so Telegram stops retrying.
+    from apps.router.inbound_dedup import claim_inbound_event
+
+    update_id = update.get("update_id")
+    capture_source_payload = {
+        "provider_event_id": update_id,
+        "redaction": {
+            "confirmed": False,
+            "reason": "seam-unredacted",
+        },
+    }
+    if update_id and not claim_inbound_event(f"tg:{update_id}"):
+        logger.info("Telegram webhook: skipping duplicate update %s", update_id)
+        return HttpResponse("ok")
+
+    # Handle /start TOKEN for account linking (before routing)
+    link_response = handle_start_command(update)
+    if link_response:
+        link_chat_id = extract_chat_id(update)
+        linked_tenant = resolve_tenant_by_chat_id(link_chat_id) if link_chat_id else None
+        if linked_tenant is not None and suppresses_real_transport(linked_tenant):
+            logger.warning(
+                "Telegram webhook: dropping eval-sink update tenant=%s",
+                linked_tenant.id,
+            )
+            return HttpResponse(status=200)
+        return JsonResponse(link_response)
+
+    chat_id = extract_chat_id(update)
+    if not chat_id:
+        return HttpResponse("ok")
+
+    if is_rate_limited(chat_id):
+        logger.warning("Rate limited chat_id %s", chat_id)
+        return HttpResponse("Too many requests", status=429)
+
+    tenant = resolve_tenant_by_chat_id(chat_id)
+
+    if tenant is not None and suppresses_real_transport(tenant):
+        logger.warning(
+            "Telegram webhook: dropping eval-sink update tenant=%s",
+            tenant.id,
+        )
+        return HttpResponse(status=200)
+
+    # Handle inline button callbacks (lessons, extraction)
+    if "callback_query" in update and tenant is not None:
+        callback_data = update["callback_query"].get("data", "")
+        if callback_data.startswith("lesson:"):
+            return handle_lesson_callback(update, tenant)
+        if callback_data.startswith("extract:"):
+            from apps.router.extraction_callbacks import handle_extraction_callback
+
+            return handle_extraction_callback(update, tenant)
+        if callback_data.startswith("task_action:"):
+            from apps.router.task_action_callbacks import handle_task_action_callback
+
+            return handle_task_action_callback(update, tenant)
+        if callback_data.startswith("friend:"):
+            from apps.router.friends_callbacks import handle_friend_callback
+
+            return handle_friend_callback(update, tenant)
+
+    # Unknown/inactive users are guided through onboarding.
+    if not tenant:
+        # Unknown user — send onboarding link
+        response_data = send_onboarding_link(chat_id)
+        logger.info("Unknown chat_id %s, sending onboarding link", chat_id)
+        return JsonResponse(response_data)
+
+    # Provisioning tenant — assistant is still waking up
+    if tenant.status in (Tenant.Status.PENDING, Tenant.Status.PROVISIONING):
+        lang = tenant.user.language or "en"
+        return JsonResponse(
+            {
+                "method": "sendMessage",
+                "chat_id": chat_id,
+                "text": error_msg(lang, "waking_up"),
+            }
+        )
+
+    frontend_url = getattr(settings, "FRONTEND_URL", "https://neighborhoodunited.org").rstrip("/")
+    if tenant.status == Tenant.Status.SUSPENDED and not tenant.is_trial and not bool(tenant.stripe_subscription_id):
+        lang = tenant.user.language or "en"
+        return JsonResponse(
+            {
+                "method": "sendMessage",
+                "chat_id": chat_id,
+                "text": error_msg(
+                    lang,
+                    "suspended",
+                    billing_url=f"{frontend_url}/settings/billing",
+                ),
+            }
+        )
+
+    # Budget check — before wake so we don't start a container just to block it
+    budget_reason = check_budget(tenant)
+    if budget_reason:
+        _hibernate_for_quota(tenant)
+        return JsonResponse(_build_budget_exhausted_message(chat_id, tenant, budget_reason))
+
+    # Hibernated tenant — buffer message and wake container
+    from apps.router.wake_on_message import (
+        ACK_FRESH,
+        ACK_RECONNECT,
+        SILENT,
+        handle_hibernated_message,
+    )
+
+    msg_text = (update.get("message") or {}).get("text", "")
+    wake_result = handle_hibernated_message(
+        tenant,
+        "telegram",
+        update,
+        msg_text,
+    )
+    if wake_result == ACK_FRESH:
+        lang = tenant.user.language or "en"
+        return JsonResponse(
+            {
+                "method": "sendMessage",
+                "chat_id": chat_id,
+                "text": error_msg(lang, "hibernation_waking"),
+            }
+        )
+    elif wake_result == ACK_RECONNECT:
+        lang = tenant.user.language or "en"
+        return JsonResponse(
+            {
+                "method": "sendMessage",
+                "chat_id": chat_id,
+                "text": error_msg(lang, "hibernation_reconnecting"),
+            }
+        )
+    elif wake_result == SILENT:
+        return HttpResponse("ok")
+
+    tenant.last_message_at = timezone.now()
+    tenant.save(update_fields=["last_message_at"])
+
+    # Forward to the correct OpenClaw instance
+    loop = asyncio.new_event_loop()
+    try:
+        user_timezone = tenant.user.timezone or "UTC"
+
+        # Inject current time into message text so the agent knows "now"
+        # Surface any proactive outbound sent to this user in the last
+        # 24h so the agent can thread the reply back to it. Tenant-scoped
+        # (transport-agnostic) — see apps.router.proactive_context.
+        from apps.router.proactive_context import surface_proactive_context
+        from apps.router.services import (
+            build_chat_context_marker,
+            build_datetime_context,
+            get_forwarding_timeout,
+        )
+
+        proactive_block = surface_proactive_context(tenant=tenant)
+
+        msg = update.get("message") or update.get("edited_message") or {}
+        # Capture the user's original text BEFORE the in-place decoration below
+        # so the conversation digest stores real content, not agent markers.
+        raw_user_text = msg.get("text") or msg.get("caption") or ""
+        if "text" in msg:
+            # Mark this as a conversational turn (not a scheduled cron run)
+            # so the agent skips the heavy AGENTS.md "Session Start"
+            # auto-context-load. See poller.py for the parallel comment.
+            msg["text"] = (
+                proactive_block
+                + build_datetime_context(user_timezone)
+                + build_chat_context_marker("telegram")
+                + msg["text"]
+            )
+
+        # Reasoning models need more time; the agent replies directly via bot
+        # token even if this times out, but a longer window lets us capture
+        # the result for usage tracking.
+        _chat_timeout, is_reasoning = get_forwarding_timeout(tenant)
+        wh_timeout = 120.0 if is_reasoning else 30.0
+
+        result = loop.run_until_complete(
+            forward_to_openclaw(
+                tenant.container_fqdn,
+                update,
+                user_timezone=user_timezone,
+                timeout=wh_timeout,
+                max_retries=1,
+                retry_delay=5.0,
+            )
+        )
+    finally:
+        loop.close()
+
+    if result:
+        _record_usage_from_openclaw_result(tenant, result)
+        _capture_telegram_webhook_transcript(
+            tenant,
+            update_id=update_id,
+            raw_user_text=raw_user_text,
+            result=result,
+        )
+        # Capture the turn for the USER.md "Conversation so far" digest so
+        # isolated crons see it. Webhook mode is latent in prod (single-revision
+        # poller) but covered per the all-channels rule. Fail-open.
+        try:
+            from apps.router.conversation_capture import clean_reply_for_capture, record_conversation_turn
+            from apps.router.pending_queue import _extract_ai_response
+
+            record_conversation_turn(
+                tenant=tenant,
+                channel="telegram",
+                channel_user_id=str(chat_id),
+                user_text=raw_user_text,
+                reply_text=clean_reply_for_capture(tenant, _extract_ai_response(result)),
+                source_payload=capture_source_payload,
+            )
+        except Exception:
+            logger.exception("telegram_webhook: conversation capture failed (non-fatal)")
+        return JsonResponse(result)
+    # Forwarding timed out — the agent likely received the message and will
+    # reply asynchronously via the bot token.  Silently ack to Telegram
+    # instead of sending a confusing "try again" message.
+    return HttpResponse("ok")
+
+
+# ── Chart image serving (for LINE image messages) ─────────────────────────
+
+
+@csrf_exempt
+def serve_chart_image(request, tenant_id, filename):
+    """Serve a chart PNG from a tenant's Azure File Share.
+
+    No authentication — security is provided by unguessable filenames
+    (UUID-based).  LINE's servers fetch this URL to deliver image messages.
+    """
+    import re
+
+    if request.method != "GET":
+        return HttpResponseBadRequest("GET only")
+
+    # Validate filename to prevent path traversal
+    if not re.match(r"^[\w-]+\.png$", filename):
+        return HttpResponseNotFound("Not found")
+
+    try:
+        from apps.orchestrator.azure_client import _is_mock
+
+        if _is_mock():
+            return HttpResponseNotFound("Not found (mock)")
+
+        account_name = str(getattr(settings, "AZURE_STORAGE_ACCOUNT_NAME", "") or "").strip()
+        if not account_name:
+            return HttpResponseNotFound("Not found")
+
+        from azure.storage.fileshare import ShareFileClient
+
+        from apps.orchestrator.azure_client import get_storage_client
+
+        storage_client = get_storage_client()
+        keys = storage_client.storage_accounts.list_keys(
+            settings.AZURE_RESOURCE_GROUP,
+            account_name,
+        )
+        account_key = keys.keys[0].value
+        share_name = f"ws-{str(tenant_id)[:20]}"
+
+        file_client = ShareFileClient(
+            account_url=f"https://{account_name}.file.core.windows.net",
+            share_name=share_name,
+            file_path=f"workspace/charts/{filename}",
+            credential=account_key,
+        )
+        data = file_client.download_file().readall()
+
+        response = HttpResponse(data, content_type="image/png")
+        response["Cache-Control"] = "public, max-age=3600"
+        return response
+
+    except Exception:
+        logger.exception("Failed to serve chart %s for tenant %s", filename, tenant_id)
+        return HttpResponseNotFound("Not found")
+
+
+# ── Meditation audio serving (Core pillar) ───────────────────────────────
+
+
+def _audio_range_response(data: bytes, content_type: str, range_header: str) -> HttpResponse:
+    """Build a Range-aware response for an in-memory audio file.
+
+    iOS ``AVPlayer`` (and Safari/WebKit, which share the same AVFoundation media
+    stack) needs HTTP Range support to establish a *finite* duration for a
+    progressively-served mp3. Without it the item duration stays ``indefinite``,
+    ``AVPlayerItemDidPlayToEndTime`` never fires, and the playhead runs past the
+    real end of the audio — the "meditation never stops / loops forever" bug.
+    Advertising ``Accept-Ranges`` and answering a ``Range:`` request with a 206
+    lets the player read the header, scrub, and stop cleanly at the true end.
+
+    Only a single ``bytes=start-end`` (or suffix ``bytes=-N``) range is honored —
+    the form every AVPlayer/browser audio probe uses; anything malformed falls
+    through to a full 200 (still with ``Accept-Ranges``).
+    """
+    size = len(data)
+    spec = (range_header or "").strip()
+    if spec.startswith("bytes="):
+        first = spec[len("bytes=") :].split(",", 1)[0].strip()
+        start_s, _, end_s = first.partition("-")
+        try:
+            if start_s == "":  # suffix range: last N bytes
+                start = max(0, size - int(end_s))
+                end = size - 1
+            else:
+                start = int(start_s)
+                end = int(end_s) if end_s else size - 1
+            end = min(end, size - 1)
+        except (ValueError, TypeError):
+            start, end = 0, size - 1  # malformed — serve the whole file below
+        else:
+            if start > end or start >= size:
+                resp = HttpResponse(status=416, content_type=content_type)
+                resp["Content-Range"] = f"bytes */{size}"
+                resp["Accept-Ranges"] = "bytes"
+                return resp
+            chunk = data[start : end + 1]
+            resp = HttpResponse(chunk, status=206, content_type=content_type)
+            resp["Content-Range"] = f"bytes {start}-{end}/{size}"
+            resp["Accept-Ranges"] = "bytes"
+            return resp
+    resp = HttpResponse(data, content_type=content_type)
+    resp["Accept-Ranges"] = "bytes"
+    return resp
+
+
+@csrf_exempt
+def serve_meditation_audio(request, tenant_id, filename):
+    """Serve a rendered meditation (mp3/ogg) from a tenant's Azure File Share.
+
+    No authentication — security is the unguessable UUID filename (same model as
+    ``serve_chart_image``). The web Core tab's ``<audio>`` element plays this URL,
+    and LINE/Telegram voice delivery fetches it.
+    """
+    import re
+
+    if request.method != "GET":
+        return HttpResponseBadRequest("GET only")
+
+    # Validate filename to prevent path traversal; only UUID-shaped mp3/ogg.
+    match = re.match(r"^[\w-]+\.(mp3|ogg)$", filename)
+    if not match:
+        return HttpResponseNotFound("Not found")
+    content_type = "audio/mpeg" if match.group(1) == "mp3" else "audio/ogg"
+
+    try:
+        from apps.orchestrator.azure_client import _is_mock
+
+        if _is_mock():
+            return HttpResponseNotFound("Not found (mock)")
+
+        account_name = str(getattr(settings, "AZURE_STORAGE_ACCOUNT_NAME", "") or "").strip()
+        if not account_name:
+            return HttpResponseNotFound("Not found")
+
+        from azure.storage.fileshare import ShareFileClient
+
+        from apps.orchestrator.azure_client import get_storage_client
+
+        storage_client = get_storage_client()
+        keys = storage_client.storage_accounts.list_keys(
+            settings.AZURE_RESOURCE_GROUP,
+            account_name,
+        )
+        account_key = keys.keys[0].value
+        share_name = f"ws-{str(tenant_id)[:20]}"
+
+        file_client = ShareFileClient(
+            account_url=f"https://{account_name}.file.core.windows.net",
+            share_name=share_name,
+            file_path=f"workspace/meditations/{filename}",
+            credential=account_key,
+        )
+        data = file_client.download_file().readall()
+
+        # Range-aware: advertise Accept-Ranges and answer Range probes with a 206
+        # so iOS AVPlayer / Safari can discover the true duration and stop at the
+        # end of the file. A full-body 200 leaves AVPlayer's duration indefinite —
+        # the playhead then overruns the real end and the sit appears to loop.
+        response = _audio_range_response(data, content_type, request.headers.get("Range", ""))
+        response["Cache-Control"] = "public, max-age=3600"
+        return response
+
+    except Exception:
+        logger.exception("Failed to serve meditation %s for tenant %s", filename, tenant_id)
+        return HttpResponseNotFound("Not found")

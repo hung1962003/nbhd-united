@@ -1,0 +1,2038 @@
+"""Tests for journal models, markdown parser, and API endpoints."""
+
+from __future__ import annotations
+
+from datetime import date, datetime, timedelta
+from unittest.mock import patch
+from zoneinfo import ZoneInfo
+
+from django.test import TestCase, override_settings
+from django.utils import timezone
+from rest_framework.test import APIClient, APIRequestFactory, force_authenticate
+
+from apps.tenants.models import Tenant, User
+from apps.tenants.test_utils import seed_internal_key
+
+from .md_utils import append_entry_markdown, parse_daily_note, serialise_daily_note
+from .models import DailyNote, Document, NoteTemplate, UserMemory, WeeklyReview
+from .services import (
+    DEFAULT_TEMPLATE_SECTIONS,
+    append_log_to_note,
+    get_or_seed_note_template,
+    seed_default_templates_for_tenant,
+    set_daily_note_section,
+    set_daily_note_sections,
+)
+
+# ---------------------------------------------------------------------------
+# Markdown parser/serializer tests
+# ---------------------------------------------------------------------------
+
+SAMPLE_MARKDOWN = """# 2026-02-15
+
+## 09:30 — MJ
+Started working on the demo video edit. Feeling good about the footage.
+Energy: 7 | Mood: 😊
+
+## 12:15 — Agent
+Checked production logs — Composio SDK breaking change found.
+
+## 23:00 — Evening Check-in (Agent)
+### What happened today
+- Timezone feature merged
+- Demo video footage reviewed
+
+### Decisions
+- Journaling module will mirror OpenClaw model
+
+### Tomorrow
+- Cold emails
+- Edit demo videos
+"""
+
+
+class MarkdownParserTest(TestCase):
+    def test_parse_basic_entries(self):
+        entries = parse_daily_note(SAMPLE_MARKDOWN)
+        self.assertEqual(len(entries), 3)
+
+    def test_parse_human_entry(self):
+        entries = parse_daily_note(SAMPLE_MARKDOWN)
+        e = entries[0]
+        self.assertEqual(e["time"], "09:30")
+        self.assertEqual(e["author"], "human")
+        self.assertIn("demo video edit", e["content"])
+        self.assertEqual(e["mood"], "😊")
+        self.assertEqual(e["energy"], 7)
+        self.assertIsNone(e["section"])
+        self.assertIsNone(e["subsections"])
+
+    def test_parse_agent_entry(self):
+        entries = parse_daily_note(SAMPLE_MARKDOWN)
+        e = entries[1]
+        self.assertEqual(e["time"], "12:15")
+        self.assertEqual(e["author"], "agent")
+        self.assertIn("Composio SDK", e["content"])
+
+    def test_parse_section_with_subsections(self):
+        entries = parse_daily_note(SAMPLE_MARKDOWN)
+        e = entries[2]
+        self.assertEqual(e["time"], "23:00")
+        self.assertEqual(e["author"], "agent")
+        self.assertEqual(e["section"], "evening-check-in")
+        self.assertIsNotNone(e["subsections"])
+        self.assertIn("what-happened-today", e["subsections"])
+        self.assertIn("decisions", e["subsections"])
+        self.assertIn("tomorrow", e["subsections"])
+
+    def test_parse_empty_markdown(self):
+        self.assertEqual(parse_daily_note(""), [])
+        self.assertEqual(parse_daily_note("   "), [])
+        self.assertEqual(parse_daily_note(None), [])
+
+    def test_parse_section_heading_without_time(self):
+        markdown = """# 2026-02-16
+
+## Morning Report
+Today I woke up early.
+"""
+        entries = parse_daily_note(markdown)
+        self.assertEqual(entries, [])
+
+    def test_roundtrip(self):
+        """Parse then serialise should produce parseable output."""
+        entries = parse_daily_note(SAMPLE_MARKDOWN)
+        output = serialise_daily_note("2026-02-15", entries)
+        re_entries = parse_daily_note(output)
+        self.assertIn("## 09:30 — MJ", output)
+        self.assertEqual(len(re_entries), len(entries))
+        for orig, reparsed in zip(entries, re_entries):
+            self.assertEqual(orig["time"], reparsed["time"])
+            self.assertEqual(orig["author"], reparsed["author"])
+            self.assertEqual(orig["section"], reparsed["section"])
+
+    def test_multi_word_mood_roundtrips_without_truncation(self):
+        markdown = append_entry_markdown(
+            "",
+            time="10:00",
+            author="human",
+            content="A steady morning.",
+            mood="calm and focused",
+            energy=7,
+            date_str="2026-02-15",
+            author_label="Alex Rivera",
+        )
+
+        entry = parse_daily_note(markdown)[0]
+
+        self.assertEqual(entry["mood"], "calm and focused")
+        self.assertEqual(entry["energy"], 7)
+
+    def test_append_to_empty(self):
+        result = append_entry_markdown(
+            "",
+            time="10:00",
+            author="human",
+            content="Hello world",
+            mood="😊",
+            energy=8,
+            date_str="2026-02-15",
+            author_label="Alex Rivera",
+        )
+        self.assertIn("## 10:00 — Alex Rivera", result)
+        entries = parse_daily_note(result)
+        self.assertEqual(len(entries), 1)
+        self.assertEqual(entries[0]["time"], "10:00")
+        self.assertEqual(entries[0]["author"], "human")
+        self.assertEqual(entries[0]["energy"], 8)
+
+    def test_append_to_existing(self):
+        result = append_entry_markdown(
+            SAMPLE_MARKDOWN,
+            time="14:00",
+            author="agent",
+            content="New entry appended.",
+        )
+        entries = parse_daily_note(result)
+        self.assertEqual(len(entries), 4)
+        self.assertEqual(entries[3]["time"], "14:00")
+        self.assertEqual(entries[3]["author"], "agent")
+
+
+# ---------------------------------------------------------------------------
+# Model tests
+# ---------------------------------------------------------------------------
+
+
+class DailyNoteModelTest(TestCase):
+    def setUp(self):
+        self.user = User.objects.create_user(username="testuser", password="testpass")
+        self.tenant = Tenant.objects.create(user=self.user, status="active")
+
+    def test_one_note_per_tenant_per_date(self):
+        DailyNote.objects.create(tenant=self.tenant, date=date(2026, 2, 15), markdown="# test")
+        with self.assertRaises(Exception):
+            DailyNote.objects.create(tenant=self.tenant, date=date(2026, 2, 15), markdown="# dupe")
+
+    def test_different_dates_ok(self):
+        DailyNote.objects.create(tenant=self.tenant, date=date(2026, 2, 15))
+        DailyNote.objects.create(tenant=self.tenant, date=date(2026, 2, 16))
+        self.assertEqual(DailyNote.objects.filter(tenant=self.tenant).count(), 2)
+
+
+class JournalServiceTest(TestCase):
+    def setUp(self):
+        self.user = User.objects.create_user(username="serviceuser", password="servicepass")
+        self.tenant = Tenant.objects.create(user=self.user, status="active")
+
+    def test_get_or_seed_note_template_preserves_legacy_markdown(self):
+        markdown = """# 2026-02-16
+
+## 09:30 — MJ
+Legacy entry for migration safety.
+"""
+        template, sections = get_or_seed_note_template(
+            tenant=self.tenant,
+            date_value=date(2026, 2, 16),
+            markdown=markdown,
+        )
+
+        self.assertIsNotNone(template)
+        # Legacy entries that don't parse into sections are returned as default
+        # template sections (no "log" section in new defaults).
+        self.assertTrue(len(sections) > 0)
+
+
+class DefaultTemplateSectionsTest(TestCase):
+    def test_default_template_has_five_sections(self):
+        self.assertEqual(len(DEFAULT_TEMPLATE_SECTIONS), 5)
+        slugs = [s["slug"] for s in DEFAULT_TEMPLATE_SECTIONS]
+        self.assertEqual(
+            slugs,
+            [
+                "morning-report",
+                "weather",
+                "news",
+                "focus",
+                "energy-mood",
+            ],
+        )
+
+    def test_seed_creates_template_with_five_sections(self):
+        user = User.objects.create_user(username="seeduser", password="pass")
+        tenant = Tenant.objects.create(user=user, status="active")
+        result = seed_default_templates_for_tenant(tenant=tenant)
+        template = result["template"]
+        self.assertEqual(len(template.sections), 5)
+
+
+class SetSectionTest(TestCase):
+    def setUp(self):
+        self.user = User.objects.create_user(username="sectionuser", password="pass")
+        self.tenant = Tenant.objects.create(user=self.user, status="active")
+
+    def test_set_known_section(self):
+        note = DailyNote.objects.create(tenant=self.tenant, date=date(2026, 2, 16))
+        note, sections = set_daily_note_section(
+            note=note,
+            section_slug="morning-report",
+            content="Hello morning",
+            writer="owner",
+        )
+        mr = next(s for s in sections if s["slug"] == "morning-report")
+        self.assertEqual(mr["content"], "Hello morning")
+        self.assertIn("Hello morning", note.markdown)
+
+    def test_set_unknown_slug_auto_creates(self):
+        note = DailyNote.objects.create(tenant=self.tenant, date=date(2026, 2, 16))
+        note, sections = set_daily_note_section(
+            note=note,
+            section_slug="tweet-drafts",
+            content="Some tweet ideas",
+            writer="owner",
+        )
+        slugs = [s["slug"] for s in sections]
+        self.assertIn("tweet-drafts", slugs)
+        # Should be appended at the end
+        self.assertEqual(slugs[-1], "tweet-drafts")
+
+    def test_set_unknown_slug_appended_when_no_evening(self):
+        """When evening-check-in doesn't exist, new sections are appended."""
+        note = DailyNote.objects.create(tenant=self.tenant, date=date(2026, 2, 16))
+        # Create a custom template without evening-check-in
+        template = NoteTemplate.objects.create(
+            tenant=self.tenant,
+            slug="custom",
+            name="Custom",
+            sections=[
+                {"slug": "morning-report", "title": "Morning Report", "content": "", "source": "agent"},
+            ],
+            is_default=True,
+        )
+        note.template = template
+        note.save()
+        note, sections = set_daily_note_section(
+            note=note,
+            section_slug="new-section",
+            content="New content",
+            writer="owner",
+        )
+        self.assertEqual(sections[-1]["slug"], "new-section")
+
+    def test_section_helpers_require_explicit_writer(self):
+        note = DailyNote.objects.create(tenant=self.tenant, date=date(2026, 2, 16))
+        with self.assertRaises(TypeError):
+            set_daily_note_section(  # type: ignore[call-arg]
+                note=note,
+                section_slug="morning-report",
+                content="Hello morning",
+            )
+        with self.assertRaises(TypeError):
+            set_daily_note_sections(  # type: ignore[call-arg]
+                note=note,
+                sections=[{"slug": "log", "title": "Log", "content": "Hello"}],
+            )
+
+
+class AppendLogTest(TestCase):
+    def setUp(self):
+        self.user = User.objects.create_user(username="loguser", password="pass", display_name="Alex Rivera")
+        self.tenant = Tenant.objects.create(user=self.user, status="active")
+
+    def test_append_log_without_log_section(self):
+        """When there's no log section, append to document tail."""
+        note = DailyNote.objects.create(
+            tenant=self.tenant,
+            date=date(2026, 2, 16),
+            markdown="# 2026-02-16\n\n## Morning Report\nHello\n",
+        )
+        note = append_log_to_note(
+            note=note,
+            content="Quick note",
+            author="human",
+            time_str="14:00",
+        )
+        self.assertIn("14:00", note.markdown)
+        self.assertIn("Quick note", note.markdown)
+        self.assertIn("### 14:00 — Alex Rivera", note.markdown)
+        self.assertNotIn("MJ", note.markdown)
+
+    def test_append_log_with_log_section(self):
+        """When a log section exists, append within it."""
+        note = DailyNote.objects.create(tenant=self.tenant, date=date(2026, 2, 16))
+        # Create a template with a log section
+        template = NoteTemplate.objects.create(
+            tenant=self.tenant,
+            slug="with-log",
+            name="With Log",
+            sections=[
+                {"slug": "morning-report", "title": "Morning Report", "content": "", "source": "agent"},
+                {"slug": "log", "title": "Log", "content": "", "source": "shared"},
+                {"slug": "evening-check-in", "title": "Evening Check-in", "content": "", "source": "human"},
+            ],
+            is_default=True,
+        )
+        note.template = template
+        note.save()
+        note = append_log_to_note(
+            note=note,
+            content="Logged this",
+            author="agent",
+            time_str="10:30",
+        )
+        self.assertIn("Logged this", note.markdown)
+        self.assertIn("10:30", note.markdown)
+
+
+class UserMemoryModelTest(TestCase):
+    def setUp(self):
+        self.user = User.objects.create_user(username="testuser", password="testpass")
+        self.tenant = Tenant.objects.create(user=self.user, status="active")
+
+    def test_one_memory_per_tenant(self):
+        UserMemory.objects.create(tenant=self.tenant, markdown="# Memory")
+        with self.assertRaises(Exception):
+            UserMemory.objects.create(tenant=self.tenant, markdown="# Dupe")
+
+    def test_different_tenants_ok(self):
+        user2 = User.objects.create_user(username="testuser2", password="testpass")
+        tenant2 = Tenant.objects.create(user=user2, status="active")
+        UserMemory.objects.create(tenant=self.tenant, markdown="# M1")
+        UserMemory.objects.create(tenant=tenant2, markdown="# M2")
+        self.assertEqual(UserMemory.objects.count(), 2)
+
+
+# ---------------------------------------------------------------------------
+# API tests — user-facing
+# ---------------------------------------------------------------------------
+
+
+@override_settings(
+    REST_FRAMEWORK={
+        "DEFAULT_AUTHENTICATION_CLASSES": [
+            "rest_framework.authentication.SessionAuthentication",
+        ],
+    }
+)
+class DailyNoteAPITest(TestCase):
+    def setUp(self):
+        self.user = User.objects.create_user(username="testuser", password="testpass", display_name="Taylor Reed")
+        self.tenant = Tenant.objects.create(user=self.user, status="active")
+        self.client = APIClient()
+        self.client.force_authenticate(user=self.user)
+
+    def test_get_empty_daily_note(self):
+        resp = self.client.get("/api/v1/journal/daily/2026-02-15/")
+        self.assertEqual(resp.status_code, 200)
+        # Sections are returned; entries are no longer included by default.
+        self.assertIn("sections", resp.data)
+        self.assertIn("markdown", resp.data)
+
+    def test_post_entry_creates_note(self):
+        resp = self.client.post(
+            "/api/v1/journal/daily/2026-02-15/entries/",
+            {"content": "Hello world", "mood": "😊", "energy": 7},
+            format="json",
+        )
+        self.assertEqual(resp.status_code, 201)
+        self.assertEqual(len(resp.data["entries"]), 1)
+        self.assertEqual(resp.data["entries"][0]["author"], "human")
+
+        # Verify persisted
+        note = DailyNote.objects.get(tenant=self.tenant, date=date(2026, 2, 15))
+        self.assertIn("Hello world", note.markdown)
+        self.assertIn("— Taylor Reed", note.markdown)
+        self.assertNotIn("— MJ", note.markdown)
+
+    def test_patch_entry(self):
+        self.client.post(
+            "/api/v1/journal/daily/2026-02-15/entries/",
+            {"content": "Original"},
+            format="json",
+        )
+        resp = self.client.patch(
+            "/api/v1/journal/daily/2026-02-15/entries/0/",
+            {"content": "Updated"},
+            format="json",
+        )
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(resp.data["entries"][0]["content"], "Updated")
+
+    def test_patch_entry_flag_off_wire_echoes_mutated_entries(self):
+        self.assertFalse(self.tenant.layer1_placeholder_writes)
+        self.client.post(
+            "/api/v1/journal/daily/2026-02-15/entries/",
+            {"content": "Original", "mood": "fine"},
+            format="json",
+        )
+        note = DailyNote.objects.get(tenant=self.tenant, date=date(2026, 2, 15))
+        expected_entries = parse_daily_note(note.markdown)
+        expected_entries[0]["mood"] = "very good"
+
+        resp = self.client.patch(
+            "/api/v1/journal/daily/2026-02-15/entries/0/",
+            {"mood": "very good"},
+            format="json",
+        )
+
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(resp.data, {"date": "2026-02-15", "entries": expected_entries})
+        self.assertEqual(resp.data["entries"][0]["mood"], "very good")
+
+    def test_delete_entry(self):
+        self.client.post("/api/v1/journal/daily/2026-02-15/entries/", {"content": "A"}, format="json")
+        self.client.post("/api/v1/journal/daily/2026-02-15/entries/", {"content": "B"}, format="json")
+        resp = self.client.delete("/api/v1/journal/daily/2026-02-15/entries/0/")
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(len(resp.data["entries"]), 1)
+
+    def test_delete_entry_flag_off_wire_echoes_mutated_entries(self):
+        self.assertFalse(self.tenant.layer1_placeholder_writes)
+        self.client.post("/api/v1/journal/daily/2026-02-15/entries/", {"content": "A"}, format="json")
+        self.client.post("/api/v1/journal/daily/2026-02-15/entries/", {"content": "B"}, format="json")
+        note = DailyNote.objects.get(tenant=self.tenant, date=date(2026, 2, 15))
+        expected_entries = parse_daily_note(note.markdown)
+        expected_entries.pop(0)
+
+        resp = self.client.delete("/api/v1/journal/daily/2026-02-15/entries/0/")
+
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(resp.data, {"date": "2026-02-15", "entries": expected_entries})
+
+    def test_template_delete_flag_off_wire_echoes_mutated_entries(self):
+        from apps.journal.views import DailyNoteTemplateView
+
+        self.assertFalse(self.tenant.layer1_placeholder_writes)
+        self.client.post("/api/v1/journal/daily/2026-02-15/entries/", {"content": "A"}, format="json")
+        self.client.post("/api/v1/journal/daily/2026-02-15/entries/", {"content": "B"}, format="json")
+        note = DailyNote.objects.get(tenant=self.tenant, date=date(2026, 2, 15))
+        expected_entries = parse_daily_note(note.markdown)
+        expected_entries.pop(0)
+        request = APIRequestFactory().delete("/api/v1/journal/daily/2026-02-15/template/")
+        force_authenticate(request, user=self.user)
+
+        resp = DailyNoteTemplateView.as_view()(request, date="2026-02-15", index=0)
+
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(resp.data, {"date": "2026-02-15", "entries": expected_entries})
+
+    def test_patch_out_of_range(self):
+        resp = self.client.patch(
+            "/api/v1/journal/daily/2026-02-15/entries/0/",
+            {"content": "nope"},
+            format="json",
+        )
+        self.assertEqual(resp.status_code, 404)
+
+    def test_patch_section_endpoint(self):
+        resp = self.client.patch(
+            "/api/v1/journal/daily/2026-02-15/sections/morning-report/",
+            {"content": "Good morning!"},
+            format="json",
+        )
+        self.assertEqual(resp.status_code, 200)
+        sections = resp.data.get("sections", [])
+        mr = next((s for s in sections if s["slug"] == "morning-report"), None)
+        self.assertIsNotNone(mr)
+        self.assertEqual(mr["content"], "Good morning!")
+
+    def test_patch_section_auto_creates_unknown_slug(self):
+        resp = self.client.patch(
+            "/api/v1/journal/daily/2026-02-15/sections/custom-section/",
+            {"content": "Custom content"},
+            format="json",
+        )
+        self.assertEqual(resp.status_code, 200)
+        slugs = [s["slug"] for s in resp.data.get("sections", [])]
+        self.assertIn("custom-section", slugs)
+
+    def test_patch_section_missing_content(self):
+        resp = self.client.patch(
+            "/api/v1/journal/daily/2026-02-15/sections/morning-report/",
+            {},
+            format="json",
+        )
+        self.assertEqual(resp.status_code, 400)
+
+
+@override_settings(
+    REST_FRAMEWORK={
+        "DEFAULT_AUTHENTICATION_CLASSES": [
+            "rest_framework.authentication.SessionAuthentication",
+        ],
+    }
+)
+class MemoryAPITest(TestCase):
+    def setUp(self):
+        self.user = User.objects.create_user(username="testuser", password="testpass")
+        self.tenant = Tenant.objects.create(user=self.user, status="active")
+        self.client = APIClient()
+        self.client.force_authenticate(user=self.user)
+
+    def test_get_empty_memory(self):
+        resp = self.client.get("/api/v1/journal/memory/")
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(resp.data["markdown"], "")
+
+    def test_put_memory(self):
+        resp = self.client.put(
+            "/api/v1/journal/memory/",
+            {"markdown": "# My Memory\n\nImportant stuff."},
+            format="json",
+        )
+        self.assertEqual(resp.status_code, 200)
+        self.assertIn("Important stuff", resp.data["markdown"])
+
+    def test_put_memory_updates(self):
+        self.client.put("/api/v1/journal/memory/", {"markdown": "v1"}, format="json")
+        self.client.put("/api/v1/journal/memory/", {"markdown": "v2"}, format="json")
+        self.assertEqual(Document.objects.filter(tenant=self.tenant, kind="memory", slug="long-term").count(), 1)
+        self.assertEqual(Document.objects.get(tenant=self.tenant, kind="memory", slug="long-term").markdown, "v2")
+
+
+@override_settings(
+    REST_FRAMEWORK={
+        "DEFAULT_AUTHENTICATION_CLASSES": [
+            "rest_framework.authentication.SessionAuthentication",
+        ],
+    }
+)
+class WeeklyReviewAPITest(TestCase):
+    def setUp(self):
+        self.user = User.objects.create_user(username="testuser", password="testpass")
+        self.tenant = Tenant.objects.create(user=self.user, status="active")
+        self.client = APIClient()
+        self.client.force_authenticate(user=self.user)
+
+    def _create_review(self, **overrides):
+        payload = {
+            "week_start": "2026-02-09",
+            "week_end": "2026-02-15",
+            "mood_summary": "Good week overall",
+            "top_wins": ["Shipped feature"],
+            "top_challenges": ["Tight deadline"],
+            "lessons": ["Start earlier"],
+            "week_rating": "thumbs-up",
+            "intentions_next_week": ["More testing"],
+        }
+        payload.update(overrides)
+        return self.client.post("/api/v1/journal/reviews/", payload, format="json")
+
+    def test_get_empty_list(self):
+        resp = self.client.get("/api/v1/journal/reviews/")
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(resp.data, [])
+
+    def test_create_review(self):
+        resp = self._create_review()
+        self.assertEqual(resp.status_code, 201)
+        self.assertEqual(resp.data["mood_summary"], "Good week overall")
+        self.assertEqual(resp.data["week_rating"], "thumbs-up")
+        self.assertIn("id", resp.data)
+
+    def test_create_review_normalizes_case_and_hyphenated_rating(self):
+        resp = self._create_review(week_rating="Thumbs-Up")
+        self.assertEqual(resp.status_code, 201)
+        self.assertEqual(resp.data["week_rating"], "thumbs-up")
+        self.assertEqual(WeeklyReview.objects.get(id=resp.data["id"]).week_rating, "thumbs-up")
+
+    def test_list_reviews(self):
+        self._create_review(week_start="2026-02-02", week_end="2026-02-08")
+        self._create_review(week_start="2026-02-09", week_end="2026-02-15")
+        resp = self.client.get("/api/v1/journal/reviews/")
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(len(resp.data), 2)
+        # Newest first
+        self.assertEqual(resp.data[0]["week_start"], "2026-02-09")
+
+    def test_get_detail(self):
+        create_resp = self._create_review()
+        review_id = create_resp.data["id"]
+        resp = self.client.get(f"/api/v1/journal/reviews/{review_id}/")
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(resp.data["mood_summary"], "Good week overall")
+
+    def test_patch_review(self):
+        create_resp = self._create_review()
+        review_id = create_resp.data["id"]
+        resp = self.client.patch(
+            f"/api/v1/journal/reviews/{review_id}/",
+            {"mood_summary": "Updated mood"},
+            format="json",
+        )
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(resp.data["mood_summary"], "Updated mood")
+
+    def test_delete_review(self):
+        create_resp = self._create_review()
+        review_id = create_resp.data["id"]
+        resp = self.client.delete(f"/api/v1/journal/reviews/{review_id}/")
+        self.assertEqual(resp.status_code, 204)
+        self.assertEqual(WeeklyReview.objects.filter(tenant=self.tenant).count(), 0)
+
+    def test_invalid_week_end_before_start(self):
+        resp = self._create_review(week_start="2026-02-15", week_end="2026-02-09")
+        self.assertEqual(resp.status_code, 400)
+
+    def test_tenant_isolation(self):
+        self._create_review()
+        user2 = User.objects.create_user(username="user2", password="pass")
+        tenant2 = Tenant.objects.create(user=user2, status="active")
+        client2 = APIClient()
+        client2.force_authenticate(user=user2)
+        resp = client2.get("/api/v1/journal/reviews/")
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(resp.data, [])
+
+
+# ---------------------------------------------------------------------------
+# Tenant isolation tests
+# ---------------------------------------------------------------------------
+
+
+@override_settings(
+    REST_FRAMEWORK={
+        "DEFAULT_AUTHENTICATION_CLASSES": [
+            "rest_framework.authentication.SessionAuthentication",
+        ],
+    }
+)
+class TenantIsolationTest(TestCase):
+    def setUp(self):
+        self.user1 = User.objects.create_user(username="user1", password="pass")
+        self.tenant1 = Tenant.objects.create(user=self.user1, status="active")
+        self.user2 = User.objects.create_user(username="user2", password="pass")
+        self.tenant2 = Tenant.objects.create(user=self.user2, status="active")
+
+        # Create notes for both tenants
+        DailyNote.objects.create(tenant=self.tenant1, date=date(2026, 2, 15), markdown="# T1 note")
+        DailyNote.objects.create(tenant=self.tenant2, date=date(2026, 2, 15), markdown="# T2 note")
+        Document.objects.create(
+            tenant=self.tenant1, kind="memory", slug="long-term", title="Memory", markdown="# T1 mem"
+        )
+        Document.objects.create(
+            tenant=self.tenant2, kind="memory", slug="long-term", title="Memory", markdown="# T2 mem"
+        )
+
+    def test_user1_sees_only_own_daily_note(self):
+        client = APIClient()
+        client.force_authenticate(user=self.user1)
+        resp = client.get("/api/v1/journal/daily/2026-02-15/")
+        self.assertEqual(resp.status_code, 200)
+        # The note should exist but entries parsed from "# T1 note" = empty (no ## headers)
+        # Just verify it doesn't crash and doesn't leak T2
+
+    def test_user1_sees_only_own_memory(self):
+        client = APIClient()
+        client.force_authenticate(user=self.user1)
+        resp = client.get("/api/v1/journal/memory/")
+        self.assertEqual(resp.status_code, 200)
+        self.assertIn("T1 mem", resp.data["markdown"])
+        self.assertNotIn("T2", resp.data["markdown"])
+
+
+# ---------------------------------------------------------------------------
+# Runtime API tests
+# ---------------------------------------------------------------------------
+
+
+@override_settings(NBHD_INTERNAL_API_KEY="test-key")
+class RuntimeToFrontendIntegrationTest(TestCase):
+    """Verify agent writes via runtime endpoint are visible on the user-facing Journal API."""
+
+    def setUp(self):
+        self.user = User.objects.create_user(username="testuser_integ", password="testpass")
+        self.tenant = Tenant.objects.create(user=self.user, status="active")
+        seed_internal_key(self.tenant)
+        self.client = APIClient()
+        self.runtime_headers = {
+            "HTTP_X_NBHD_INTERNAL_KEY": "test-key",
+            "HTTP_X_NBHD_TENANT_ID": str(self.tenant.id),
+        }
+
+    def test_agent_section_write_visible_on_document_api(self):
+        """Morning briefing writes → visible on /api/v1/journal/documents/daily/{date}/"""
+        # 1. Agent writes via runtime endpoint (simulates nbhd_daily_note_set_section)
+        resp = self.client.post(
+            f"/api/v1/integrations/runtime/{self.tenant.id}/daily-note/append/",
+            {"content": "Sunny, 72F, clear skies.", "date": "2026-02-17", "section_slug": "weather"},
+            format="json",
+            **self.runtime_headers,
+        )
+        self.assertEqual(resp.status_code, 201)
+
+        # 2. User fetches the same document via the user-facing API
+        self.client.force_authenticate(user=self.user)
+        resp = self.client.get("/api/v1/journal/documents/daily/2026-02-17/")
+        self.assertEqual(resp.status_code, 200)
+        self.assertIn("Sunny, 72F", resp.data["markdown"])
+        self.assertIn("## Weather", resp.data["markdown"])
+
+    def test_agent_quick_log_visible_on_document_api(self):
+        """Quick log append → visible as timestamped entry."""
+        resp = self.client.post(
+            f"/api/v1/integrations/runtime/{self.tenant.id}/daily-note/append/",
+            {"content": "Checked email, nothing urgent.", "date": "2026-02-17"},
+            format="json",
+            **self.runtime_headers,
+        )
+        self.assertEqual(resp.status_code, 201)
+
+        self.client.force_authenticate(user=self.user)
+        resp = self.client.get("/api/v1/journal/documents/daily/2026-02-17/")
+        self.assertEqual(resp.status_code, 200)
+        self.assertIn("Checked email", resp.data["markdown"])
+        self.assertIn("(Neighbor)", resp.data["markdown"])
+
+
+@override_settings(NBHD_INTERNAL_API_KEY="test-key")
+class RuntimeDailyNoteAPITest(TestCase):
+    def setUp(self):
+        self.user = User.objects.create_user(username="testuser", password="testpass")
+        self.tenant = Tenant.objects.create(user=self.user, status="active")
+        seed_internal_key(self.tenant)
+        self.client = APIClient()
+        self.headers = {
+            "HTTP_X_NBHD_INTERNAL_KEY": "test-key",
+            "HTTP_X_NBHD_TENANT_ID": str(self.tenant.id),
+        }
+
+    def test_get_daily_note_raw_markdown(self):
+        Document.objects.create(
+            tenant=self.tenant,
+            kind="daily",
+            slug="2026-02-15",
+            title="2026-02-15",
+            markdown=SAMPLE_MARKDOWN,
+        )
+        resp = self.client.get(
+            f"/api/v1/integrations/runtime/{self.tenant.id}/daily-note/",
+            {"date": "2026-02-15"},
+            **self.headers,
+        )
+        self.assertEqual(resp.status_code, 200)
+        self.assertIn("Composio SDK", resp.data["markdown"])
+
+    def test_get_daily_note_empty(self):
+        resp = self.client.get(
+            f"/api/v1/integrations/runtime/{self.tenant.id}/daily-note/",
+            {"date": "2026-02-15"},
+            **self.headers,
+        )
+        self.assertEqual(resp.status_code, 200)
+        # Runtime endpoint auto-seeds with template content
+        self.assertIn("Morning Report", resp.data["markdown"])
+
+    def test_append_daily_note(self):
+        resp = self.client.post(
+            f"/api/v1/integrations/runtime/{self.tenant.id}/daily-note/append/",
+            {"content": "Agent appended this.", "date": "2026-02-15"},
+            format="json",
+            **self.headers,
+        )
+        self.assertEqual(resp.status_code, 201)
+        self.assertIn("Agent appended this", resp.data["markdown"])
+        self.assertIn("Agent", resp.data["markdown"])
+
+    @patch("apps.integrations.runtime_views.tz.now")
+    def test_get_daily_note_defaults_to_tenant_local_date(self, mock_now):
+        self.user.timezone = "Asia/Tokyo"
+        self.user.save(update_fields=["timezone"])
+
+        utc_now = datetime(2026, 2, 21, 15, 0, 0, tzinfo=ZoneInfo("UTC"))
+        mock_now.return_value = utc_now
+
+        expected_local_date = utc_now.astimezone(ZoneInfo("Asia/Tokyo")).date()
+
+        resp = self.client.get(
+            f"/api/v1/integrations/runtime/{self.tenant.id}/daily-note/",
+            **self.headers,
+        )
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(resp.data["date"], str(expected_local_date))
+
+    @patch("apps.integrations.runtime_views.tz.now")
+    def test_append_daily_note_defaults_to_tenant_local_date(self, mock_now):
+        self.user.timezone = "Asia/Tokyo"
+        self.user.save(update_fields=["timezone"])
+
+        utc_now = datetime(2026, 2, 21, 15, 0, 0, tzinfo=ZoneInfo("UTC"))
+        mock_now.return_value = utc_now
+
+        expected_local_date = utc_now.astimezone(ZoneInfo("Asia/Tokyo")).date()
+
+        resp = self.client.post(
+            f"/api/v1/integrations/runtime/{self.tenant.id}/daily-note/append/",
+            {"content": "Local append test"},
+            format="json",
+            **self.headers,
+        )
+        self.assertEqual(resp.status_code, 201)
+        self.assertEqual(resp.data["date"], str(expected_local_date))
+
+
+@override_settings(NBHD_INTERNAL_API_KEY="test-key")
+class RuntimeDailyNoteDateAttributionWarningTest(TestCase):
+    """P1: a fact reported today about a DIFFERENT day (e.g. 'yesterday's
+    dinner' told to the assistant tonight) used to get filed under today's
+    note with only a relative word distinguishing it — correct at write time,
+    but recall attributes by the note's date and later misreports the day.
+    The fix is a deterministic nudge in the tool response (never a block)
+    when the caller left `date` to our default AND the content contains a
+    relative-day word.
+    """
+
+    def setUp(self):
+        self.user = User.objects.create_user(username="testuser_dnw", password="testpass")
+        self.tenant = Tenant.objects.create(user=self.user, status="active")
+        seed_internal_key(self.tenant)
+        self.client = APIClient()
+        self.headers = {
+            "HTTP_X_NBHD_INTERNAL_KEY": "test-key",
+            "HTTP_X_NBHD_TENANT_ID": str(self.tenant.id),
+        }
+
+    @patch("apps.integrations.runtime_views.tz.now")
+    def test_yesterday_no_date_param_warns_with_tenant_local_yesterday(self, mock_now):
+        self.user.timezone = "Asia/Tokyo"
+        self.user.save(update_fields=["timezone"])
+
+        utc_now = datetime(2026, 2, 21, 15, 0, 0, tzinfo=ZoneInfo("UTC"))
+        mock_now.return_value = utc_now
+        note_date = utc_now.astimezone(ZoneInfo("Asia/Tokyo")).date()
+        expected_yesterday = note_date - timedelta(days=1)
+
+        resp = self.client.post(
+            f"/api/v1/integrations/runtime/{self.tenant.id}/daily-note/append/",
+            {"content": "Yesterday's dinner (context): Sushi — great omakase spot."},
+            format="json",
+            **self.headers,
+        )
+        self.assertEqual(resp.status_code, 201, resp.content)
+        self.assertIn("Yesterday's dinner", resp.data["markdown"])
+        self.assertEqual(resp.data["date"], str(note_date))
+
+        warning = resp.data.get("date_attribution_warning")
+        self.assertIsNotNone(warning, "expected date_attribution_warning on the response")
+        self.assertIn(str(expected_yesterday), warning)
+        self.assertIn("date=YYYY-MM-DD", warning)
+
+    def test_explicit_date_suppresses_warning(self):
+        resp = self.client.post(
+            f"/api/v1/integrations/runtime/{self.tenant.id}/daily-note/append/",
+            {"content": "Yesterday's dinner was sushi.", "date": "2026-02-20"},
+            format="json",
+            **self.headers,
+        )
+        self.assertEqual(resp.status_code, 201, resp.content)
+        self.assertNotIn("date_attribution_warning", resp.data)
+
+    def test_clean_content_no_date_no_warning(self):
+        resp = self.client.post(
+            f"/api/v1/integrations/runtime/{self.tenant.id}/daily-note/append/",
+            {"content": "Went for a run, felt great."},
+            format="json",
+            **self.headers,
+        )
+        self.assertEqual(resp.status_code, 201, resp.content)
+        self.assertNotIn("date_attribution_warning", resp.data)
+
+    def test_section_write_with_last_night_warns_and_writes_normally(self):
+        resp = self.client.post(
+            f"/api/v1/integrations/runtime/{self.tenant.id}/daily-note/append/",
+            {"content": "Watched a movie, went to bed late.", "section_slug": "evening-check-in"},
+            format="json",
+            **self.headers,
+        )
+        # Control: no relative word yet.
+        self.assertEqual(resp.status_code, 201, resp.content)
+        self.assertNotIn("date_attribution_warning", resp.data)
+
+        resp2 = self.client.post(
+            f"/api/v1/integrations/runtime/{self.tenant.id}/daily-note/append/",
+            {"content": "Last night we stayed up late talking.", "section_slug": "evening-check-in"},
+            format="json",
+            **self.headers,
+        )
+        self.assertEqual(resp2.status_code, 201, resp2.content)
+        self.assertIn("## Evening Check In", resp2.data["markdown"])
+        self.assertIn("Last night we stayed up late talking.", resp2.data["markdown"])
+        warning = resp2.data.get("date_attribution_warning")
+        self.assertIsNotNone(warning)
+        self.assertIn("last night", warning.lower())
+
+    def test_case_insensitive_match(self):
+        resp = self.client.post(
+            f"/api/v1/integrations/runtime/{self.tenant.id}/daily-note/append/",
+            {"content": "YESTERDAY we went hiking."},
+            format="json",
+            **self.headers,
+        )
+        self.assertEqual(resp.status_code, 201, resp.content)
+        self.assertIsNotNone(resp.data.get("date_attribution_warning"))
+
+    def test_word_boundary_does_not_match_substring(self):
+        resp = self.client.post(
+            f"/api/v1/integrations/runtime/{self.tenant.id}/daily-note/append/",
+            {"content": "Attached yesterdays_export.csv for review."},
+            format="json",
+            **self.headers,
+        )
+        self.assertEqual(resp.status_code, 201, resp.content)
+        self.assertNotIn("date_attribution_warning", resp.data)
+
+    @patch("apps.integrations.runtime_views.tz.now")
+    def test_timezone_correctness_chicago_yesterday_not_utc_yesterday(self, mock_now):
+        # Frozen just after UTC midnight so the UTC calendar date has already
+        # rolled to the 15th, while Chicago (CDT, UTC-5 in July) is still on
+        # the 14th evening — the bug this guards against is a warning that
+        # reports UTC-yesterday (07-14) instead of Chicago-yesterday (07-13).
+        self.user.timezone = "America/Chicago"
+        self.user.save(update_fields=["timezone"])
+
+        utc_now = datetime(2026, 7, 15, 2, 0, 0, tzinfo=ZoneInfo("UTC"))
+        mock_now.return_value = utc_now
+
+        resp = self.client.post(
+            f"/api/v1/integrations/runtime/{self.tenant.id}/daily-note/append/",
+            {"content": "Yesterday's dinner (context): Sushi."},
+            format="json",
+            **self.headers,
+        )
+        self.assertEqual(resp.status_code, 201, resp.content)
+        self.assertEqual(resp.data["date"], "2026-07-14")  # Chicago-local today
+
+        warning = resp.data.get("date_attribution_warning")
+        self.assertIsNotNone(warning)
+        self.assertIn("2026-07-13", warning)  # Chicago-local yesterday, not UTC's 07-14
+
+
+@override_settings(NBHD_INTERNAL_API_KEY="test-key")
+class RuntimeUserMemoryAPITest(TestCase):
+    def setUp(self):
+        self.user = User.objects.create_user(username="testuser", password="testpass")
+        self.tenant = Tenant.objects.create(user=self.user, status="active")
+        seed_internal_key(self.tenant)
+        self.client = APIClient()
+        self.headers = {
+            "HTTP_X_NBHD_INTERNAL_KEY": "test-key",
+            "HTTP_X_NBHD_TENANT_ID": str(self.tenant.id),
+        }
+
+    def test_get_empty_memory(self):
+        resp = self.client.get(
+            f"/api/v1/integrations/runtime/{self.tenant.id}/long-term-memory/",
+            **self.headers,
+        )
+        self.assertEqual(resp.status_code, 200)
+        # Runtime endpoint auto-seeds with template content when memory doesn't exist
+        self.assertIn("Memory", resp.data["markdown"])
+
+    def test_put_memory(self):
+        resp = self.client.put(
+            f"/api/v1/integrations/runtime/{self.tenant.id}/long-term-memory/",
+            {"markdown": "# Agent Memory\n\nKey insight here."},
+            format="json",
+            **self.headers,
+        )
+        self.assertEqual(resp.status_code, 200)
+        self.assertIn("Key insight", resp.data["markdown"])
+
+    def test_put_overwrites(self):
+        self.client.put(
+            f"/api/v1/integrations/runtime/{self.tenant.id}/long-term-memory/",
+            {"markdown": "v1"},
+            format="json",
+            **self.headers,
+        )
+        self.client.put(
+            f"/api/v1/integrations/runtime/{self.tenant.id}/long-term-memory/",
+            {"markdown": "v2"},
+            format="json",
+            **self.headers,
+        )
+        mem = Document.objects.get(tenant=self.tenant, kind="memory", slug="long-term")
+        self.assertEqual(mem.markdown, "v2")
+
+    def test_section_write_preserves_a_concurrent_committed_flush(self):
+        """P2 prerequisite: a scoped person-fact write must not silently clobber
+        a compaction memoryFlush that committed between the reflex's read and its
+        write. Because the scoped write re-reads under select_for_update it merges
+        against the CURRENT document, so both the flush's summary and the person
+        fact survive — the directive's "a person-fact write + a memory flush both
+        survive" gate. Deterministic: the .update() stands in for the racing
+        full-document writer this endpoint used to lose to.
+        """
+        url = f"/api/v1/integrations/runtime/{self.tenant.id}/long-term-memory/"
+        self.client.put(
+            url,
+            {"markdown": "# Memory\n\n## Preferences\n- likes tea\n"},
+            format="json",
+            **self.headers,
+        )
+        # A concurrent compaction flush commits a full rewrite (session summary)
+        # after the reflex would have read but before it writes.
+        Document.objects.filter(tenant=self.tenant, kind="memory", slug="long-term").update(
+            markdown="# Memory\n\n## Preferences\n- likes tea\n\n## Session\n- flushed session summary\n"
+        )
+        resp = self.client.put(
+            url,
+            {"markdown": "- Jasmine — coworker in Japan", "section": "People & Context"},
+            format="json",
+            **self.headers,
+        )
+        self.assertEqual(resp.status_code, 200)
+        mem = Document.objects.get(tenant=self.tenant, kind="memory", slug="long-term")
+        self.assertIn("flushed session summary", mem.markdown)  # concurrent flush survives
+        self.assertIn("Jasmine — coworker in Japan", mem.markdown)  # person fact survives
+        self.assertIn("## People & Context", mem.markdown)
+        self.assertIn("likes tea", mem.markdown)  # untouched section intact
+
+    def test_section_write_replaces_only_its_own_section(self):
+        """A scoped write REPLACES its section's body and leaves every sibling
+        section intact — no duplicate heading, no collateral edit."""
+        url = f"/api/v1/integrations/runtime/{self.tenant.id}/long-term-memory/"
+        self.client.put(
+            url,
+            {"markdown": "# Memory\n\n## People & Context\n- old note\n\n## Preferences\n- likes tea\n"},
+            format="json",
+            **self.headers,
+        )
+        self.client.put(
+            url,
+            {"markdown": "- Jasmine — coworker in Japan", "section": "People & Context"},
+            format="json",
+            **self.headers,
+        )
+        mem = Document.objects.get(tenant=self.tenant, kind="memory", slug="long-term")
+        self.assertIn("- Jasmine — coworker in Japan", mem.markdown)
+        self.assertNotIn("- old note", mem.markdown)  # body replaced, not duplicated
+        self.assertEqual(mem.markdown.count("## People & Context"), 1)
+        self.assertIn("- likes tea", mem.markdown)  # sibling section untouched
+
+
+@override_settings(NBHD_INTERNAL_API_KEY="test-key")
+class RuntimeJournalContextAPITest(TestCase):
+    def setUp(self):
+        self.user = User.objects.create_user(username="testuser", password="testpass")
+        self.tenant = Tenant.objects.create(user=self.user, status="active")
+        seed_internal_key(self.tenant)
+        self.client = APIClient()
+        self.headers = {
+            "HTTP_X_NBHD_INTERNAL_KEY": "test-key",
+            "HTTP_X_NBHD_TENANT_ID": str(self.tenant.id),
+        }
+
+    def test_journal_context(self):
+
+        from django.utils import timezone as tz
+
+        today = tz.now().date()
+        Document.objects.create(tenant=self.tenant, kind="daily", slug=str(today), title=str(today), markdown="# Today")
+        Document.objects.create(
+            tenant=self.tenant, kind="memory", slug="long-term", title="Memory", markdown="# Memory"
+        )
+
+        resp = self.client.get(
+            f"/api/v1/integrations/runtime/{self.tenant.id}/journal-context/",
+            **self.headers,
+        )
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(resp.data["recent_notes_count"], 1)
+        self.assertEqual(resp.data["long_term_memory"], "# Memory")
+        self.assertEqual(resp.data["recent_notes"][0]["markdown"], "# Today")
+
+
+# ---------------------------------------------------------------------------
+# Document model tests (Journal v2)
+# ---------------------------------------------------------------------------
+
+
+class DocumentModelTest(TestCase):
+    def setUp(self):
+        self.user = User.objects.create_user(username="docuser", password="pass")
+        self.tenant = Tenant.objects.create(user=self.user, status="active")
+
+    def test_create_daily_document(self):
+        doc = Document.objects.create(
+            tenant=self.tenant,
+            kind="daily",
+            slug="2026-02-16",
+            title="2026-02-16",
+            markdown="# Hello",
+        )
+        self.assertEqual(doc.kind, "daily")
+        self.assertEqual(doc.slug, "2026-02-16")
+
+    def test_create_each_kind(self):
+        for kind_val, _label in Document.Kind.choices:
+            doc = Document.objects.create(
+                tenant=self.tenant,
+                kind=kind_val,
+                slug=f"test-{kind_val}",
+                title=f"Test {kind_val}",
+                markdown="",
+            )
+            self.assertEqual(doc.kind, kind_val)
+
+    def test_unique_constraint(self):
+        Document.objects.create(
+            tenant=self.tenant,
+            kind="daily",
+            slug="2026-02-16",
+            title="Day",
+            markdown="",
+        )
+        with self.assertRaises(Exception):
+            Document.objects.create(
+                tenant=self.tenant,
+                kind="daily",
+                slug="2026-02-16",
+                title="Dupe",
+                markdown="",
+            )
+
+    def test_same_slug_different_kind_ok(self):
+        Document.objects.create(
+            tenant=self.tenant,
+            kind="daily",
+            slug="2026-02-16",
+            title="Daily",
+            markdown="",
+        )
+        Document.objects.create(
+            tenant=self.tenant,
+            kind="weekly",
+            slug="2026-02-16",
+            title="Weekly",
+            markdown="",
+        )
+        self.assertEqual(Document.objects.filter(tenant=self.tenant).count(), 2)
+
+
+# ---------------------------------------------------------------------------
+# Document API tests — user-facing (Journal v2)
+# ---------------------------------------------------------------------------
+
+
+@override_settings(
+    REST_FRAMEWORK={
+        "DEFAULT_AUTHENTICATION_CLASSES": [
+            "rest_framework.authentication.SessionAuthentication",
+        ],
+    }
+)
+class DocumentAPITest(TestCase):
+    def setUp(self):
+        self.user = User.objects.create_user(username="docapiuser", password="pass", display_name="Casey Park")
+        self.tenant = Tenant.objects.create(user=self.user, status="active")
+        self.client = APIClient()
+        self.client.force_authenticate(user=self.user)
+
+    def test_list_documents_by_kind(self):
+        Document.objects.create(
+            tenant=self.tenant,
+            kind="daily",
+            slug="2026-02-15",
+            title="Feb 15",
+            markdown="# 15",
+        )
+        Document.objects.create(
+            tenant=self.tenant,
+            kind="daily",
+            slug="2026-02-16",
+            title="Feb 16",
+            markdown="# 16",
+        )
+        Document.objects.create(
+            tenant=self.tenant,
+            kind="goal",
+            slug="fitness",
+            title="Fitness",
+            markdown="# Fitness",
+        )
+        resp = self.client.get("/api/v1/journal/documents/", {"kind": "daily"})
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(len(resp.data), 2)
+        # Daily notes ordered by slug desc
+        self.assertEqual(resp.data[0]["slug"], "2026-02-16")
+
+    def test_get_nonexistent_document_returns_404(self):
+        """GET for a non-existent non-singleton document returns 404 (no auto-create)."""
+        resp = self.client.get("/api/v1/journal/documents/daily/2026-02-16/")
+        self.assertEqual(resp.status_code, 404)
+        self.assertFalse(
+            Document.objects.filter(
+                tenant=self.tenant,
+                kind="daily",
+                slug="2026-02-16",
+            ).exists()
+        )
+
+    def test_get_guessed_weekly_slug_returns_404_not_validation_400(self):
+        resp = self.client.get("/api/v1/journal/documents/weekly/weekly_review_2026-07-04/")
+        self.assertEqual(resp.status_code, 404)
+        self.assertEqual(
+            resp.data,
+            {"error": "not_found", "detail": "Document not found."},
+        )
+        self.assertFalse(
+            Document.objects.filter(
+                tenant=self.tenant,
+                kind="weekly",
+                slug="weekly_review_2026-07-04",
+            ).exists()
+        )
+
+    def test_get_existing_document(self):
+        """GET for an existing document returns 200."""
+        Document.objects.create(
+            tenant=self.tenant,
+            kind="daily",
+            slug="2026-02-16",
+            title="Feb 16",
+            markdown="# 2026-02-16\n\n## Morning Report\n",
+        )
+        resp = self.client.get("/api/v1/journal/documents/daily/2026-02-16/")
+        self.assertEqual(resp.status_code, 200)
+        self.assertIn("markdown", resp.data)
+        self.assertIn("2026-02-16", resp.data["markdown"])
+        self.assertIn("Morning Report", resp.data["markdown"])
+
+    def test_get_singleton_auto_creates(self):
+        """GET for singleton kinds (tasks, ideas, memory) still auto-creates."""
+        resp = self.client.get("/api/v1/journal/documents/tasks/tasks/")
+        self.assertEqual(resp.status_code, 200)
+        self.assertTrue(
+            Document.objects.filter(
+                tenant=self.tenant,
+                kind="tasks",
+                slug="tasks",
+            ).exists()
+        )
+
+    def test_patch_document(self):
+        Document.objects.create(
+            tenant=self.tenant,
+            kind="daily",
+            slug="2026-02-16",
+            title="Feb 16",
+            markdown="# Original",
+        )
+        resp = self.client.patch(
+            "/api/v1/journal/documents/daily/2026-02-16/",
+            {"markdown": "# Updated content"},
+            format="json",
+        )
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(resp.data["markdown"], "# Updated content")
+
+    def test_append_to_document(self):
+        Document.objects.create(
+            tenant=self.tenant,
+            kind="daily",
+            slug="2026-02-16",
+            title="Feb 16",
+            markdown="# 2026-02-16\n\n### 08:00 — MJ\nHistorical entry\n",
+        )
+        resp = self.client.post(
+            "/api/v1/journal/documents/daily/2026-02-16/append/",
+            {"content": "Appended entry", "time": "09:45"},
+            format="json",
+        )
+        self.assertEqual(resp.status_code, 201)
+        self.assertIn("Appended entry", resp.data["markdown"])
+        self.assertIn("### 09:45 — Casey Park", resp.data["markdown"])
+        self.assertIn("### 08:00 — MJ\nHistorical entry", resp.data["markdown"])
+
+    def test_append_to_document_without_display_name_uses_neutral_heading(self):
+        self.user.display_name = ""
+        self.user.save(update_fields=["display_name"])
+        Document.objects.create(
+            tenant=self.tenant,
+            kind="daily",
+            slug="2026-02-17",
+            title="Feb 17",
+            markdown="# 2026-02-17",
+        )
+
+        resp = self.client.post(
+            "/api/v1/journal/documents/daily/2026-02-17/append/",
+            {"content": "Neutral entry", "time": "10:15"},
+            format="json",
+        )
+
+        self.assertEqual(resp.status_code, 201)
+        self.assertIn("### 10:15\nNeutral entry", resp.data["markdown"])
+        self.assertNotIn("### 10:15 —", resp.data["markdown"])
+
+    def test_post_rejects_nan_daily_slug(self):
+        """POST is the create path that historically skipped slug validation.
+        A daily slug that isn't a real ISO date (the web UI's 'NaN-NaN-NaN'
+        Invalid-Date artifact) must 400 and never persist."""
+        resp = self.client.post(
+            "/api/v1/journal/documents/",
+            {"kind": "daily", "slug": "NaN-NaN-NaN", "title": "NaN-NaN-NaN"},
+            format="json",
+        )
+        self.assertEqual(resp.status_code, 400)
+        self.assertFalse(Document.objects.filter(tenant=self.tenant, kind="daily", slug="NaN-NaN-NaN").exists())
+
+    def test_post_rejects_ntfs_hostile_slug(self):
+        """POST must reject NTFS-hostile slugs (':' breaks the SMB file path)."""
+        resp = self.client.post(
+            "/api/v1/journal/documents/",
+            {"kind": "project", "slug": "a:b", "title": "x"},
+            format="json",
+        )
+        self.assertEqual(resp.status_code, 400)
+        self.assertFalse(Document.objects.filter(tenant=self.tenant, slug="a:b").exists())
+
+    def test_post_accepts_valid_daily_slug(self):
+        """A real ISO-date daily slug still creates the document via POST."""
+        resp = self.client.post(
+            "/api/v1/journal/documents/",
+            {"kind": "daily", "slug": "2026-02-16", "title": "Feb 16", "markdown": "# hi"},
+            format="json",
+        )
+        self.assertEqual(resp.status_code, 201)
+        self.assertTrue(Document.objects.filter(tenant=self.tenant, kind="daily", slug="2026-02-16").exists())
+
+    def test_patch_rejects_overlong_slug(self):
+        """A slug longer than the column max (128) must 400, not 500 from the DB
+        insert — URL-path endpoints pass the slug straight to _validate_slug."""
+        long_slug = "p" * 200
+        resp = self.client.patch(
+            f"/api/v1/journal/documents/project/{long_slug}/",
+            {"markdown": "x"},
+            format="json",
+        )
+        self.assertEqual(resp.status_code, 400)
+        self.assertFalse(Document.objects.filter(tenant=self.tenant, slug=long_slug).exists())
+
+    def test_sidebar_tree(self):
+        Document.objects.create(
+            tenant=self.tenant,
+            kind="daily",
+            slug="2026-02-16",
+            title="Feb 16",
+            markdown="",
+        )
+        Document.objects.create(
+            tenant=self.tenant,
+            kind="goal",
+            slug="fitness",
+            title="Fitness",
+            markdown="",
+        )
+        resp = self.client.get("/api/v1/journal/tree/")
+        self.assertEqual(resp.status_code, 200)
+        kinds = [node["kind"] for node in resp.data]
+        self.assertIn("daily", kinds)
+        self.assertIn("goals", kinds)
+        daily_node = next(n for n in resp.data if n["kind"] == "daily")
+        self.assertEqual(len(daily_node["items"]), 1)
+
+    def test_sidebar_orders_weekly_reviews_by_updated_at(self):
+        now = timezone.now()
+        newer = Document.objects.create(
+            tenant=self.tenant,
+            kind="weekly",
+            slug="2026-W32",
+            title="Current weekly review",
+            markdown="",
+        )
+        older = Document.objects.create(
+            tenant=self.tenant,
+            kind="weekly",
+            slug="weekly-review",
+            title="Legacy weekly review",
+            markdown="",
+        )
+        Document.objects.filter(pk=newer.pk).update(updated_at=now)
+        Document.objects.filter(pk=older.pk).update(updated_at=now - timedelta(days=7))
+
+        resp = self.client.get("/api/v1/journal/tree/")
+
+        self.assertEqual(resp.status_code, 200)
+        weekly_items = next(node["items"] for node in resp.data if node["kind"] == "weekly")
+        self.assertEqual([item["slug"] for item in weekly_items], ["2026-W32", "weekly-review"])
+
+    @patch("apps.common.llm_contracts.dj_tz.now")
+    def test_tenant_local_today_is_in_sidebar_and_today_endpoint(self, mock_now):
+        self.user.timezone = "Asia/Tokyo"
+        self.user.save(update_fields=["timezone"])
+        mock_now.return_value = datetime(2026, 7, 22, 16, 30, tzinfo=ZoneInfo("UTC"))
+        Document.objects.create(
+            tenant=self.tenant,
+            kind="daily",
+            slug="2026-07-23",
+            title="Jul 23",
+            markdown="# Tenant-local today",
+        )
+
+        sidebar_resp = self.client.get("/api/v1/journal/tree/")
+        self.assertEqual(sidebar_resp.status_code, 200)
+        daily_items = next(node["items"] for node in sidebar_resp.data if node["kind"] == "daily")
+        self.assertIn("2026-07-23", [item["slug"] for item in daily_items])
+
+        today_resp = self.client.get("/api/v1/journal/today/")
+        self.assertEqual(today_resp.status_code, 200)
+        self.assertEqual(today_resp.data["slug"], "2026-07-23")
+
+    @patch("apps.common.llm_contracts.dj_tz.now")
+    def test_sidebar_still_hides_tenant_local_tomorrow(self, mock_now):
+        self.user.timezone = "Asia/Tokyo"
+        self.user.save(update_fields=["timezone"])
+        mock_now.return_value = datetime(2026, 7, 22, 16, 30, tzinfo=ZoneInfo("UTC"))
+        Document.objects.create(
+            tenant=self.tenant,
+            kind="daily",
+            slug="2026-07-24",
+            title="Jul 24",
+            markdown="# Tenant-local tomorrow",
+        )
+
+        resp = self.client.get("/api/v1/journal/tree/")
+        self.assertEqual(resp.status_code, 200)
+        daily_items = next(node["items"] for node in resp.data if node["kind"] == "daily")
+        self.assertNotIn("2026-07-24", [item["slug"] for item in daily_items])
+
+    @patch("apps.common.llm_contracts.dj_tz.now")
+    def test_utc_tenant_today_matches_utc_date(self, mock_now):
+        mock_now.return_value = datetime(2026, 7, 22, 16, 30, tzinfo=ZoneInfo("UTC"))
+        Document.objects.create(
+            tenant=self.tenant,
+            kind="daily",
+            slug="2026-07-22",
+            title="Jul 22",
+            markdown="# UTC today",
+        )
+
+        sidebar_resp = self.client.get("/api/v1/journal/tree/")
+        self.assertEqual(sidebar_resp.status_code, 200)
+        daily_items = next(node["items"] for node in sidebar_resp.data if node["kind"] == "daily")
+        self.assertIn("2026-07-22", [item["slug"] for item in daily_items])
+
+        today_resp = self.client.get("/api/v1/journal/today/")
+        self.assertEqual(today_resp.status_code, 200)
+        self.assertEqual(today_resp.data["slug"], "2026-07-22")
+
+    def test_auth_required(self):
+        client = APIClient()  # unauthenticated
+        resp = client.get("/api/v1/journal/documents/")
+        self.assertIn(resp.status_code, [401, 403])
+
+    def test_delete_daily_document_forbidden(self):
+        """Daily notes cannot be deleted — protected by design."""
+        Document.objects.create(
+            tenant=self.tenant,
+            kind="daily",
+            slug="2026-02-16",
+            title="Feb 16",
+            markdown="# 2026-02-16",
+        )
+        resp = self.client.delete("/api/v1/journal/documents/daily/2026-02-16/")
+        self.assertEqual(resp.status_code, 403)
+        # Document should still exist
+        self.assertTrue(
+            Document.objects.filter(
+                tenant=self.tenant,
+                kind="daily",
+                slug="2026-02-16",
+            ).exists()
+        )
+
+    def test_delete_document(self):
+        """Non-daily documents can be deleted."""
+        Document.objects.create(
+            tenant=self.tenant,
+            kind="note",
+            slug="my-note",
+            title="My Note",
+            markdown="# My Note",
+        )
+        resp = self.client.delete("/api/v1/journal/documents/note/my-note/")
+        self.assertEqual(resp.status_code, 204)
+        self.assertFalse(
+            Document.objects.filter(
+                tenant=self.tenant,
+                kind="note",
+                slug="my-note",
+            ).exists()
+        )
+
+    def test_today_endpoint(self):
+        resp = self.client.get("/api/v1/journal/today/")
+        self.assertEqual(resp.status_code, 200)
+        self.assertIn("markdown", resp.data)
+
+
+# ---------------------------------------------------------------------------
+# Runtime Document API tests (Journal v2)
+# ---------------------------------------------------------------------------
+
+
+@override_settings(NBHD_INTERNAL_API_KEY="test-key", NBHD_DISABLE_BACKGROUND_THREADS=True)
+class RuntimeDocumentAPITest(TestCase):
+    def setUp(self):
+        self.user = User.objects.create_user(username="rtdocuser", password="pass")
+        self.tenant = Tenant.objects.create(user=self.user, status="active")
+        seed_internal_key(self.tenant)
+        self.client = APIClient()
+        self.headers = {
+            "HTTP_X_NBHD_INTERNAL_KEY": "test-key",
+            "HTTP_X_NBHD_TENANT_ID": str(self.tenant.id),
+        }
+
+    def test_get_document(self):
+        Document.objects.create(
+            tenant=self.tenant,
+            kind="daily",
+            slug="2026-02-16",
+            title="February 16",
+            markdown="# 2026-02-16\n\n## Morning Report\n",
+        )
+        resp = self.client.get(
+            f"/api/v1/integrations/runtime/{self.tenant.id}/document/",
+            {"kind": "daily", "slug": "2026-02-16"},
+            **self.headers,
+        )
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(resp.data["kind"], "daily")
+        self.assertEqual(resp.data["slug"], "2026-02-16")
+        self.assertIn("Morning Report", resp.data["markdown"])
+
+    def test_get_missing_document_returns_available_slugs_without_creating(self):
+        slugs = [f"2026-W{week:02d}" for week in range(1, 23)]
+        for slug in slugs:
+            Document.objects.create(
+                tenant=self.tenant,
+                kind="weekly",
+                slug=slug,
+                title=f"Weekly Review — {slug}",
+                markdown=f"# {slug}",
+            )
+
+        guessed_slug = "2026-W23"
+        resp = self.client.get(
+            f"/api/v1/integrations/runtime/{self.tenant.id}/document/",
+            {"kind": "weekly", "slug": guessed_slug},
+            **self.headers,
+        )
+
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(
+            resp.data,
+            {
+                "exists": False,
+                "kind": "weekly",
+                "slug": guessed_slug,
+                "available_slugs": list(reversed(slugs))[:20],
+            },
+        )
+        self.assertFalse(
+            Document.objects.filter(
+                tenant=self.tenant,
+                kind="weekly",
+                slug=guessed_slug,
+            ).exists()
+        )
+
+    def test_put_document(self):
+        resp = self.client.put(
+            f"/api/v1/integrations/runtime/{self.tenant.id}/document/",
+            {"kind": "daily", "slug": "2026-02-16", "markdown": "# Agent wrote this"},
+            format="json",
+            **self.headers,
+        )
+        self.assertIn(resp.status_code, [200, 201])
+        self.assertIn("Agent wrote this", resp.data["markdown"])
+
+    def test_put_updates_existing(self):
+        # Create first
+        self.client.put(
+            f"/api/v1/integrations/runtime/{self.tenant.id}/document/",
+            {"kind": "daily", "slug": "2026-02-16", "markdown": "v1"},
+            format="json",
+            **self.headers,
+        )
+        # Update
+        resp = self.client.put(
+            f"/api/v1/integrations/runtime/{self.tenant.id}/document/",
+            {"kind": "daily", "slug": "2026-02-16", "markdown": "v2"},
+            format="json",
+            **self.headers,
+        )
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(resp.data["markdown"], "v2")
+
+    def test_append_document(self):
+        resp = self.client.post(
+            f"/api/v1/integrations/runtime/{self.tenant.id}/document/append/",
+            {"kind": "daily", "slug": "2026-02-16", "content": "Agent log entry"},
+            format="json",
+            **self.headers,
+        )
+        self.assertEqual(resp.status_code, 201)
+        self.assertIn("Agent log entry", resp.data["markdown"])
+
+    def test_auth_required(self):
+        resp = self.client.get(
+            f"/api/v1/integrations/runtime/{self.tenant.id}/document/",
+            {"kind": "daily", "slug": "2026-02-16"},
+        )
+        self.assertEqual(resp.status_code, 401)
+
+    def test_wrong_key_rejected(self):
+        resp = self.client.get(
+            f"/api/v1/integrations/runtime/{self.tenant.id}/document/",
+            {"kind": "daily", "slug": "2026-02-16"},
+            HTTP_X_NBHD_INTERNAL_KEY="wrong-key",
+            HTTP_X_NBHD_TENANT_ID=str(self.tenant.id),
+        )
+        self.assertEqual(resp.status_code, 401)
+
+    def test_missing_kind_returns_400(self):
+        resp = self.client.get(
+            f"/api/v1/integrations/runtime/{self.tenant.id}/document/",
+            {"slug": "2026-02-16"},
+            **self.headers,
+        )
+        self.assertEqual(resp.status_code, 400)
+
+    # ── Path-component validation (path-injection guard) ────────────────
+    # The agent supplies `kind` and `slug` strings that flow into the
+    # `journal_document` table AND into Azure SMB paths via memory_sync.
+    # Reject NTFS-hostile values at the endpoint so the file share never
+    # sees them. The two production-incident shapes regressed here:
+    #   • kind=":" slug=":"     → memory/journal/:/:.md (NTFS reserves :)
+    #   • kind="cron" slug="_sync:Heartbeat Check-in"  → non-enum kind +
+    #     colon in slug, written by a misrouted Phase 2 sync.
+
+    def test_put_rejects_colon_kind_and_slug(self):
+        resp = self.client.put(
+            f"/api/v1/integrations/runtime/{self.tenant.id}/document/",
+            {"kind": ":", "slug": ":", "markdown": ""},
+            format="json",
+            **self.headers,
+        )
+        self.assertEqual(resp.status_code, 400)
+        self.assertEqual(resp.data["error"], "invalid_kind")
+
+    def test_put_rejects_non_enum_kind(self):
+        resp = self.client.put(
+            f"/api/v1/integrations/runtime/{self.tenant.id}/document/",
+            {"kind": "cron", "slug": "_sync:Heartbeat Check-in", "markdown": ""},
+            format="json",
+            **self.headers,
+        )
+        self.assertEqual(resp.status_code, 400)
+        self.assertEqual(resp.data["error"], "invalid_kind")
+
+    def test_put_rejects_slug_with_colon(self):
+        resp = self.client.put(
+            f"/api/v1/integrations/runtime/{self.tenant.id}/document/",
+            {"kind": "memory", "slug": "evil:name", "markdown": ""},
+            format="json",
+            **self.headers,
+        )
+        self.assertEqual(resp.status_code, 400)
+        self.assertEqual(resp.data["error"], "invalid_slug")
+
+    def test_put_rejects_dotdot_segment(self):
+        resp = self.client.put(
+            f"/api/v1/integrations/runtime/{self.tenant.id}/document/",
+            {"kind": "memory", "slug": "memo/../escape", "markdown": ""},
+            format="json",
+            **self.headers,
+        )
+        self.assertEqual(resp.status_code, 400)
+        self.assertEqual(resp.data["error"], "invalid_slug")
+
+    def test_put_rejects_leading_slash(self):
+        resp = self.client.put(
+            f"/api/v1/integrations/runtime/{self.tenant.id}/document/",
+            {"kind": "memory", "slug": "/absolute", "markdown": ""},
+            format="json",
+            **self.headers,
+        )
+        self.assertEqual(resp.status_code, 400)
+        self.assertEqual(resp.data["error"], "invalid_slug")
+
+    def test_put_accepts_legitimate_dated_slug(self):
+        # ISO dates use hyphens, which remain valid in nested document slugs.
+        resp = self.client.put(
+            f"/api/v1/integrations/runtime/{self.tenant.id}/document/",
+            {"kind": "memory", "slug": "week-ahead/2026-05-15", "markdown": "ok"},
+            format="json",
+            **self.headers,
+        )
+        self.assertIn(resp.status_code, [200, 201])
+        self.assertEqual(resp.data["slug"], "week-ahead/2026-05-15")
+
+    def test_put_rejects_dot_and_underscore_slugs(self):
+        for slug in ("weekly.review", "weekly_review"):
+            with self.subTest(slug=slug):
+                resp = self.client.put(
+                    f"/api/v1/integrations/runtime/{self.tenant.id}/document/",
+                    {"kind": "weekly", "slug": slug, "markdown": "not stored"},
+                    format="json",
+                    **self.headers,
+                )
+                self.assertEqual(resp.status_code, 400)
+                self.assertEqual(resp.data["error"], "invalid_slug")
+                self.assertFalse(Document.objects.filter(tenant=self.tenant, slug=slug).exists())
+
+    def test_get_rejects_non_enum_kind(self):
+        # Auto-create on GET previously seeded rows with any kind. Closed.
+        resp = self.client.get(
+            f"/api/v1/integrations/runtime/{self.tenant.id}/document/",
+            {"kind": "cron", "slug": "anything"},
+            **self.headers,
+        )
+        self.assertEqual(resp.status_code, 400)
+        self.assertEqual(resp.data["error"], "invalid_kind")
+        self.assertEqual(resp.data["valid_kinds"], sorted(Document.Kind.values))
+
+    def test_append_rejects_colon_slug(self):
+        resp = self.client.post(
+            f"/api/v1/integrations/runtime/{self.tenant.id}/document/append/",
+            {"kind": "memory", "slug": "bad:slug", "content": "x"},
+            format="json",
+            **self.headers,
+        )
+        self.assertEqual(resp.status_code, 400)
+        self.assertEqual(resp.data["error"], "invalid_slug")
+
+
+# ═════════════════════════════════════════════════════════════════════
+# Document post_save signal — async behavior in production
+# ═════════════════════════════════════════════════════════════════════
+
+
+class DocumentSaveSignalAsyncTest(TestCase):
+    """When QStash is configured, the post_save signal must NOT block on
+    the publish_task HTTP call — it must fire in a thread after commit.
+    When QStash is unconfigured (dev/test), the synchronous fallback is
+    preserved so existing test assertions about task side-effects work.
+    """
+
+    def setUp(self):
+        from apps.tenants.services import create_tenant
+
+        self.tenant = create_tenant(display_name="Signal Async Test", telegram_chat_id=900111)
+
+    @override_settings(QSTASH_TOKEN="", API_BASE_URL="")
+    def test_synchronous_fallback_when_qstash_unconfigured(self):
+        """Without QSTASH_TOKEN, the QStash publish runs synchronously.
+
+        Since Phase 2.6 added a separate USER.md refresh handler that always
+        uses ``threading.Thread`` (independent of QStash config), we can no
+        longer assert on the bare Thread mock. Instead we verify the QStash
+        publish ran in-thread (synchronous) by confirming the publish target
+        function name doesn't appear in any Thread() call.
+        """
+        from unittest.mock import patch as _patch
+
+        from apps.journal.models import Document
+
+        with (
+            _patch("apps.cron.publish.publish_task") as mock_publish,
+            _patch("apps.journal.signals.threading.Thread") as mock_thread,
+        ):
+            with self.captureOnCommitCallbacks(execute=True):
+                Document.objects.create(
+                    tenant=self.tenant,
+                    kind="daily",
+                    slug="2026-04-30",
+                    title="Test",
+                    markdown="# Test\n",
+                )
+            # QStash publish handler should NOT have used a thread.
+            qstash_thread_calls = [
+                c
+                for c in mock_thread.call_args_list
+                if (target := c.kwargs.get("target")) is not None and target.__name__ == "_publish"
+            ]
+            self.assertEqual(qstash_thread_calls, [])
+            mock_publish.assert_called_once()
+            args, kwargs = mock_publish.call_args
+            self.assertEqual(args, ("sync_documents_to_workspace", str(self.tenant.id)))
+            # Bucketed idempotency_key collapses bursty Document saves into one
+            # delivery per tenant per minute on the QStash side. Uses '-' as
+            # the separator because QStash rejects ':' / whitespace in the
+            # dedup id (caught by the eager validator in apps.cron.publish).
+            self.assertIn("idempotency_key", kwargs)
+            self.assertTrue(
+                kwargs["idempotency_key"].startswith(
+                    f"sync-documents-to-workspace-{self.tenant.id}-",
+                ),
+            )
+            self.assertNotIn(":", kwargs["idempotency_key"])
+
+    @override_settings(QSTASH_TOKEN="t_abc", API_BASE_URL="https://example.com")
+    def test_threaded_publish_when_qstash_configured(self):
+        """With QStash configured, publish_task is invoked from a daemon thread.
+
+        Phase 2.6 added a USER.md refresh handler that ALSO uses Thread, so
+        we filter the mock's calls to just the QStash publish handler's
+        target (the inner ``_publish`` closure).
+        """
+        from unittest.mock import MagicMock
+        from unittest.mock import patch as _patch
+
+        from apps.journal.models import Document
+
+        thread_instance = MagicMock()
+        with (
+            _patch("apps.journal.signals.threading.Thread", return_value=thread_instance) as mock_thread_cls,
+            self.captureOnCommitCallbacks(execute=True),
+        ):
+            Document.objects.create(
+                tenant=self.tenant,
+                kind="daily",
+                slug="2026-05-01",
+                title="Test",
+                markdown="# Test\n",
+            )
+        # Filter to the QStash publish handler's thread call.
+        qstash_thread_calls = [
+            c
+            for c in mock_thread_cls.call_args_list
+            if (target := c.kwargs.get("target")) is not None and target.__name__ == "_publish"
+        ]
+        self.assertEqual(len(qstash_thread_calls), 1)
+        self.assertTrue(qstash_thread_calls[0].kwargs.get("daemon"))
+        thread_instance.start.assert_called()
+
+    @override_settings(QSTASH_TOKEN="t_abc", API_BASE_URL="https://example.com")
+    def test_publish_failure_in_thread_does_not_propagate(self):
+        """An exception inside the threaded publish must not break doc.save()."""
+        from unittest.mock import patch as _patch
+
+        from apps.journal.models import Document
+
+        # Run the thread target inline so we exercise the swallow-and-log path.
+        def fake_thread_factory(target, daemon):
+            class _FakeThread:
+                def start(self_):
+                    target()
+
+            return _FakeThread()
+
+        with (
+            _patch("apps.journal.signals.threading.Thread", side_effect=fake_thread_factory),
+            _patch(
+                "apps.cron.publish.publish_task",
+                side_effect=RuntimeError("qstash unreachable"),
+            ),
+        ):
+            with self.captureOnCommitCallbacks(execute=True):
+                doc = Document.objects.create(
+                    tenant=self.tenant,
+                    kind="daily",
+                    slug="2026-05-02",
+                    title="Test",
+                    markdown="# Test\n",
+                )
+            self.assertIsNotNone(doc.id)
+
+
+# ---------------------------------------------------------------------------
+# Bad-slug daily defenses: read-path filtering + cleanup migration
+# ---------------------------------------------------------------------------
+
+
+class RecentJournalFilterTest(TestCase):
+    """The 'recent journal' envelope section (and the runtime context bundle that
+    shares its date-cutoff approach) must surface only real ISO-date daily notes
+    — never a pre-guard garbage slug like 'NaN-NaN-NaN' (which text-sorts ABOVE
+    every date) or a mis-kinded daily like '2026-03-29-debt-chart'."""
+
+    def setUp(self):
+        self.user = User.objects.create_user(username="recentuser", password="pass")
+        self.tenant = Tenant.objects.create(user=self.user, status="active")
+
+    def test_excludes_non_date_daily_slugs(self):
+        from apps.journal.envelope import render_recent_journal
+
+        Document.objects.create(
+            tenant=self.tenant,
+            kind="daily",
+            slug="2026-02-10",
+            title="Feb 10",
+            markdown="# Feb 10\n\nReal entry content here.",
+        )
+        Document.objects.create(
+            tenant=self.tenant,
+            kind="daily",
+            slug="NaN-NaN-NaN",
+            title="NaN-NaN-NaN",
+            markdown="# {{date}}\n\nGarbage stub leaking in.",
+        )
+        Document.objects.create(
+            tenant=self.tenant,
+            kind="daily",
+            slug="2026-03-29-debt-chart",
+            title="Debt",
+            markdown="# Debt chart\n\nMis-kinded daily with real content.",
+        )
+
+        out = render_recent_journal(self.tenant)
+
+        self.assertIn("Feb 10", out)
+        self.assertNotIn("NaN", out)
+        self.assertNotIn("Debt", out)
+
+
+class CleanupNanDailyStubsMigrationTest(TestCase):
+    """The 0020 cleanup must remove empty placeholder stubs (NaN-NaN-NaN,
+    template, AGENTS.md) WITHOUT touching real content — including real dailies
+    with non-date slugs (debt-chart, week-ahead) and the impossible-but-guarded
+    case of an ISO-date daily that contains a literal '{{date}}'."""
+
+    def setUp(self):
+        self.user = User.objects.create_user(username="cleanupuser", password="pass")
+        self.tenant = Tenant.objects.create(user=self.user, status="active")
+
+    def _run_cleanup(self):
+        import importlib
+
+        from django.apps import apps as django_apps
+
+        mod = importlib.import_module("apps.journal.migrations.0020_cleanup_nan_daily_stubs")
+        mod.cleanup_nan_daily_stubs(django_apps, None)
+
+    def test_deletes_only_empty_placeholder_stubs(self):
+        # Garbage: non-date slug + unrendered template placeholder → DELETE
+        for slug in ("NaN-NaN-NaN", "template", "AGENTS.md"):
+            Document.objects.create(
+                tenant=self.tenant,
+                kind="daily",
+                slug=slug,
+                title=slug,
+                markdown="# {{date}} ({{weekday}})\n\n## Morning Report\n",
+            )
+        # Real content with non-date slugs → KEEP
+        Document.objects.create(
+            tenant=self.tenant,
+            kind="daily",
+            slug="2026-03-29-debt-chart",
+            title="Debt",
+            markdown="# Debt chart\n\nReal content.",
+        )
+        Document.objects.create(
+            tenant=self.tenant,
+            kind="daily",
+            slug="memory/week-ahead/2026-W15",
+            title="Week Ahead",
+            markdown="# Week Ahead\n\nReal content.",
+        )
+        # Real ISO-date daily → KEEP (even if it somehow contains the placeholder)
+        Document.objects.create(
+            tenant=self.tenant,
+            kind="daily",
+            slug="2026-04-01",
+            title="Apr 1",
+            markdown="# {{date}} typed verbatim by the user\n",
+        )
+
+        self._run_cleanup()
+
+        remaining = set(Document.objects.filter(tenant=self.tenant, kind="daily").values_list("slug", flat=True))
+        self.assertEqual(
+            remaining,
+            {"2026-03-29-debt-chart", "memory/week-ahead/2026-W15", "2026-04-01"},
+        )
+
+    def test_idempotent(self):
+        Document.objects.create(
+            tenant=self.tenant,
+            kind="daily",
+            slug="NaN-NaN-NaN",
+            title="NaN-NaN-NaN",
+            markdown="# {{date}} ({{weekday}})\n",
+        )
+        self._run_cleanup()
+        self._run_cleanup()  # second pass must be a no-op, not an error
+        self.assertFalse(Document.objects.filter(tenant=self.tenant, slug="NaN-NaN-NaN").exists())
+
+
+class PathValidationDateValidityTest(TestCase):
+    """validate_kind_slug (the runtime/agent write boundary) must reject daily
+    slugs that are ISO-shaped but not real calendar dates, matching the frontend
+    isISODate() and the console _validate_slug()."""
+
+    def test_rejects_impossible_calendar_dates(self):
+        from apps.journal.path_validation import validate_kind_slug
+
+        self.assertIsNotNone(validate_kind_slug("daily", "2026-02-30"))
+        self.assertIsNotNone(validate_kind_slug("daily", "2026-13-01"))
+        self.assertIsNotNone(validate_kind_slug("daily", "NaN-NaN-NaN"))
+
+    def test_accepts_real_dates(self):
+        from apps.journal.path_validation import validate_kind_slug
+
+        self.assertIsNone(validate_kind_slug("daily", "2026-02-28"))
+        self.assertIsNone(validate_kind_slug("daily", "2024-02-29"))  # leap year

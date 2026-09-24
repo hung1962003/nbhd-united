@@ -1,0 +1,45 @@
+from django.urls import path
+from rest_framework_simplejwt.views import TokenRefreshView
+
+from .apple_views import AppleBeginView, AppleCompleteView, AppleLinkView, AppleNativeView
+from .auth_views import (
+    LogoutView,
+    MeView,
+    PasswordResetConfirmView,
+    PasswordResetRequestView,
+    SignupView,
+    ThrottledLoginView,
+)
+from .oauth_views import AuthorizeBeginView, ExchangeView
+from .pat_views import PATCreateView, PATListView, PATRevokeView
+
+urlpatterns = [
+    path("signup/", SignupView.as_view(), name="auth-signup"),
+    path("login/", ThrottledLoginView.as_view(), name="auth-login"),
+    path("refresh/", TokenRefreshView.as_view(), name="auth-refresh"),
+    path("logout/", LogoutView.as_view(), name="auth-logout"),
+    path("me/", MeView.as_view(), name="auth-me"),
+    # Password reset
+    path(
+        "password-reset/request/",
+        PasswordResetRequestView.as_view(),
+        name="auth-password-reset-request",
+    ),
+    path(
+        "password-reset/confirm/",
+        PasswordResetConfirmView.as_view(),
+        name="auth-password-reset-confirm",
+    ),
+    # Personal Access Tokens
+    path("tokens/", PATListView.as_view(), name="pat-list"),
+    path("tokens/create/", PATCreateView.as_view(), name="pat-create"),
+    path("tokens/<uuid:token_id>/", PATRevokeView.as_view(), name="pat-revoke"),
+    # Web→app PKCE handoff (iOS "Create an account")
+    path("authorize/", AuthorizeBeginView.as_view(), name="auth-authorize"),
+    path("exchange/", ExchangeView.as_view(), name="auth-exchange"),
+    # Sign in with Apple web popup flow
+    path("apple/begin/", AppleBeginView.as_view(), name="auth-apple-begin"),
+    path("apple/complete/", AppleCompleteView.as_view(), name="auth-apple-complete"),
+    path("apple/native/", AppleNativeView.as_view(), name="auth-apple-native"),
+    path("apple/link/", AppleLinkView.as_view(), name="auth-apple-link"),
+]

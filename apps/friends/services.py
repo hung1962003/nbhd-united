@@ -1,0 +1,1794 @@
+"""Neighborhood service layer — waves, responses, profiles, invites.
+
+All the edge-state logic lives here so the DRF views (console) and the router
+callbacks (Telegram/LINE wave buttons) share one implementation. PR1 touches
+only ``Friendship`` / ``NeighborProfile`` / ``FriendInvite`` (not restricted by
+the chokepoint); any "are these two neighbors" question routes through
+:mod:`apps.friends.access`.
+
+Invariant that binds every path: the friendship edge is deduped at the DATABASE
+(``pair_key`` unique), never in a service check — a reciprocal or concurrent
+wave collides on the same row (see :func:`send_wave`).
+"""
+
+from __future__ import annotations
+
+import re
+import secrets
+from collections import Counter
+from datetime import UTC, timedelta
+
+from django.core.exceptions import PermissionDenied as DjangoPermissionDenied
+from django.core.exceptions import ValidationError as DjangoValidationError
+from django.db import IntegrityError, transaction
+from django.db.models import F, Q
+from django.utils import timezone
+from rest_framework.exceptions import NotFound, PermissionDenied, ValidationError
+
+from apps.common.eval_sink import suppresses_real_transport
+from apps.lessons.pillars import infer_pillar_from_tags
+from apps.tenants.models import Tenant
+
+from . import access
+from .models import (
+    AbsorbedItem,
+    FriendInvite,
+    Friendship,
+    FriendThread,
+    FriendThreadMembership,
+    NeighborProfile,
+    PendingGoalAction,
+    PendingShare,
+    SharedGoalMembership,
+    SharedGoalUpdate,
+    SharedLesson,
+    compute_pair_key,
+)
+from .scrub import _content_hash
+
+# Handles people can never claim (impersonation / support-desk confusion).
+RESERVED_HANDLES = frozenset({"admin", "nbhd", "neighborhood", "support", "mj"})
+
+_VALID_HANDLE_RE = re.compile(r"^[a-z0-9_]{3,30}$")
+_HANDLE_STRIP_RE = re.compile(r"[^a-z0-9_]")
+
+MAX_INVITE_USES = 50
+MAX_INVITE_DAYS = 90
+DEFAULT_INVITE_DAYS = 14
+
+# A neighborhood is people you actually know — a Dunbar-ish ceiling keeps it that
+# way (and caps the fan-out of any one account). Checked when an action would
+# GROW the actor's accepted-edge count (wave send / invite claim).
+MAX_NEIGHBORS = 150
+_AT_MAX_NEIGHBORS_MSG = (
+    "You've reached the maximum of 150 neighbors. Your Neighborhood is meant to be people you "
+    "actually know — remove a neighbor to make room for a new one."
+)
+
+
+def accepted_neighbor_count(tenant) -> int:
+    """How many ACCEPTED edges the tenant is a party to."""
+    tid = getattr(tenant, "id", tenant)
+    return Friendship.objects.filter(
+        Q(requester_id=tid) | Q(addressee_id=tid), status=Friendship.Status.ACCEPTED
+    ).count()
+
+
+# ── Profiles ────────────────────────────────────────────────────────────────
+
+
+def derive_unique_handle(base: str) -> str:
+    """A DB-unique, non-reserved handle seeded from ``base`` (display name /
+    username). Sanitized to ``[a-z0-9_]``, 3-30 chars, numeric suffix on
+    collision."""
+    slug = _HANDLE_STRIP_RE.sub("", (base or "").lower()) or "neighbor"
+    slug = slug[:26]  # leave headroom for a disambiguating suffix
+    if len(slug) < 3:
+        slug = (slug + "neighbor")[:26]
+    candidate = slug
+    i = 0
+    while candidate in RESERVED_HANDLES or NeighborProfile.objects.filter(handle=candidate).exists():
+        i += 1
+        candidate = f"{slug}{i}"[:30]
+    return candidate
+
+
+def ensure_neighbor_profile(tenant, user=None) -> NeighborProfile:
+    """Get-or-create the tenant's ``NeighborProfile`` with a derived unique
+    handle. Called on any action that needs the actor to be visible to a
+    neighbor (wave send, invite claim, profile GET)."""
+    profile = NeighborProfile.objects.filter(tenant=tenant).first()
+    if profile is not None:
+        return profile
+    user = user or tenant.user
+    display = (getattr(user, "display_name", None) or getattr(user, "username", None) or "Neighbor").strip()[:80]
+    for _attempt in range(5):
+        handle = derive_unique_handle(display or "neighbor")
+        try:
+            with transaction.atomic():
+                return NeighborProfile.objects.create(tenant=tenant, handle=handle, display_name=display or "Neighbor")
+        except IntegrityError:
+            # Lost a race — either the profile now exists (OneToOne) or the
+            # handle was taken concurrently. Re-check the profile, else retry.
+            existing = NeighborProfile.objects.filter(tenant=tenant).first()
+            if existing is not None:
+                return existing
+    # Extremely unlikely: fall back to a random handle.
+    return NeighborProfile.objects.create(
+        tenant=tenant, handle=f"neighbor_{secrets.token_hex(6)}", display_name=display or "Neighbor"
+    )
+
+
+def validate_handle(handle: str, tenant) -> str:
+    """Normalize + validate a user-chosen handle. Raises DRF ``ValidationError``
+    (→ 400) with a human message."""
+    handle = (handle or "").strip().lower()
+    if not _VALID_HANDLE_RE.match(handle):
+        raise ValidationError("Handle must be 3-30 characters: lowercase letters, numbers, or underscore.")
+    if handle in RESERVED_HANDLES:
+        raise ValidationError("That handle is reserved.")
+    if NeighborProfile.objects.filter(handle=handle).exclude(tenant=tenant).exists():
+        raise ValidationError("That handle is already taken.")
+    return handle
+
+
+# ── Neighborhood listing ─────────────────────────────────────────────────────
+
+
+def _profile_entry(tenant, profiles_by_id: dict) -> dict:
+    """display_name / handle / avatar_hue for a tenant, from a prefetched map,
+    falling back to the auth user's display name when they have no profile."""
+    profile = profiles_by_id.get(tenant.id)
+    if profile is not None:
+        return {
+            "display_name": profile.display_name,
+            "handle": profile.handle,
+            "avatar_hue": profile.avatar_hue,
+        }
+    return {
+        "display_name": (getattr(tenant.user, "display_name", None) or "Neighbor"),
+        "handle": None,
+        "avatar_hue": 210,
+    }
+
+
+def list_neighborhood(tenant) -> dict:
+    """Accepted neighbors + pending waves in/out, plus the caller's own profile.
+    Addresses only by ``friendship_id`` — never leaks a neighbor's tenant_id."""
+    me = ensure_neighbor_profile(tenant, tenant.user)
+    edges = list(
+        Friendship.objects.filter(Q(requester=tenant) | Q(addressee=tenant)).select_related(
+            "requester", "requester__user", "addressee", "addressee__user"
+        )
+    )
+    other_ids = [(e.addressee_id if e.requester_id == tenant.id else e.requester_id) for e in edges]
+    profiles_by_id = {p.tenant_id: p for p in NeighborProfile.objects.filter(tenant_id__in=other_ids)}
+
+    neighbors, pending_incoming, pending_outgoing = [], [], []
+    for edge in edges:
+        other = edge.addressee if edge.requester_id == tenant.id else edge.requester
+        entry = _profile_entry(other, profiles_by_id)
+        if edge.status == Friendship.Status.ACCEPTED:
+            neighbors.append(
+                {"friendship_id": str(edge.id), "status": edge.status, "since": edge.responded_at, **entry}
+            )
+        elif edge.status == Friendship.Status.PENDING:
+            bucket = pending_incoming if edge.addressee_id == tenant.id else pending_outgoing
+            bucket.append(
+                {
+                    "friendship_id": str(edge.id),
+                    "note": edge.invite_note,
+                    "created_at": edge.created_at,
+                    **entry,
+                }
+            )
+        # declined / revoked / blocked are intentionally invisible
+
+    neighbors.sort(key=lambda n: (n["display_name"] or "").lower())
+    return {
+        "profile": {
+            "handle": me.handle,
+            "display_name": me.display_name,
+            "bio": me.bio,
+            "avatar_hue": me.avatar_hue,
+        },
+        "neighbors": neighbors,
+        "pending_incoming": pending_incoming,
+        "pending_outgoing": pending_outgoing,
+    }
+
+
+# ── Waves ────────────────────────────────────────────────────────────────────
+
+
+def send_wave(from_tenant, from_user, handle: str, note: str = "") -> tuple[Friendship, bool]:
+    """Send a wave to the neighbor at ``@handle``. Returns ``(friendship,
+    created)``.
+
+    Idempotent + race-safe by construction: dedup is the ``pair_key`` unique
+    constraint, so a concurrent duplicate collides at the DB and we return the
+    winning row. A ``blocked`` edge is treated as "no such neighbor" (no-reveal).
+    A re-wave after decline/revoke REUSES the row (flip to pending, set the
+    current sender as requester). Waving back a pending incoming wave accepts it.
+    """
+    handle = (handle or "").strip().lower()
+    target_profile = NeighborProfile.objects.select_related("tenant", "tenant__user").filter(handle=handle).first()
+    if target_profile is None:
+        raise NotFound("No neighbor with that handle.")
+    target = target_profile.tenant
+    if target.id == from_tenant.id:
+        raise ValidationError("You can't wave to yourself.")
+
+    ensure_neighbor_profile(from_tenant, from_user)  # so the addressee can see who waved
+    pair = compute_pair_key(from_tenant.id, target.id)
+    existing = Friendship.objects.filter(pair_key=pair).first()
+
+    # Neighbor cap — enforced only when this wave would GROW the sender's network
+    # (a fresh wave, a re-wave after decline, or waving back to accept). An
+    # already-accepted edge is idempotent and never blocked.
+    if existing is None or existing.status != Friendship.Status.ACCEPTED:
+        if accepted_neighbor_count(from_tenant) >= MAX_NEIGHBORS:
+            raise ValidationError(_AT_MAX_NEIGHBORS_MSG)
+
+    if existing is not None:
+        if existing.status == Friendship.Status.BLOCKED:
+            raise NotFound("No neighbor with that handle.")  # no-reveal
+        if existing.status == Friendship.Status.ACCEPTED:
+            return existing, False
+        if existing.status == Friendship.Status.PENDING:
+            if existing.addressee_id == from_tenant.id:
+                # They already waved me — waving back accepts it (mutual consent).
+                existing.status = Friendship.Status.ACCEPTED
+                existing.responded_at = timezone.now()
+                existing.save(update_fields=["status", "responded_at"])
+                return existing, False
+            return existing, False  # I already sent this wave — idempotent
+        # declined or revoked → reuse the row, flip to pending in the new direction
+        existing.requester = from_tenant
+        existing.addressee = target
+        existing.requested_by = from_user
+        existing.status = Friendship.Status.PENDING
+        existing.responded_at = None
+        existing.revoked_at = None
+        existing.blocked_by = None
+        existing.invite_note = note or ""
+        existing.requested_via = "handle"
+        existing.save()
+        _notify_wave_received(existing)
+        return existing, False
+
+    try:
+        with transaction.atomic():
+            edge = Friendship.objects.create(
+                requester=from_tenant,
+                addressee=target,
+                requested_by=from_user,
+                status=Friendship.Status.PENDING,
+                invite_note=note or "",
+                requested_via="handle",
+            )
+    except IntegrityError:
+        # A concurrent wave won the race to the unique pair_key — return it.
+        edge = Friendship.objects.filter(pair_key=pair).first()
+        return edge, False
+    _notify_wave_received(edge)
+    return edge, True
+
+
+def respond_to_wave(tenant, friendship_id, action: str) -> Friendship:
+    """accept / decline (addressee only) or block (either party). Non-party →
+    404 (no-reveal); requester trying to accept their own wave → 403. Idempotent
+    on the terminal state."""
+    edge = _load_edge_for_party(tenant, friendship_id)
+    is_addressee = edge.addressee_id == tenant.id
+    now = timezone.now()
+
+    if action in ("accept", "decline"):
+        if not is_addressee:
+            raise PermissionDenied("Only the neighbor who was waved can respond to this wave.")
+        target_status = Friendship.Status.ACCEPTED if action == "accept" else Friendship.Status.DECLINED
+        if edge.status == target_status:
+            return edge  # idempotent
+        if edge.status != Friendship.Status.PENDING:
+            raise ValidationError("This wave can no longer be answered.")
+        edge.status = target_status
+        edge.responded_at = now
+        edge.save(update_fields=["status", "responded_at"])
+        return edge
+
+    if action == "block":
+        if edge.status == Friendship.Status.BLOCKED:
+            return edge  # idempotent
+        edge.status = Friendship.Status.BLOCKED
+        edge.blocked_by = tenant
+        edge.responded_at = now
+        edge.save(update_fields=["status", "blocked_by", "responded_at"])
+        _purge_absorbed_between(tenant.id, _edge_other_party_id(edge, tenant.id))  # PR10: block = purge now
+        return edge
+
+    raise ValidationError("Unknown action.")
+
+
+def _edge_other_party_id(edge, tenant_id):
+    return edge.addressee_id if edge.requester_id == tenant_id else edge.requester_id
+
+
+def _purge_absorbed_between(a_id, b_id) -> None:
+    """Block is the strongest signal: tombstone what each side's agent absorbed
+    FROM the other (both directions), so a blocked counterpart's circle-sourced
+    sparks/chat stop surfacing immediately — defensive, alongside the read-time
+    filter in access.py."""
+    AbsorbedItem.objects.filter(
+        Q(tenant_id=a_id, from_tenant_id=b_id) | Q(tenant_id=b_id, from_tenant_id=a_id),
+        purged_at__isnull=True,
+    ).update(purged_at=timezone.now())
+
+
+def unblock(tenant, friendship_id) -> Friendship:
+    """Lift a block. ONLY the blocker (``blocked_by``) may unblock; a non-party or
+    the blocked side gets 404 (no-reveal — the block was never disclosed to them).
+    Flips to ``revoked`` (NOT accepted): the relationship must be re-waved to
+    resume, so unblocking never silently restores a connection. Idempotent."""
+    edge = _load_edge_for_party(tenant, friendship_id)
+    if edge.status != Friendship.Status.BLOCKED or edge.blocked_by_id != tenant.id:
+        # Not a block this tenant owns — don't confirm one exists.
+        raise NotFound("No such block.")
+    edge.status = Friendship.Status.REVOKED
+    edge.blocked_by = None
+    edge.revoked_at = timezone.now()
+    edge.save(update_fields=["status", "blocked_by", "revoked_at"])
+    return edge
+
+
+def unfriend(tenant, friendship_id) -> Friendship:
+    """Revoke an accepted/pending edge. A ``blocked`` edge is left intact (you
+    can't un-block by unfriending). Idempotent."""
+    edge = _load_edge_for_party(tenant, friendship_id)
+    if edge.status in (Friendship.Status.ACCEPTED, Friendship.Status.PENDING):
+        edge.status = Friendship.Status.REVOKED
+        edge.revoked_at = timezone.now()
+        edge.save(update_fields=["status", "revoked_at"])
+    return edge
+
+
+def _load_edge_for_party(tenant, friendship_id) -> Friendship:
+    """Load the edge, or raise ``NotFound`` if it doesn't exist OR the caller
+    isn't a party (no-reveal for both cases)."""
+    try:
+        edge = Friendship.objects.select_related("requester", "addressee").get(id=friendship_id)
+    except (Friendship.DoesNotExist, ValueError, DjangoValidationError, ValidationError) as exc:
+        # DjangoValidationError: a malformed UUID reaches here from callback
+        # paths (the console URLs are <uuid:>-guarded, callbacks are not).
+        raise NotFound("No such wave.") from exc
+    if tenant.id not in (edge.requester_id, edge.addressee_id):
+        raise NotFound("No such wave.")
+    return edge
+
+
+# ── Invites ──────────────────────────────────────────────────────────────────
+
+
+def create_invite(tenant, max_uses: int = 1, expires_in_days: int = DEFAULT_INVITE_DAYS) -> FriendInvite:
+    """A high-entropy, expiring wave link (reuses the linking UX)."""
+    try:
+        max_uses = max(1, min(int(max_uses), MAX_INVITE_USES))
+    except (TypeError, ValueError):
+        max_uses = 1
+    try:
+        days = max(1, min(int(expires_in_days), MAX_INVITE_DAYS))
+    except (TypeError, ValueError):
+        days = DEFAULT_INVITE_DAYS
+    return FriendInvite.objects.create(
+        inviter=tenant,
+        token=secrets.token_urlsafe(32),
+        max_uses=max_uses,
+        expires_at=timezone.now() + timedelta(days=days),
+    )
+
+
+def invite_metadata(token: str) -> dict:
+    """Public (AllowAny) invite preview for the signup/accept page — inviter
+    identity only, never anything private."""
+    invite = FriendInvite.objects.select_related("inviter", "inviter__user").filter(token=token).first()
+    if invite is None:
+        raise NotFound("Invite not found.")
+    profile = ensure_neighbor_profile(invite.inviter, invite.inviter.user)
+    valid = invite.expires_at > timezone.now() and invite.uses < invite.max_uses
+    return {
+        "inviter_display_name": profile.display_name,
+        "inviter_handle": profile.handle,
+        "inviter_hue": profile.avatar_hue,
+        "valid": valid,
+    }
+
+
+def claim_invite(tenant, user, token: str) -> Friendship:
+    """An existing subscriber claims an invite → the edge resolves to
+    ``accepted`` immediately (design §2.3). Non-subscriber signup→auto-accept
+    is the documented PR1.5 seam (see views.InviteDetailView)."""
+    invite = FriendInvite.objects.select_related("inviter", "inviter__user").filter(token=token).first()
+    if invite is None:
+        raise NotFound("Invite not found.")
+    if invite.expires_at <= timezone.now():
+        raise ValidationError("This invite has expired.")
+    if invite.uses >= invite.max_uses:
+        raise ValidationError("This invite has already been used.")
+    inviter = invite.inviter
+    if inviter.id == tenant.id:
+        raise ValidationError("You can't claim your own invite.")
+
+    ensure_neighbor_profile(tenant, user)
+    ensure_neighbor_profile(inviter, inviter.user)
+    pair = compute_pair_key(inviter.id, tenant.id)
+    # Neighbor cap for the claimer — skipped when the edge is already accepted
+    # (idempotent re-claim doesn't grow their network).
+    _existing = Friendship.objects.filter(pair_key=pair).first()
+    if (_existing is None or _existing.status != Friendship.Status.ACCEPTED) and (
+        accepted_neighbor_count(tenant) >= MAX_NEIGHBORS
+    ):
+        raise ValidationError(_AT_MAX_NEIGHBORS_MSG)
+    with transaction.atomic():
+        edge = Friendship.objects.select_for_update().filter(pair_key=pair).first()
+        if edge is None:
+            edge = Friendship.objects.create(
+                requester=inviter,
+                addressee=tenant,
+                requested_by=inviter.user,
+                status=Friendship.Status.ACCEPTED,
+                requested_via="link",
+                invite=invite,
+                responded_at=timezone.now(),
+            )
+        else:
+            if edge.status == Friendship.Status.BLOCKED:
+                raise NotFound("Invite not found.")  # no-reveal
+            edge.status = Friendship.Status.ACCEPTED
+            edge.responded_at = timezone.now()
+            edge.invite = invite
+            edge.save()
+        FriendInvite.objects.filter(id=invite.id).update(uses=F("uses") + 1)
+    return edge
+
+
+# ── Consent + blocked list + home BFF (iOS enablers, PR11) ───────────────────
+
+# Bump to force everyone to re-accept (App Review EULA acknowledgment). iOS shows
+# the consent gate whenever a profile's accepted version != this.
+FRIENDS_TERMS_VERSION = "2026-07-06"
+
+
+def record_consent(tenant, user, terms_version: str = "") -> dict:
+    """Record the tenant's Neighborhood EULA acknowledgment on their profile
+    (server-side so it survives reinstall). Idempotent — re-accepting just
+    refreshes the timestamp/version."""
+    profile = ensure_neighbor_profile(tenant, user)
+    version = (terms_version or FRIENDS_TERMS_VERSION).strip()[:20]
+    profile.accepted_terms_at = timezone.now()
+    profile.accepted_terms_version = version
+    profile.save(update_fields=["accepted_terms_at", "accepted_terms_version"])
+    return {
+        "accepted_terms_at": profile.accepted_terms_at.isoformat(),
+        "accepted_terms_version": version,
+        "current_terms_version": FRIENDS_TERMS_VERSION,
+    }
+
+
+def _profile_public(profile) -> dict:
+    return {
+        "handle": profile.handle if profile else None,
+        "display_name": profile.display_name if profile else "Neighbor",
+        "avatar_hue": profile.avatar_hue if profile else 210,
+    }
+
+
+def blocked_list(tenant) -> list[dict]:
+    """Neighbors THIS tenant has blocked (``blocked_by == tenant``) — the iOS
+    Settings Blocked-list. Only the blocker sees their own blocks."""
+    edges = list(Friendship.objects.filter(blocked_by=tenant, status=Friendship.Status.BLOCKED))
+    other_ids = {(e.addressee_id if e.requester_id == tenant.id else e.requester_id): e for e in edges}
+    profiles = {p.tenant_id: p for p in NeighborProfile.objects.filter(tenant_id__in=other_ids.keys())}
+    out = []
+    for other_id, edge in other_ids.items():
+        out.append(
+            {
+                "friendship_id": str(edge.id),
+                **_profile_public(profiles.get(other_id)),
+                "blocked_at": edge.responded_at.isoformat() if edge.responded_at else None,
+            }
+        )
+    return out
+
+
+def _wave_public(edge, other_profile, *, incoming: bool) -> dict:
+    return {
+        "friendship_id": str(edge.id),
+        "direction": "in" if incoming else "out",
+        "note": edge.invite_note or "",
+        "created_at": _iso_z(edge.created_at),
+        **_profile_public(other_profile),
+    }
+
+
+def _iso_z(dt) -> str | None:
+    """UTC ISO-8601 with a Z suffix. The home cursor round-trips as a query
+    param; a '+00:00' offset would need URL-encoding (a raw '+' decodes to a
+    space) — Z has no footgun. parse_datetime accepts both forms."""
+    if dt is None:
+        return None
+    return dt.isoformat().replace("+00:00", "Z")
+
+
+def neighborhood_home(tenant, since=None) -> dict:
+    """Aggregated Neighborhood home + decision-moments BFF (design ask #2) — one
+    call for the iOS home + moments dock. Bounded queries (no per-neighbor N+1):
+    neighbor profiles, spark counts, and 1:1 thread state each load in bulk.
+    All cross-tenant reads route through :mod:`apps.friends.access`."""
+    me = ensure_neighbor_profile(tenant, tenant.user)
+
+    edges = list(
+        Friendship.objects.filter(Q(requester=tenant) | Q(addressee=tenant), status=Friendship.Status.ACCEPTED)
+    )
+    counterpart_ids = [(e.addressee_id if e.requester_id == tenant.id else e.requester_id) for e in edges]
+    spark_counts = access.spark_counts_by_owner(tenant)
+    thread_state = access.direct_thread_state(tenant)
+    sky_ids = access.sky_friendship_ids(
+        tenant
+    )  # additive in_my_sky flag (Bounded Neighborhood; THE iOS flight contract)
+
+    pending = list(
+        Friendship.objects.filter(Q(requester=tenant) | Q(addressee=tenant), status=Friendship.Status.PENDING)
+    )
+    pending_other_ids = [(e.requester_id if e.addressee_id == tenant.id else e.addressee_id) for e in pending]
+
+    profiles = {
+        p.tenant_id: p
+        for p in NeighborProfile.objects.filter(tenant_id__in=set(counterpart_ids) | set(pending_other_ids))
+    }
+
+    neighbors = []
+    for edge in edges:
+        cid = edge.addressee_id if edge.requester_id == tenant.id else edge.requester_id
+        state = thread_state.get(cid, {})
+        neighbors.append(
+            {
+                "friendship_id": str(edge.id),
+                **_profile_public(profiles.get(cid)),
+                "spark_count": spark_counts.get(cid, 0),
+                "in_my_sky": edge.id in sky_ids,
+                "has_unread_thread": state.get("has_unread", False),
+                "thread_id": state.get("thread_id"),
+            }
+        )
+
+    pending_in, pending_out = [], []
+    for edge in pending:
+        if edge.addressee_id == tenant.id:
+            pending_in.append(_wave_public(edge, profiles.get(edge.requester_id), incoming=True))
+        else:
+            pending_out.append(_wave_public(edge, profiles.get(edge.addressee_id), incoming=False))
+
+    moments = _decision_moments(tenant, pending, profiles, since=since)
+    cursor = moments[0]["created_at"] if moments else _iso_z(since)
+
+    return {
+        "profile": {
+            "handle": me.handle,
+            "display_name": me.display_name,
+            "bio": me.bio,
+            "avatar_hue": me.avatar_hue,
+            "accepted_terms_at": me.accepted_terms_at.isoformat() if me.accepted_terms_at else None,
+            "accepted_terms_version": me.accepted_terms_version,
+            "needs_consent": me.accepted_terms_version != FRIENDS_TERMS_VERSION,
+        },
+        "neighbors": neighbors,
+        "pending_in": pending_in,
+        "pending_out": pending_out,
+        "moments": moments,
+        "cursor": cursor,
+    }
+
+
+def _decision_moments(tenant, pending, profiles, *, since=None) -> list[dict]:
+    """Decision-moments only: incoming waves to answer + agent share-proposals to
+    approve. Sorted newest-first; ``since`` (a datetime) keeps only newer ones."""
+    moments: list[dict] = []
+    for edge in pending:
+        if edge.addressee_id != tenant.id:
+            continue  # only incoming waves are a decision for me
+        if since is not None and edge.created_at <= since:
+            continue
+        prof = profiles.get(edge.requester_id)
+        moments.append(
+            {
+                "id": f"wave:{edge.id}",
+                "kind": "wave",
+                "created_at": _iso_z(edge.created_at),
+                "_sort": edge.created_at,
+                "friendship_id": str(edge.id),
+                "note": edge.invite_note or "",
+                **_profile_public(prof),
+            }
+        )
+
+    proposals = PendingShare.objects.filter(
+        tenant=tenant, proposed_by="agent", status=PendingShare.Status.PENDING
+    ).select_related("source_lesson", "target_friendship", "target_circle")
+    for share in proposals:
+        if since is not None and share.created_at <= since:
+            continue
+        snapshot = access.get_shared_lesson_by_lesson_id(share.source_lesson_id, tenant)
+        moments.append(
+            {
+                "id": f"share:{share.id}",
+                "kind": "share_proposal",
+                "created_at": _iso_z(share.created_at),
+                "_sort": share.created_at,
+                "pending_share_id": str(share.id),
+                # lesson_id + friendship_id let a client live-poll the preview
+                # endpoint for a proposal that's still scrubbing (iOS N3 seam).
+                "lesson_id": str(share.source_lesson_id),
+                "friendship_id": str(share.target_friendship_id) if share.target_friendship_id else None,
+                "preview_text": (snapshot.redacted_text if snapshot else "") or "",
+                "scrub_status": snapshot.scrub_status if snapshot else "pending",
+                "audience_label": _share_audience_label(tenant, share),
+            }
+        )
+
+    moments.sort(key=lambda m: m["_sort"], reverse=True)
+    for m in moments:
+        m.pop("_sort", None)
+    return moments
+
+
+def _share_audience_label(tenant, share) -> str:
+    if share.target_circle_id is not None:
+        return _circle_audience_label(share.target_circle)
+    if share.target_friendship_id is not None:
+        return _audience_label(tenant, share.target_friendship)
+    return "a neighbor"
+
+
+# ── Notifications (thin wrapper; defensive, never raises into a request) ──────
+
+
+def _notify_wave_received(friendship: Friendship) -> None:
+    if suppresses_real_transport(friendship.addressee):
+        return
+
+    from .notifications import notify_wave_app, notify_wave_received
+
+    notify_wave_received(friendship)  # Telegram/LINE inline accept/decline (existing)
+    notify_wave_app(friendship)  # typed APNs wake for the iOS moments dock (best-effort)
+
+
+# ── Share pipeline (propose → scrub → preview → approve → freeze → publish) ───
+
+RESIDUALS_BANNER = "We hide names — but not amounts, dates, or company names."
+
+# Mechanical share-never list, independent of the LLM (design §4.7). Lessons in
+# these pillars refuse to share by default; MJ can opt a pillar in later.
+SHARE_BLOCKED_PILLARS = frozenset({"gravity", "core"})
+
+
+def lesson_pillar(lesson) -> str:
+    """The lesson's pillar: the first-class ``pillar`` field when set (PR9), else
+    the shared tag heuristic (gravity/core/lessons)."""
+    explicit = (getattr(lesson, "pillar", "") or "").strip().lower()
+    if explicit:
+        return explicit
+    return infer_pillar_from_tags(getattr(lesson, "tags", None))
+
+
+def assert_shareable_pillar(lesson) -> None:
+    """Mechanical share-never block. Blocks if EITHER the first-class ``pillar``
+    field is share-blocked OR the tag heuristic is — belt and suspenders, so a
+    lesson whose field predates a later finance/mindfulness tag still can't slip
+    through. Never weaker than the pre-field behavior."""
+    field = (getattr(lesson, "pillar", "") or "").strip().lower()
+    heuristic = infer_pillar_from_tags(getattr(lesson, "tags", None))
+    if field in SHARE_BLOCKED_PILLARS or heuristic in SHARE_BLOCKED_PILLARS:
+        raise PermissionDenied(
+            "Finance and mindfulness lessons stay private by default — they can't be shared to your Neighborhood."
+        )
+
+
+def _enqueue_scrub(shared_lesson, content_hash, pending_share_id=None) -> None:
+    from apps.cron.publish import publish_task
+
+    kwargs = {}
+    if pending_share_id is not None:
+        kwargs["pending_share_id"] = str(pending_share_id)
+    publish_task(
+        "scrub_shared_lesson",
+        str(shared_lesson.id),
+        idempotency_key=f"scrub-{shared_lesson.id}-{content_hash[:8]}",
+        **kwargs,
+    )
+
+
+def _scrub_needed(shared_lesson, current_hash) -> bool:
+    """True iff an EXISTING snapshot needs a (re)scrub: a prior failure to retry,
+    or content drifted from a ready scrub. False while a scrub is already in flight
+    (status pending) — so a double-submit's losing request never re-enqueues the
+    winner's scrub (the winner enqueues it once via its ``created`` branch)."""
+    if shared_lesson.scrub_status == SharedLesson.ScrubStatus.PENDING:
+        return False
+    return shared_lesson.scrub_status != SharedLesson.ScrubStatus.READY or shared_lesson.content_hash != current_hash
+
+
+def share_lesson(owner_tenant, owner_user, lesson, friendship_id=None, circle_id=None) -> PendingShare:
+    """Human-initiated share intent → a ``PendingShare(proposed_by="user")`` +
+    an ensured ``SharedLesson`` + an enqueued fail-closed scrub. **No grant is
+    created here** — the grant is created only at approve-after-preview (design
+    §3.2: "no preview → no grant" binds every path, including this one)."""
+    if lesson.tenant_id != owner_tenant.id:
+        raise NotFound("No such lesson.")
+    assert_shareable_pillar(lesson)  # mechanical gravity/core block → 403
+    edge, circle = _resolve_share_audience(owner_tenant, friendship_id, circle_id)
+
+    shared_lesson, created = access.ensure_shared_lesson(lesson, owner_tenant)
+    current_hash = _content_hash(lesson.text or "", lesson.context or "")
+    if created or _scrub_needed(shared_lesson, current_hash):
+        access.mark_scrub_pending(shared_lesson)
+        _enqueue_scrub(shared_lesson, current_hash)  # first scrub or content_hash drift → (re)scrub
+
+    pending, _pending_created = PendingShare.objects.get_or_create(
+        tenant=owner_tenant,
+        source_lesson=lesson,
+        target_friendship=edge,
+        target_circle=circle,
+        status=PendingShare.Status.PENDING,
+        defaults={
+            "proposed_by": "user",
+            "expires_at": timezone.now() + timedelta(days=7),
+        },
+    )
+    return pending
+
+
+def _resolve_share_audience(tenant, friendship_id, circle_id):
+    """Resolve exactly one share audience: an accepted friendship XOR a circle the
+    tenant is an active member of. Returns ``(edge, circle)`` with one None."""
+    if circle_id:
+        from .circles import _assert_circle_member
+
+        circle, _membership = _assert_circle_member(tenant, circle_id)
+        return None, circle
+    if friendship_id:
+        return access.assert_neighbors(tenant, friendship_id), None
+    raise ValidationError("A friendship_id or circle_id is required.")
+
+
+def _has_pending_share(owner_tenant, lesson_id, edge, circle) -> bool:
+    """True iff a still-PENDING share for this lesson + resolved audience exists —
+    i.e. a share really is in progress. Keeps ``preview_share`` from reporting a
+    transient empty snapshot read as a hard 404."""
+    qs = PendingShare.objects.filter(
+        tenant=owner_tenant, source_lesson_id=lesson_id, status=PendingShare.Status.PENDING
+    )
+    if circle is not None:
+        qs = qs.filter(target_circle=circle)
+    elif edge is not None:
+        qs = qs.filter(target_friendship=edge)
+    try:
+        return qs.exists()
+    except (ValueError, TypeError):
+        return False
+
+
+def preview_share(owner_tenant, lesson_id, friendship_id=None, circle_id=None) -> tuple[dict, int]:
+    """Preview-before-share: the LITERAL ``redacted_text`` the audience will see.
+    202 while scrubbing, 409 if the scrub failed (fail-closed), 200 when ready."""
+    edge, circle = _resolve_share_audience(owner_tenant, friendship_id, circle_id)
+    shared_lesson = access.get_shared_lesson_by_lesson_id(lesson_id, owner_tenant)
+    if shared_lesson is None:
+        # A PendingShare for this lesson + audience IS the definition of a share
+        # in progress, so never answer "no share in progress" (404) while one
+        # exists — the iOS SharePreviewSheet dead-ends on a 404. The snapshot read
+        # can come back empty for a beat even when the row is present (an RLS GUC
+        # flicker on a pooled/reconnected connection, or read-replica lag); tell
+        # the client to keep polling (202) and let the next poll settle. Only a
+        # genuinely un-started share (no pending row) is a true 404.
+        if _has_pending_share(owner_tenant, lesson_id, edge, circle):
+            return {"detail": "Preparing your preview safely — try again in a moment."}, 202
+        raise NotFound("No share in progress for this lesson.")
+    if shared_lesson.scrub_status == SharedLesson.ScrubStatus.PENDING:
+        return {"detail": "Preparing your preview safely — try again in a moment."}, 202
+    if shared_lesson.scrub_status == SharedLesson.ScrubStatus.FAILED:
+        return {"detail": "We couldn't prepare this share safely, so nothing will be shared."}, 409
+    return {
+        "redacted_text": shared_lesson.redacted_text,
+        "redacted_context": shared_lesson.redacted_context,
+        "audience": _circle_audience_label(circle) if circle else _audience_label(owner_tenant, edge),
+        "residuals_banner": RESIDUALS_BANNER,
+    }, 200
+
+
+def _circle_audience_label(circle) -> str:
+    from .models import CircleMembership
+
+    count = CircleMembership.objects.filter(circle=circle, status="active").count()
+    others = max(0, count - 1)  # exclude the sharer
+    return f"your {others} {circle.name} neighbor{'s' if others != 1 else ''}"
+
+
+def list_pending_shares(tenant) -> list[dict]:
+    shares = (
+        PendingShare.objects.filter(tenant=tenant, status=PendingShare.Status.PENDING)
+        .select_related("source_lesson", "target_friendship", "target_circle")
+        .order_by("-created_at")
+    )
+    out: list[dict] = []
+    for pending in shares:
+        edge = pending.target_friendship
+        circle = pending.target_circle
+        if circle is not None:
+            audience = _circle_audience_label(circle)
+        elif edge is not None:
+            audience = _audience_label(tenant, edge)
+        else:
+            audience = None
+        out.append(
+            {
+                "id": str(pending.id),
+                "lesson_id": pending.source_lesson_id,
+                "lesson_preview": (pending.source_lesson.text or "")[:140],
+                "proposed_by": pending.proposed_by,
+                "friendship_id": str(edge.id) if edge else None,
+                "circle_id": str(circle.id) if circle else None,
+                "audience": audience,
+                "created_at": pending.created_at,
+            }
+        )
+    return out
+
+
+def approve_share(tenant, pending_share_id, final_text=None) -> tuple[dict, int]:
+    """Human approve. **The only path that creates a grant.** Idempotent.
+    An edit re-scrubs the edited text fail-closed (returns 202 → preview again →
+    approve); a ready snapshot freezes + publishes the grant."""
+    pending = _load_pending_share(tenant, pending_share_id)
+    if pending.status in (PendingShare.Status.APPROVED, PendingShare.Status.EDITED):
+        return {"pending_share_id": str(pending.id), "status": pending.status}, 200
+    if pending.status != PendingShare.Status.PENDING:
+        raise ValidationError("This share can no longer be approved.")
+    if pending.target_friendship_id is None and pending.target_circle_id is None:
+        raise ValidationError("This share has no audience.")
+
+    shared_lesson = access.get_shared_lesson_by_lesson_id(pending.source_lesson_id, tenant)
+    if shared_lesson is None:
+        raise ValidationError("No prepared snapshot to approve.")
+
+    # Edit → re-scrub the edited text fail-closed, then the human previews +
+    # approves again. This keeps "no preview → no grant" intact for edits too.
+    edited = (final_text or "").strip()
+    if edited and edited != (pending.final_text or "").strip():
+        pending.final_text = edited
+        pending.save(update_fields=["final_text"])
+        access.mark_scrub_pending(shared_lesson)
+        content_hash = _content_hash(edited, pending.source_lesson.context or "")
+        _enqueue_scrub(shared_lesson, content_hash, pending_share_id=pending.id)
+        return {
+            "pending_share_id": str(pending.id),
+            "status": "rescrubbing",
+            "detail": "We re-scrubbed your edit — preview it, then approve to share.",
+        }, 202
+
+    if shared_lesson.scrub_status == SharedLesson.ScrubStatus.PENDING:
+        return {"detail": "Still preparing this share safely — try again in a moment."}, 202
+    if shared_lesson.scrub_status == SharedLesson.ScrubStatus.FAILED:
+        pending.status = PendingShare.Status.BLOCKED
+        pending.resolved_at = timezone.now()
+        pending.save(update_fields=["status", "resolved_at"])
+        return {"detail": "We couldn't prepare this share safely, so nothing was shared."}, 409
+
+    # READY → freeze + publish (create the grant for the friendship XOR circle).
+    grant = access.create_grant(
+        shared_lesson,
+        friendship=pending.target_friendship,
+        circle=pending.target_circle,
+        granted_by=tenant.user,
+    )
+    pending.status = PendingShare.Status.EDITED if pending.final_text else PendingShare.Status.APPROVED
+    pending.preview_text = shared_lesson.redacted_text
+    pending.resolved_at = timezone.now()
+    pending.save(update_fields=["status", "preview_text", "resolved_at"])
+    return {"pending_share_id": str(pending.id), "status": pending.status, "grant_id": str(grant.id)}, 200
+
+
+def reject_share(tenant, pending_share_id) -> PendingShare:
+    pending = _load_pending_share(tenant, pending_share_id)
+    if pending.status == PendingShare.Status.PENDING:
+        pending.status = PendingShare.Status.REJECTED
+        pending.resolved_at = timezone.now()
+        pending.save(update_fields=["status", "resolved_at"])
+    return pending
+
+
+def revoke_share(owner_tenant, lesson, grant_id) -> None:
+    """Revoke one share → the spark leaves the neighbor's wormhole + absorb pull
+    instantly (read-through, zero residue)."""
+    grant = access.get_grant(grant_id)
+    if (
+        grant is None
+        or grant.shared_lesson.owner_tenant_id != owner_tenant.id
+        or grant.shared_lesson.source_lesson_id != lesson.id
+    ):
+        raise NotFound("No such share.")
+    access.revoke_grant(grant)
+
+
+def _load_pending_share(tenant, pending_share_id) -> PendingShare:
+    try:
+        pending = PendingShare.objects.select_related("target_friendship").get(id=pending_share_id, tenant=tenant)
+    except (PendingShare.DoesNotExist, ValueError, DjangoValidationError) as exc:
+        raise NotFound("No such share.") from exc
+    return pending
+
+
+def _audience_label(viewer_tenant, edge) -> str:
+    """The neighbor's display name for a friendship edge (owner's view)."""
+    if edge is None:
+        return "a neighbor"
+    other_id = edge.addressee_id if edge.requester_id == viewer_tenant.id else edge.requester_id
+    profile = NeighborProfile.objects.filter(tenant_id=other_id).first()
+    return profile.display_name if profile else "a neighbor"
+
+
+# ── Wormholes & warp (PR3) ────────────────────────────────────────────────────
+
+
+def list_wormholes(viewer_tenant, warpable=None) -> list[dict]:
+    """Warp targets for the home galaxy: one gate per accepted neighbor with ≥1
+    active+ready spark shared to the viewer. Addressed only by ``friendship_id``
+    — never a neighbor's tenant_id. Gate placement is deterministic client-side
+    from a stable hash of ``friendship_id``; the payload carries the neighbor's
+    identity, spark count, the "new since last visit" glow count, and the additive
+    ``in_my_sky`` flag (Bounded Neighborhood — web parity for the sky flight).
+
+    ``warpable="sky"`` narrows the list to the CHOSEN inner circle —
+    ``in_my_sky AND spark_count > 0`` — i.e. exactly the gates the iOS flight
+    renders. Because ``wormhole_targets`` is already spark-gated, the sky filter is
+    a pure additional narrowing (it can only ever hide gates, never widen).
+    """
+    targets = access.wormhole_targets(viewer_tenant)
+    sky_ids = access.sky_friendship_ids(viewer_tenant)
+    owner_ids = [t["owner_id"] for t in targets]
+    profiles = {p.tenant_id: p for p in NeighborProfile.objects.filter(tenant_id__in=owner_ids)}
+    out: list[dict] = []
+    for target in targets:
+        in_my_sky = target["friendship"].id in sky_ids
+        if warpable == "sky" and not in_my_sky:
+            continue
+        profile = profiles.get(target["owner_id"])
+        out.append(
+            {
+                "friendship_id": str(target["friendship"].id),
+                "display_name": profile.display_name if profile else "Neighbor",
+                "handle": profile.handle if profile else None,
+                "avatar_hue": profile.avatar_hue if profile else 210,
+                "spark_count": target["spark_count"],
+                "new_since_last_visit": target["new_since_last_visit"],
+                "in_my_sky": in_my_sky,
+            }
+        )
+    out.sort(key=lambda w: (w["display_name"] or "").lower())
+    return out
+
+
+def friend_galaxy(viewer_tenant, friendship_id) -> dict:
+    """The neighbor's SHARED constellation as the exact ``GalaxyData`` shape the
+    game consumes (``{stars, edges, clusters}``), built server-side from
+    ``SharedLesson`` snapshots via the audited accessor — READ-ONLY.
+
+    Only ``ready`` + active-granted snapshots are returned (``shared_star_qs``);
+    the raw ``Lesson`` corpus, connections, and star journals are never touched.
+    Star ids are namespaced ``f:<friendship_id>:<shared_lesson_id>`` so they can
+    never collide with home-galaxy ``Lesson`` PKs or be replayed against
+    owner-scoped endpoints. Edges are OMITTED for MVP (one less leak surface);
+    clusters are derived from the shared subset's ``cluster_label`` values only.
+    """
+    edge = access.assert_neighbors(viewer_tenant, friendship_id)  # party + accepted, else 403
+    owner_id = access.other_party_id(edge, viewer_tenant)
+    snapshots = list(access.shared_star_qs(viewer_tenant, owner_id))
+
+    # Synthesize a stable integer cluster_id per distinct non-empty label within
+    # the shared subset (SharedLesson carries a scrubbed label, not a numeric id).
+    labels = sorted({s.cluster_label for s in snapshots if s.cluster_label})
+    label_to_id = {label: idx for idx, label in enumerate(labels)}
+
+    stars = []
+    for snap in snapshots:
+        cluster_id = label_to_id.get(snap.cluster_label) if snap.cluster_label else None
+        stars.append(
+            {
+                "id": f"f:{friendship_id}:{snap.id}",
+                "shared_lesson_id": str(snap.id),
+                "text": snap.redacted_text,
+                "tags": list(snap.tags or []),
+                "cluster_id": cluster_id,
+                "cluster_label": snap.cluster_label,
+                "star_stage": snap.star_stage or "proto",
+                "x": snap.position_x,
+                "y": snap.position_y,
+            }
+        )
+
+    counts: dict[str, int] = {}
+    tag_bags: dict[str, list] = {}
+    for snap in snapshots:
+        if not snap.cluster_label:
+            continue
+        counts[snap.cluster_label] = counts.get(snap.cluster_label, 0) + 1
+        tag_bags.setdefault(snap.cluster_label, []).extend(snap.tags or [])
+    clusters = [
+        {
+            "id": label_to_id[label],
+            "label": label,
+            "count": counts.get(label, 0),
+            "tags": [tag for tag, _n in Counter(tag_bags.get(label, [])).most_common(3)],
+        }
+        for label in labels
+    ]
+    return {"stars": stars, "edges": [], "clusters": clusters}
+
+
+def mark_wormhole_visited(viewer_tenant, friendship_id) -> dict:
+    """Advance the viewer's ``WormholeVisit`` watermark for a friendship (kills
+    the "new since last visit" glow). Party + accepted checked via the accessor."""
+    edge = access.assert_neighbors(viewer_tenant, friendship_id)
+    visit = access.upsert_wormhole_visit(viewer_tenant, edge)
+    return {"friendship_id": str(edge.id), "last_visited_at": visit.last_visited_at}
+
+
+# ── "My sky" — the chosen inner circle (Bounded Neighborhood; BN-PR1) ─────────
+#
+# A private, one-way, invisible curation. The other party is NEVER told — no
+# moment, no push, no counter they can see. All SkyMembership access is confined
+# to apps/friends/access.py (chokepoint); these service functions only orchestrate
+# the party check, the hard-12 cap response, and the roster hydration.
+
+
+def _sky_roster_payload(tenant) -> list[dict]:
+    """Hydrate the viewer's sky roster (≤ ``access.MAX_SKY``) with identities +
+    spark counts, INCLUDING the quiet in-sky-no-spark slots the wormhole payload
+    omits. This is the ONLY place the sky is read back, and only ever for its own
+    owner — a neighbor can never see they were chosen."""
+    roster = access.sky_roster(tenant)
+    owner_ids = [row["owner_id"] for row in roster]
+    profiles = {p.tenant_id: p for p in NeighborProfile.objects.filter(tenant_id__in=owner_ids)}
+    spark_counts = access.spark_counts_by_owner(tenant)
+    out: list[dict] = []
+    for row in roster:
+        oid = row["owner_id"]
+        profile = profiles.get(oid)
+        spark_count = spark_counts.get(oid, 0)
+        out.append(
+            {
+                "friendship_id": row["friendship_id"],
+                **_profile_public(profile),
+                "spark_count": spark_count,
+                "in_my_sky": True,
+                "quiet_slot": spark_count == 0,  # chosen, but nothing to warp to yet
+                "added_at": _iso_z(row["added_at"]),
+            }
+        )
+    return out
+
+
+def list_sky(tenant) -> dict:
+    """The viewer's OWN sky roster — visible ONLY to them (design brief §4.3).
+    ``{sky: [...], count, cap}``; the roster includes quiet no-spark slots so the
+    directory can render "chosen, waiting to share" alongside the live gates."""
+    roster = _sky_roster_payload(tenant)
+    return {"sky": roster, "count": len(roster), "cap": access.MAX_SKY}
+
+
+def add_neighbor_to_sky(tenant, friendship_id) -> tuple[dict, int]:
+    """Add an accepted neighbor to the caller's PRIVATE sky. Party + accepted are
+    checked via the accessor (a stranger's ``friendship_id`` → 403, IDOR dead by
+    construction). Idempotent, and hard-capped at ``access.MAX_SKY``:
+
+      * 201 — newly added.
+      * 200 — already in the sky (no-op).
+      * 409 ``{"error": "sky_full", "cap": MAX_SKY, "sky": [...]}`` — at capacity;
+        the payload carries the current members so the client renders the
+        forced-removal swap ("who makes room?"). Nothing was added.
+
+    One-way + invisible: no signal of any kind reaches the other party.
+    """
+    edge = access.assert_neighbors(tenant, friendship_id)  # party + accepted, else PermissionDenied (403)
+    created, full = access.add_to_sky(tenant, edge)
+    if full:
+        return {
+            "error": "sky_full",
+            "cap": access.MAX_SKY,
+            "detail": f"Your sky holds {access.MAX_SKY}. Remove someone to make room.",
+            "sky": _sky_roster_payload(tenant),
+        }, 409
+    return (
+        {"friendship_id": str(edge.id), "in_my_sky": True, "sky_count": access.sky_count(tenant), "created": created},
+        201 if created else 200,
+    )
+
+
+def remove_neighbor_from_sky(tenant, friendship_id) -> dict:
+    """Remove a neighbor from the caller's sky. Idempotent (200 whether or not a
+    row existed). NOT an unfriend — the edge and everything shared over it are
+    untouched; only the flight gate goes away. Self-scoped, so it can only ever
+    remove the caller's own pick (a foreign/stale ``friendship_id`` removes
+    nothing, no-reveal). The other party is never told."""
+    removed = access.remove_from_sky(tenant, friendship_id)
+    return {
+        "friendship_id": str(friendship_id),
+        "in_my_sky": False,
+        "removed": removed,
+        "sky_count": access.sky_count(tenant),
+    }
+
+
+def adopt_spark(viewer_tenant, viewer_user, shared_lesson_id) -> tuple[dict, int]:
+    """Souvenir: bring a neighbor's spark home as a PENDING lesson in the viewer's
+    own tenant (design §8). Idempotent per snapshot. 201 on create, 200 on an
+    existing adopt; 400 when adopting your own snapshot; 403 with no active grant.
+    """
+    try:
+        lesson, created = access.adopt_shared_lesson(viewer_tenant, viewer_user, shared_lesson_id)
+    except ValueError:
+        raise ValidationError("You can't bring home your own spark — it's already in your galaxy.")
+    return (
+        {"lesson_id": lesson.id, "status": lesson.status, "created": created},
+        201 if created else 200,
+    )
+
+
+def refresh_shared_positions(tenant_id) -> dict:
+    """QStash task body: copy-forward a tenant's current lesson coords onto their
+    ready shared snapshots (coords only). Debounced after a constellation
+    recluster (see apps/lessons/clustering.refresh_constellation)."""
+    tenant = Tenant.objects.filter(id=tenant_id).first()
+    if tenant is None:
+        return {"updated": 0, "reason": "no such tenant"}
+    updated = access.refresh_shared_positions_for_owner(tenant)
+    return {"updated": updated}
+
+
+# ── PR4: agent propose + backstage absorb + transparency ledger ──────────────
+
+
+def propose_share(
+    tenant, lesson, friendship=None, source_context: str = "", *, circle=None
+) -> tuple[PendingShare, bool]:
+    """Agent proposes sharing an EXISTING lesson to a neighbor OR a circle → a
+    ``PendingShare(proposed_by="agent")`` + ensured SharedLesson + enqueued scrub
+    (so the preview is ready when the human looks). NEVER creates a grant — a
+    human approve is the only path (§5.4). Idempotent per (lesson, audience): an
+    existing pending proposal is returned, no dupe. Exactly one of friendship /
+    circle. Returns (pending, created)."""
+    if lesson.tenant_id != tenant.id:
+        raise NotFound("No such lesson.")
+    if bool(friendship) == bool(circle):
+        raise ValidationError("Exactly one of a neighbor or a circle is required.")
+    assert_shareable_pillar(lesson)  # mechanical gravity/core block → 403
+
+    existing = PendingShare.objects.filter(
+        tenant=tenant,
+        source_lesson=lesson,
+        target_friendship=friendship,
+        target_circle=circle,
+        status=PendingShare.Status.PENDING,
+    ).first()
+    if existing is not None:
+        return existing, False
+
+    shared_lesson, created = access.ensure_shared_lesson(lesson, tenant)
+    current_hash = _content_hash(lesson.text or "", lesson.context or "")
+    if created or _scrub_needed(shared_lesson, current_hash):
+        access.mark_scrub_pending(shared_lesson)
+        _enqueue_scrub(shared_lesson, current_hash)
+
+    pending, pending_created = PendingShare.objects.get_or_create(
+        tenant=tenant,
+        source_lesson=lesson,
+        target_friendship=friendship,
+        target_circle=circle,
+        status=PendingShare.Status.PENDING,
+        defaults={
+            "proposed_by": "agent",
+            "source_context": (source_context or "")[:2000],
+            "expires_at": timezone.now() + timedelta(days=7),
+        },
+    )
+    if not pending_created:
+        return pending, False
+    from .notifications import notify_share_proposal
+
+    notify_share_proposal(pending)  # typed APNs wake so the human sees the approval moment
+    return pending, pending_created
+
+
+def resolve_member_circle(tenant, circle_id):
+    """Resolve a circle the tenant is an ACTIVE member of, by opaque circle_id.
+    Returns None when nothing resolves (no-reveal), mirroring
+    :func:`resolve_accepted_friendship`."""
+    if not circle_id:
+        return None
+    from .circles import _assert_circle_member
+
+    try:
+        circle, _membership = _assert_circle_member(tenant, circle_id)
+        return circle
+    except (PermissionDenied, DjangoPermissionDenied, NotFound):
+        return None
+
+
+def resolve_accepted_friendship(tenant, friendship_id=None, handle=None) -> Friendship | None:
+    """Resolve an ACCEPTED friendship the tenant is a party to, by opaque
+    friendship_id (party-checked via the accessor) OR by neighbor @handle.
+    Returns None when nothing accepted resolves (never leaks)."""
+    if friendship_id:
+        try:
+            return access.assert_neighbors(tenant, friendship_id)
+        except (PermissionDenied, DjangoPermissionDenied, NotFound):
+            return None
+    if handle:
+        profile = NeighborProfile.objects.filter(handle=str(handle).strip().lower()).first()
+        if profile is None:
+            return None
+        return Friendship.objects.filter(
+            pair_key=compute_pair_key(tenant.id, profile.tenant_id),
+            status=Friendship.Status.ACCEPTED,
+        ).first()
+    return None
+
+
+def _spark_title(text: str) -> str:
+    line = (text or "").strip().splitlines()[0] if (text or "").strip() else ""
+    return line[:140]
+
+
+def neighborhood_context(tenant, since=None) -> dict:
+    """The absorb READ side (design §5.4): accessor-approved scrubbed sparks
+    shared TO ``tenant``. Each newly-seen spark is logged to ``AbsorbedItem``
+    (idempotent via the unique constraint), and items the human has PURGED are
+    excluded. Returns ONLY frozen redacted text — never raw Lesson content.
+    """
+    grants = access.inbound_shared_grants(tenant, since=since)
+    purged_ids = set(
+        AbsorbedItem.objects.filter(
+            tenant=tenant,
+            source_kind=AbsorbedItem.SourceKind.SHARED_LESSON,
+            purged_at__isnull=False,
+        ).values_list("source_id", flat=True)
+    )
+
+    sparks: list[dict] = []
+    latest = since
+    for grant in grants:
+        shared_lesson = grant.shared_lesson
+        if shared_lesson.id in purged_ids:
+            continue  # the human purged this — respect it, don't re-surface
+        title = _spark_title(shared_lesson.redacted_text)
+        _log_absorbed(
+            tenant,
+            AbsorbedItem.SourceKind.SHARED_LESSON,
+            shared_lesson.id,
+            shared_lesson.owner_tenant_id,
+            title,
+            circle_id=grant.circle_id,  # tag circle-sourced sparks (cross-leak guard + scoped purge)
+        )
+        sparks.append(
+            {
+                "shared_lesson_id": str(shared_lesson.id),
+                "from_handle": _handle_for(shared_lesson.owner_tenant_id),
+                "title": title,
+                "text": shared_lesson.redacted_text,
+            }
+        )
+        if latest is None or grant.created_at > latest:
+            latest = grant.created_at
+
+    return {
+        "neighbors": _accepted_neighbor_handles(tenant),
+        "sparks": sparks,
+        "chat": _absorb_chat(tenant),
+        "cursor": _iso_z(latest),
+    }
+
+
+def _absorb_chat(tenant) -> list[dict]:
+    """The chat absorb read (design §4.6/§6): raw friend-chat text redacted FRESH
+    in the RECIPIENT's session before the agent's LLM sees it (never persisted),
+    the per-thread cursor advanced (idempotent), and a NEUTRAL AbsorbedItem
+    logged per message (label = "Chat with @handle" — a pointer, never the
+    message text). Skipped for threads where agent_absorb_enabled is off."""
+    from apps.pii.redactor import redact_user_message
+
+    highlights: list[dict] = []
+    for entry in access.absorb_pending_chat(tenant):
+        circle_id = entry.get("circle_id")
+        texts = []
+        for message in entry["messages"]:
+            texts.append(redact_user_message(message.text, tenant))  # fresh redaction, ephemeral
+            # from_tenant = the actual sender (works for 1:1 AND circle group chat);
+            # label is a NEUTRAL pointer + circle tag, never message text.
+            sender_handle = _handle_for(message.sender_tenant_id)
+            label = f"Chat with @{sender_handle}" if sender_handle else "Neighborhood chat"
+            _log_absorbed(
+                tenant,
+                AbsorbedItem.SourceKind.FRIEND_MESSAGE,
+                message.public_id,
+                message.sender_tenant_id,
+                label,
+                circle_id=circle_id,
+            )
+        from_handle = _handle_for(entry["from_id"]) if entry.get("from_id") else None
+        highlights.append({"thread_id": entry["thread_id"], "from_handle": from_handle, "messages": texts})
+    return highlights
+
+
+def _log_absorbed(tenant, source_kind, source_id, from_tenant_id, label, *, circle_id=None) -> None:
+    """Idempotent ledger insert — a repeated absorb of the same source is a
+    no-op (unique (tenant, source_kind, source_id)). ``circle_id`` tags
+    circle-sourced items for scoped purge + the cross-group leakage guard."""
+    try:
+        with transaction.atomic():
+            AbsorbedItem.objects.create(
+                tenant=tenant,
+                source_kind=source_kind,
+                source_id=source_id,
+                from_tenant_id=from_tenant_id,
+                circle_id=circle_id,
+                label=(label or "")[:200],
+            )
+    except IntegrityError:
+        pass  # already absorbed
+
+
+def list_absorbed(tenant) -> list[dict]:
+    """The transparency ledger — what the assistant absorbed (un-purged)."""
+    items = (
+        AbsorbedItem.objects.filter(tenant=tenant, purged_at__isnull=True)
+        .select_related("from_tenant")
+        .order_by("-absorbed_at")
+    )
+    return [
+        {
+            "id": str(item.id),
+            "source_kind": item.source_kind,
+            "source_id": str(item.source_id),
+            "from_handle": _handle_for(item.from_tenant_id),
+            "label": item.label,
+            "absorbed_at": item.absorbed_at,
+        }
+        for item in items
+    ]
+
+
+def purge_absorbed(tenant, absorbed_item_id) -> AbsorbedItem:
+    """Tombstone one absorbed item — the envelope + context exclude it hereafter."""
+    try:
+        item = AbsorbedItem.objects.get(id=absorbed_item_id, tenant=tenant)
+    except (AbsorbedItem.DoesNotExist, ValueError, DjangoValidationError) as exc:
+        raise NotFound("No such absorbed item.") from exc
+    if item.purged_at is None:
+        item.purged_at = timezone.now()
+        item.save(update_fields=["purged_at"])
+    return item
+
+
+def _handle_for(tenant_id) -> str | None:
+    profile = NeighborProfile.objects.filter(tenant_id=tenant_id).only("handle").first()
+    return profile.handle if profile else None
+
+
+def _accepted_neighbor_handles(tenant) -> list[str]:
+    edges = Friendship.objects.filter(
+        Q(requester=tenant) | Q(addressee=tenant), status=Friendship.Status.ACCEPTED
+    ).values_list("requester_id", "addressee_id")
+    other_ids = [(r if a == tenant.id else a) for (r, a) in edges]
+    handles = NeighborProfile.objects.filter(tenant_id__in=other_ids).values_list("handle", flat=True)
+    return sorted(h for h in handles if h)
+
+
+# ── PR5: friend chat 1:1 (control-plane store; FriendMessage access via access.py) ──
+
+
+def open_thread(tenant, friendship_id) -> FriendThread:
+    """Open (get-or-create) the direct thread for an accepted friendship the
+    caller is a party to. Idempotent (uq_direct_thread)."""
+    edge = access.assert_neighbors(tenant, friendship_id)  # accepted party, else PermissionDenied
+    return _get_or_create_direct_thread(tenant, edge)
+
+
+def _get_or_create_direct_thread(tenant, edge) -> FriendThread:
+    thread, _created = FriendThread.objects.get_or_create(
+        friendship=edge, defaults={"kind": FriendThread.Kind.DIRECT, "created_by": tenant}
+    )
+    for party in (edge.requester, edge.addressee):
+        FriendThreadMembership.objects.get_or_create(thread=thread, tenant=party, defaults={"user": party.user})
+    return thread
+
+
+def list_threads(tenant) -> list[dict]:
+    memberships = FriendThreadMembership.objects.filter(tenant=tenant, left_at__isnull=True).select_related(
+        "thread", "thread__friendship"
+    )
+    out: list[dict] = []
+    for membership in memberships:
+        thread = membership.thread
+        other_id = access._thread_other_party_id(thread, tenant.id)
+        profile = NeighborProfile.objects.filter(tenant_id=other_id).first() if other_id else None
+        last = access.latest_message(thread)
+        out.append(
+            {
+                "thread_id": str(thread.id),
+                "friendship_id": str(thread.friendship_id) if thread.friendship_id else None,
+                "display_name": profile.display_name if profile else "Neighbor",
+                "handle": profile.handle if profile else None,
+                "avatar_hue": profile.avatar_hue if profile else 210,
+                "unread": access.unread_count(thread, membership.last_read_seq, tenant.id),
+                "last_message": (last.text[:80] if last else ""),
+                "last_message_at": thread.last_message_at,
+                "muted": membership.muted,
+                "agent_absorb_enabled": membership.agent_absorb_enabled,
+            }
+        )
+    from datetime import datetime
+
+    epoch = datetime.min.replace(tzinfo=UTC)
+    out.sort(key=lambda t: t["last_message_at"] or epoch, reverse=True)
+    return out
+
+
+def send_friend_message(tenant, user, thread_id, client_msg_id, text) -> tuple:
+    """Send a message into a thread the caller is a member of. Idempotent on
+    (sender_tenant, client_msg_id). A blocked/revoked/unfriended edge freezes
+    SENDS (history stays readable via assert_participant, which gates on
+    membership not edge status). Chat is a CONTROL-PLANE store, so a SUSPENDED
+    target is naturally store-only + notify (no container to touch) — we do NOT
+    reject it (design §10); assert_can_write's raise-on-SUSPENDED guards
+    container writes, which chat never does, so we gate on are_neighbors."""
+    thread = access.assert_participant(tenant, thread_id)  # PermissionDenied if not a member
+    text = (text or "").strip()
+    if not text:
+        raise ValidationError("Message text is required.")
+    if not (client_msg_id or "").strip():
+        raise ValidationError("client_msg_id is required.")
+
+    other_id = access._thread_other_party_id(thread, tenant.id)
+    if other_id is not None and not access.are_neighbors(tenant, other_id):
+        raise PermissionDenied("You can't message this neighbor right now.")
+
+    message, created = access.create_friend_message(thread, tenant, user, client_msg_id.strip(), text)
+    if created:
+        FriendThread.objects.filter(id=thread.id).update(last_message_at=timezone.now())
+        _notify_friend_message(message)
+    return message, created
+
+
+def get_thread_messages(tenant, thread_id, cursor, limit) -> dict:
+    from . import feed
+
+    thread = access.assert_participant(tenant, thread_id)
+    items, next_cursor = feed.build_thread_page(tenant, thread, cursor=cursor, limit=limit)
+    return {"messages": items, "next_cursor": next_cursor}
+
+
+def mark_thread_read(tenant, thread_id) -> dict:
+    thread = access.assert_participant(tenant, thread_id)
+    last = access.latest_message(thread)
+    last_seq = last.seq if last else 0
+    if last_seq:
+        FriendThreadMembership.objects.filter(thread=thread, tenant=tenant).update(last_read_seq=last_seq)
+    return {"thread_id": str(thread.id), "last_read_seq": last_seq}
+
+
+def patch_thread_membership(tenant, thread_id, *, muted=None, agent_absorb_enabled=None) -> dict:
+    thread = access.assert_participant(tenant, thread_id)
+    fields = {}
+    if muted is not None:
+        fields["muted"] = bool(muted)
+    if agent_absorb_enabled is not None:
+        fields["agent_absorb_enabled"] = bool(agent_absorb_enabled)
+    if fields:
+        FriendThreadMembership.objects.filter(thread=thread, tenant=tenant).update(**fields)
+    membership = FriendThreadMembership.objects.get(thread=thread, tenant=tenant)
+    return {
+        "thread_id": str(thread.id),
+        "muted": membership.muted,
+        "agent_absorb_enabled": membership.agent_absorb_enabled,
+    }
+
+
+def _notify_friend_message(message) -> None:
+    from .notifications import notify_friend_message
+
+    notify_friend_message(message)
+
+
+# ── PR6: Missions (shared goals + crew projection). SharedGoal.objects is
+#    confined to access.py; membership/update/pending-action are used freely. ──
+
+_HUMAN_UPDATE_KINDS = frozenset({"note", "progress", "milestone"})
+
+
+def _append_update(mission, tenant, user, kind, *, text="", payload=None):
+    return SharedGoalUpdate.objects.create(
+        shared_goal=mission, tenant=tenant, user=user, kind=kind, text=text, payload=payload or {}
+    )
+
+
+def _assert_mission_member(tenant, mission_id):
+    """Return (mission, active membership) or raise NotFound (no-reveal IDOR)."""
+    mission = access.get_mission(mission_id)
+    if mission is None:
+        raise NotFound("No such mission.")
+    membership = SharedGoalMembership.objects.filter(shared_goal=mission, tenant=tenant, status="active").first()
+    if membership is None:
+        raise NotFound("No such mission.")
+    return mission, membership
+
+
+def _mint_member_task(tenant, mission, title, description, due_date):
+    """The caller's OWN local journal Task, linked to the mission via related_ref
+    (zero journal.Task schema change)."""
+    from apps.journal.models import Task
+    from apps.pii.authoring import author_text, truncate_placeholder_safe
+
+    authored_title = author_text(
+        tenant,
+        title,
+        seam="friends.mission.local_task.create",
+        writer="background",
+        field="title",
+    )
+    authored_description = author_text(
+        tenant,
+        description or "",
+        seam="friends.mission.local_task.create",
+        writer="background",
+        field="description",
+    )
+    return Task.objects.create(
+        tenant=tenant,
+        title=truncate_placeholder_safe(
+            authored_title.text,
+            Task._meta.get_field("title").max_length,
+        ),
+        description=authored_description.text,
+        pii_receipts={
+            "title": authored_title.receipt,
+            "description": authored_description.receipt,
+        },
+        due_date=due_date,
+        related_ref={"pillar": "friends", "object_type": "shared_goal", "object_id": str(mission.id)},
+    )
+
+
+def create_mission(tenant, user, friendship_id, *, title, description="", pillar="", target=None, target_date=None):
+    """Create a 1:1 Mission on an accepted friendship. Creator auto-joins as
+    owner; the friendship's other party is invited."""
+    edge = access.assert_neighbors(tenant, friendship_id)  # accepted party, else PermissionDenied
+    title = (title or "").strip()
+    if not title:
+        raise ValidationError("A mission title is required.")
+    mission = access.create_mission(
+        tenant,
+        edge,
+        title=title,
+        description=description or "",
+        pillar=pillar or "",
+        target=target or {},
+        target_date=target_date,
+    )
+    SharedGoalMembership.objects.create(shared_goal=mission, tenant=tenant, user=user, role="owner", status="active")
+    other_id = edge.addressee_id if edge.requester_id == tenant.id else edge.requester_id
+    other = Tenant.objects.select_related("user").filter(id=other_id).first()
+    if other is not None:
+        SharedGoalMembership.objects.get_or_create(
+            shared_goal=mission,
+            tenant=other,
+            defaults={"user": other.user, "role": "member", "status": "invited"},
+        )
+    _append_update(mission, tenant, user, SharedGoalUpdate.Kind.JOINED, text="created the mission")
+    return mission
+
+
+def list_missions(tenant) -> list[dict]:
+    out: list[dict] = []
+    for mission in access.missions_for(tenant):
+        membership = SharedGoalMembership.objects.filter(shared_goal=mission, tenant=tenant, status="active").first()
+        out.append(
+            {
+                "mission_id": str(mission.id),
+                "title": mission.title,
+                "status": mission.status,
+                "target": mission.target,
+                "target_date": mission.target_date,
+                "my_commitment": membership.commitment if membership else "",
+                "version": mission.version,
+            }
+        )
+    return out
+
+
+def get_mission_detail(tenant, mission_id) -> dict:
+    from . import projection
+
+    mission, membership = _assert_mission_member(tenant, mission_id)
+    data = projection.build_mission_status(mission)
+    data["description"] = mission.description
+    data["version"] = mission.version
+    data["my_commitment"] = membership.commitment
+    data["my_role"] = membership.role
+    return data
+
+
+def join_mission(tenant, user, mission_id, commitment="") -> dict:
+    mission = access.get_mission(mission_id)
+    if mission is None:
+        raise NotFound("No such mission.")
+    membership = SharedGoalMembership.objects.filter(shared_goal=mission, tenant=tenant).first()
+    if membership is None:
+        raise NotFound("No such mission.")  # only invited members (friendship party) can join
+    if membership.status != "active":
+        membership.status = "active"
+        membership.left_at = None
+        if commitment:
+            membership.commitment = commitment.strip()[:200]
+        membership.save(update_fields=["status", "left_at", "commitment"])
+        _append_update(mission, tenant, user, SharedGoalUpdate.Kind.JOINED, text="joined")
+    return {"mission_id": str(mission.id), "status": "active"}
+
+
+def leave_mission(tenant, mission_id) -> dict:
+    mission, membership = _assert_mission_member(tenant, mission_id)
+    membership.status = "left"
+    membership.left_at = timezone.now()
+    membership.save(update_fields=["status", "left_at"])
+    return {"mission_id": str(mission.id), "status": "left"}
+
+
+def add_mission_update(tenant, user, mission_id, kind, text) -> dict:
+    mission, _membership = _assert_mission_member(tenant, mission_id)
+    if kind not in _HUMAN_UPDATE_KINDS:
+        raise ValidationError("kind must be note, progress, or milestone.")
+    update = _append_update(mission, tenant, user, kind, text=(text or "").strip())
+    return {"id": str(update.id), "kind": kind}
+
+
+def add_mission_task(tenant, user, mission_id, *, title, description="", due_date=None) -> dict:
+    mission, _membership = _assert_mission_member(tenant, mission_id)
+    title = (title or "").strip()
+    if not title:
+        raise ValidationError("A task title is required.")
+    task = _mint_member_task(tenant, mission, title, description, due_date)
+    _append_update(
+        mission,
+        tenant,
+        user,
+        SharedGoalUpdate.Kind.TASK_ADDED,
+        text=title,
+        payload={"title": title, "task_id": str(task.id)},
+    )
+    return {"task_id": str(task.id), "title": title}
+
+
+def update_mission(tenant, mission_id, *, expected_version, fields) -> tuple[dict, int]:
+    """Optimistic multi-writer edit → 409 on version/lock conflict."""
+    mission, _membership = _assert_mission_member(tenant, mission_id)
+    updated, result = access.update_mission(
+        mission, expected_version=expected_version, editor_owner=f"user:{tenant.id}", fields=fields
+    )
+    if result == "version_conflict":
+        return {
+            "detail": "This mission changed since you loaded it — refresh and try again.",
+            "version": updated.version,
+        }, 409
+    if result == "locked":
+        return {"detail": "Someone else is editing this mission — try again in a moment."}, 409
+    return {"mission_id": str(updated.id), "version": updated.version, "title": updated.title}, 200
+
+
+def propose_mission_task(tenant, mission_id, *, title, description="", due_date=None) -> tuple:
+    """Agent proposes a Mission task for ITS OWN human (the proposing tenant must
+    be an active member; the task is for THAT member only). Never writes another
+    human's task. Idempotent per (member, mission, title)."""
+    mission, _membership = _assert_mission_member(tenant, mission_id)
+    title = (title or "").strip()
+    if not title:
+        raise ValidationError("A task title is required.")
+    existing = PendingGoalAction.objects.filter(
+        tenant=tenant, shared_goal=mission, status="pending", suggested__title=title
+    ).first()
+    if existing is not None:
+        return existing, False
+    action = PendingGoalAction.objects.create(
+        tenant=tenant,
+        shared_goal=mission,
+        kind="add_task",
+        suggested={
+            "title": title,
+            "description": description or "",
+            "due_date": due_date.isoformat() if due_date else None,
+        },
+        status="pending",
+        expires_at=timezone.now() + timedelta(days=7),
+    )
+    return action, True
+
+
+def list_pending_goal_actions(tenant) -> list[dict]:
+    actions = (
+        PendingGoalAction.objects.filter(tenant=tenant, status="pending")
+        .select_related("shared_goal")
+        .order_by("-created_at")
+    )
+    return [
+        {
+            "id": str(action.id),
+            "mission_id": str(action.shared_goal_id),
+            "mission_title": action.shared_goal.title,
+            "suggested": action.suggested,
+            "created_at": action.created_at,
+        }
+        for action in actions
+    ]
+
+
+def approve_goal_action(tenant, action_id) -> dict:
+    """Human approve → mint the member's OWN local Task + append task_added."""
+    from datetime import date
+
+    try:
+        action = PendingGoalAction.objects.select_related("shared_goal").get(
+            id=action_id, tenant=tenant, status="pending"
+        )
+    except (PendingGoalAction.DoesNotExist, ValueError, DjangoValidationError) as exc:
+        raise NotFound("No such proposal.") from exc
+    mission = action.shared_goal
+    suggested = action.suggested or {}
+    due_raw = suggested.get("due_date")
+    try:
+        due_date = date.fromisoformat(due_raw) if due_raw else None
+    except (TypeError, ValueError):
+        due_date = None
+    title = (suggested.get("title") or "Mission task").strip()
+    task = _mint_member_task(tenant, mission, title, suggested.get("description") or "", due_date)
+    _append_update(
+        mission,
+        tenant,
+        tenant.user,
+        SharedGoalUpdate.Kind.TASK_ADDED,
+        text=title,
+        payload={"title": title, "task_id": str(task.id)},
+    )
+    action.status = "approved"
+    action.task = task
+    action.resolved_at = timezone.now()
+    action.save(update_fields=["status", "task", "resolved_at"])
+    return {"action_id": str(action.id), "status": "approved", "task_id": str(task.id)}
+
+
+def reject_goal_action(tenant, action_id) -> dict:
+    action = PendingGoalAction.objects.filter(id=action_id, tenant=tenant, status="pending").first()
+    if action is None:
+        raise NotFound("No such proposal.")
+    action.status = "rejected"
+    action.resolved_at = timezone.now()
+    action.save(update_fields=["status", "resolved_at"])
+    return {"action_id": str(action.id), "status": "rejected"}
+
+
+def runtime_missions(tenant) -> list[dict]:
+    """The tid's own missions + projection (agent nudges its own human)."""
+    from . import projection
+
+    out: list[dict] = []
+    for mission in access.missions_for(tenant):
+        membership = SharedGoalMembership.objects.filter(shared_goal=mission, tenant=tenant, status="active").first()
+        status = projection.build_mission_status(mission)
+        status["my_commitment"] = membership.commitment if membership else ""
+        out.append(status)
+    return out

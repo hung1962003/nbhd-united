@@ -1,0 +1,151 @@
+from django.urls import include, path
+from rest_framework.routers import DefaultRouter
+
+from .line_views import line_generate_link, line_set_preferred_channel, line_status, line_unlink
+from .promo_views import redeem_promo
+from .runtime_views import (
+    RuntimeAgendaEngagementView,
+    RuntimeCommitmentRecordView,
+    RuntimePreferredModelView,
+    RuntimeWelcomeMarkView,
+)
+from .telegram_views import telegram_generate_link, telegram_status, telegram_unlink
+from .unsubscribe_views import unsubscribe
+from .views import (
+    AvailableModelsView,
+    CancelDeletionView,
+    ConstellationSettingsView,
+    DeleteAccountView,
+    EntityRegistryBulkDeleteView,
+    EntityRegistryItemView,
+    EntityRegistryListView,
+    HeartbeatConfigView,
+    OnboardTenantView,
+    PersonaListView,
+    PIIDenylistBulkView,
+    PIIDenylistItemView,
+    PIIDenylistListView,
+    PIIReviewQueueKeepView,
+    PIIReviewQueueView,
+    PreferredModelView,
+    ProfileView,
+    ProvisioningStatusView,
+    RefreshConfigView,
+    RetryProvisioningView,
+    TaskModelPreferencesView,
+    TenantViewSet,
+    UpdatePreferencesView,
+)
+
+router = DefaultRouter()
+router.register("", TenantViewSet, basename="tenant")
+
+urlpatterns = [
+    path("onboard/", OnboardTenantView.as_view(), name="tenant-onboard"),
+    path("profile/", ProfileView.as_view(), name="user-profile"),
+    path("provisioning-status/", ProvisioningStatusView.as_view(), name="tenant-provisioning-status"),
+    path("retry-provisioning/", RetryProvisioningView.as_view(), name="tenant-retry-provisioning"),
+    path("personas/", PersonaListView.as_view(), name="persona-list"),
+    path("preferences/", UpdatePreferencesView.as_view(), name="preferences"),
+    path("refresh-config/", RefreshConfigView.as_view(), name="refresh-config"),
+    # Settings UI for the per-tenant PII entity registry. List, edit name /
+    # relationship / notes, or delete entries. Backs the privacy-placeholders
+    # envelope identity-context sub-section (apps/tenants/envelope.py).
+    path("settings/entity-registry/", EntityRegistryListView.as_view(), name="entity-registry-list"),
+    # NOTE: `bulk/` MUST be registered before `<str:placeholder>/` — otherwise
+    # the string path captures "bulk" as the placeholder and ItemView returns
+    # 405 for POST. Django matches paths in declaration order.
+    path(
+        "settings/entity-registry/bulk/",
+        EntityRegistryBulkDeleteView.as_view(),
+        name="entity-registry-bulk-delete",
+    ),
+    path(
+        "settings/entity-registry/<str:placeholder>/",
+        EntityRegistryItemView.as_view(),
+        name="entity-registry-item",
+    ),
+    # PII denylist: per-tenant set of canonical-keyed words the redactor
+    # should never treat as PII. Foundation lives in PR #664 / migration
+    # 0068; this UI lets users curate the list directly.
+    path("settings/pii-denylist/", PIIDenylistListView.as_view(), name="pii-denylist-list"),
+    # NOTE: `bulk/` MUST be registered before `<str:key>/` — otherwise the
+    # string path captures "bulk" as the key and ItemView returns 405 for
+    # POST. Django matches paths in declaration order.
+    path(
+        "settings/pii-denylist/bulk/",
+        PIIDenylistBulkView.as_view(),
+        name="pii-denylist-bulk",
+    ),
+    path(
+        "settings/pii-denylist/<str:key>/",
+        PIIDenylistItemView.as_view(),
+        name="pii-denylist-item",
+    ),
+    # Tier-2 PII review queue: the PERSON/LOCATION bindings the assistant is
+    # hiding that the user has not yet judged. GET the queue, POST keep/ to
+    # stamp reviewed_at on the ones worth keeping; "clean" verdicts reuse the
+    # entity-registry bulk-delete (deny=true) above. This is also the contract
+    # the iOS on-device review flow consumes.
+    path("settings/pii-review-queue/", PIIReviewQueueView.as_view(), name="pii-review-queue"),
+    path(
+        "settings/pii-review-queue/keep/",
+        PIIReviewQueueKeepView.as_view(),
+        name="pii-review-queue-keep",
+    ),
+    path("telegram/generate-link/", telegram_generate_link, name="telegram-generate-link"),
+    path("telegram/unlink/", telegram_unlink, name="telegram-unlink"),
+    path("telegram/status/", telegram_status, name="telegram-status"),
+    path("line/generate-link/", line_generate_link, name="line-generate-link"),
+    path("line/unlink/", line_unlink, name="line-unlink"),
+    path("line/status/", line_status, name="line-status"),
+    path("line/preferred-channel/", line_set_preferred_channel, name="line-preferred-channel"),
+    # Promotional campaign redemption — unauthenticated, the per-user
+    # HMAC token in the URL carries the authorization. See
+    # apps/tenants/promo_views.py and promo_signing.py.
+    path("promos/redeem/", redeem_promo, name="promo-redeem"),
+    # One-click marketing-email unsubscribe — unauthenticated, the per-user
+    # HMAC token in the path carries the authorization. GET renders a
+    # confirmation page; POST is the RFC 8058 List-Unsubscribe-Post target.
+    # See apps/tenants/unsubscribe_views.py and unsubscribe_signing.py.
+    path("unsubscribe/<str:token>/", unsubscribe, name="email-unsubscribe"),
+    path("heartbeat/", HeartbeatConfigView.as_view(), name="heartbeat-config"),
+    path("delete-account/", DeleteAccountView.as_view(), name="delete-account"),
+    path("cancel-deletion/", CancelDeletionView.as_view(), name="cancel-deletion"),
+    path("settings/preferred-model/", PreferredModelView.as_view(), name="preferred-model"),
+    path("settings/task-model-preferences/", TaskModelPreferencesView.as_view(), name="task-model-preferences"),
+    path("settings/available-models/", AvailableModelsView.as_view(), name="available-models"),
+    # Constellation is a pure client-side visualization — no assistant plugin,
+    # no config bump, no restart. See ConstellationSettingsView.
+    path("settings/constellation/", ConstellationSettingsView.as_view(), name="constellation-settings"),
+    # Internal runtime endpoint for the agent to acknowledge welcome delivery.
+    path(
+        "runtime/<uuid:tenant_id>/welcomes/<str:feature>/",
+        RuntimeWelcomeMarkView.as_view(),
+        name="runtime-welcome-mark",
+    ),
+    # Internal runtime endpoint for recording agenda engagement events
+    # (Phase B). OpenClaw plugins / extractors / explicit agent tool
+    # calls all funnel through here.
+    path(
+        "runtime/<uuid:tenant_id>/agenda/<str:kind>/<str:item_id>/",
+        RuntimeAgendaEngagementView.as_view(),
+        name="runtime-agenda-engagement",
+    ),
+    # Phase D — record an assistant-written future-aware commitment.
+    # Called by the nbhd_record_commitment plugin tool.
+    path(
+        "runtime/<uuid:tenant_id>/commitments/",
+        RuntimeCommitmentRecordView.as_view(),
+        name="runtime-commitment-record",
+    ),
+    # Assistant-callable primary-model read + switch. Reuses the same
+    # tier gate as the consumer PreferredModelView so the assistant cannot
+    # quietly upgrade itself past the tier ceiling.
+    path(
+        "runtime/<uuid:tenant_id>/preferred-model/",
+        RuntimePreferredModelView.as_view(),
+        name="runtime-preferred-model",
+    ),
+    path("", include(router.urls)),
+]

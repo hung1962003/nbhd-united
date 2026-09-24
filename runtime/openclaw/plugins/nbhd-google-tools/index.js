@@ -1,0 +1,351 @@
+import { wrapTool } from "../../tool-logger.js";
+const wrap = (def) => wrapTool(def, { plugin: "nbhd-google-tools" });
+
+const DEFAULT_REQUEST_TIMEOUT_MS = 20000;
+
+function asObject(value) {
+  return value && typeof value === "object" && !Array.isArray(value) ? value : {};
+}
+
+function asTrimmedString(value) {
+  return typeof value === "string" ? value.trim() : "";
+}
+
+function asStringArray(value, { maxItems = 10 } = {}) {
+  if (value === undefined || value === null) {
+    return [];
+  }
+  if (!Array.isArray(value)) {
+    throw new Error("Expected an array of strings");
+  }
+  if (value.length > maxItems) {
+    throw new Error(`Array exceeds max items (${maxItems})`);
+  }
+
+  const cleaned = [];
+  for (const item of value) {
+    if (typeof item !== "string") {
+      throw new Error("Array must contain only strings");
+    }
+    const normalized = item.trim();
+    if (normalized.length > 0) {
+      cleaned.push(normalized);
+    }
+  }
+  return cleaned;
+}
+
+function parseInteger(value, { defaultValue, min, max }) {
+  if (value === undefined || value === null || value === "") {
+    return defaultValue;
+  }
+  const parsed = Number.parseInt(String(value), 10);
+  if (Number.isNaN(parsed)) {
+    return defaultValue;
+  }
+  return Math.max(min, Math.min(max, parsed));
+}
+
+function parseBoolean(value, defaultValue = false) {
+  if (value === undefined || value === null || value === "") {
+    return defaultValue;
+  }
+  const normalized = String(value).trim().toLowerCase();
+  if (["1", "true", "yes", "on"].includes(normalized)) {
+    return true;
+  }
+  if (["0", "false", "no", "off"].includes(normalized)) {
+    return false;
+  }
+  return defaultValue;
+}
+
+function getRuntimeConfig(api) {
+  const pluginConfig = asObject(api.pluginConfig);
+  const apiBaseUrl = asTrimmedString(pluginConfig.apiBaseUrl || process.env.NBHD_API_BASE_URL).replace(
+    /\/+$/,
+    "",
+  );
+  const tenantId = asTrimmedString(process.env.NBHD_TENANT_ID);
+  const internalKey = asTrimmedString(process.env.NBHD_INTERNAL_API_KEY);
+  const requestTimeoutMs = parseInteger(pluginConfig.requestTimeoutMs, {
+    defaultValue: DEFAULT_REQUEST_TIMEOUT_MS,
+    min: 1000,
+    max: 60000,
+  });
+
+  if (!apiBaseUrl) {
+    throw new Error("NBHD_API_BASE_URL is required");
+  }
+  if (!tenantId) {
+    throw new Error("NBHD_TENANT_ID is required");
+  }
+  if (!internalKey) {
+    throw new Error("NBHD_INTERNAL_API_KEY is required");
+  }
+
+  return { apiBaseUrl, tenantId, internalKey, requestTimeoutMs };
+}
+
+function buildUrl(baseUrl, path, query) {
+  const url = new URL(`${baseUrl}${path}`);
+  for (const [key, value] of Object.entries(query || {})) {
+    if (value === undefined || value === null || value === "") {
+      continue;
+    }
+    url.searchParams.set(key, String(value));
+  }
+  return url;
+}
+
+function renderPayload(payload) {
+  return {
+    content: [
+      {
+        type: "text",
+        text: JSON.stringify(payload, null, 2),
+      },
+    ],
+    details: {
+      json: payload,
+    },
+  };
+}
+
+const TOOL_ERROR_DETAIL_MAX_CHARS = 2000;
+
+function clampErrorDetail(text) {
+  if (text.length <= TOOL_ERROR_DETAIL_MAX_CHARS) return text;
+  return `${text.slice(0, TOOL_ERROR_DETAIL_MAX_CHARS)}… [truncated]`;
+}
+
+function compactErrorDetail(payload) {
+  const normalized = asObject(payload);
+  const entries = Object.entries(normalized).filter(([key]) => key !== "error");
+  if (entries.length === 0) return "";
+
+  const detail = normalized.detail;
+  const detailIsOnlyKey = entries.length === 1 && detail !== undefined;
+  if (detailIsOnlyKey && typeof detail === "string") {
+    return detail.trim() ? clampErrorDetail(detail.trim()) : "";
+  }
+
+  const value = detailIsOnlyKey ? detail : Object.fromEntries(entries);
+  if (value === null || (typeof value === "object" && Object.keys(value).length === 0)) return "";
+
+  try {
+    return clampErrorDetail(JSON.stringify(value));
+  } catch {
+    return clampErrorDetail(String(value));
+  }
+}
+
+async function callNbhdRuntimeRequest(api, { path, method = "GET", query, body }) {
+  const runtime = getRuntimeConfig(api);
+  const url = buildUrl(runtime.apiBaseUrl, path, query);
+
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), runtime.requestTimeoutMs);
+
+  try {
+    const headers = {
+      "X-NBHD-Internal-Key": runtime.internalKey,
+      "X-NBHD-Tenant-Id": runtime.tenantId,
+    };
+    let requestBody;
+    if (method !== "GET" && body !== undefined) {
+      headers["Content-Type"] = "application/json";
+      requestBody = JSON.stringify(body);
+    }
+
+    const response = await fetch(url, {
+      method,
+      headers,
+      body: requestBody,
+      signal: controller.signal,
+    });
+
+    const raw = await response.text();
+    let payload = {};
+    if (raw) {
+      try {
+        payload = JSON.parse(raw);
+      } catch {
+        payload = { detail: "upstream returned a non-JSON response body" };
+      }
+    }
+
+    if (!response.ok) {
+      const normalized = asObject(payload);
+      const code = asTrimmedString(normalized.error) || "runtime_request_failed";
+      // DRF commonly returns field errors at the top level, e.g.
+      // {week_rating: ["..."]}, rather than under `detail`. Preserve that
+      // compact validation payload so the model can correct and retry.
+      const detail = compactErrorDetail(normalized);
+      const detailSuffix = detail ? ` (${detail})` : "";
+      throw new Error(`NBHD runtime error ${response.status}: ${code}${detailSuffix}`);
+    }
+
+    return asObject(payload);
+  } catch (error) {
+    if (error && error.name === "AbortError") {
+      throw new Error(`NBHD runtime request timed out after ${runtime.requestTimeoutMs}ms`);
+    }
+    throw error;
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
+function tenantPath(api, suffix) {
+  const runtime = getRuntimeConfig(api);
+  return `/api/v1/integrations/runtime/${encodeURIComponent(runtime.tenantId)}${suffix}`;
+}
+
+function registerTool(api, tool) {
+  api.registerTool(wrap(tool), { optional: true });
+}
+
+export default function register(api) {
+  registerTool(api, {
+    name: "nbhd_gmail_list_messages",
+    description: "List recent Gmail messages for the tenant (read-only).",
+    parameters: {
+      type: "object",
+      additionalProperties: false,
+      properties: {
+        q: { type: "string", description: "Gmail search query." },
+        max_results: { type: "number", minimum: 1, maximum: 10 },
+      },
+    },
+    async execute(_id, params) {
+      const input = asObject(params);
+      const payload = await callNbhdRuntimeRequest(api, {
+        path: tenantPath(api, "/gmail/messages/"),
+        method: "GET",
+        query: {
+          q: asTrimmedString(input.q),
+          max_results: parseInteger(input.max_results, {
+            defaultValue: 5,
+            min: 1,
+            max: 10,
+          }),
+        },
+      });
+      return renderPayload(payload);
+    },
+  });
+
+  registerTool(api, {
+    name: "nbhd_gmail_get_message_detail",
+    description: "Get normalized Gmail message detail (body + thread context) for action-item extraction.",
+    parameters: {
+      type: "object",
+      additionalProperties: false,
+      properties: {
+        message_id: { type: "string" },
+        include_thread: { type: "boolean" },
+        thread_limit: { type: "number", minimum: 1, maximum: 10 },
+      },
+      required: ["message_id"],
+    },
+    async execute(_id, params) {
+      const input = asObject(params);
+      const messageId = asTrimmedString(input.message_id);
+      if (!messageId) {
+        throw new Error("message_id is required");
+      }
+      const payload = await callNbhdRuntimeRequest(api, {
+        path: tenantPath(api, `/gmail/messages/${encodeURIComponent(messageId)}/`),
+        method: "GET",
+        query: {
+          include_thread: parseBoolean(input.include_thread, true),
+          thread_limit: parseInteger(input.thread_limit, {
+            defaultValue: 5,
+            min: 1,
+            max: 10,
+          }),
+        },
+      });
+      return renderPayload(payload);
+    },
+  });
+
+  registerTool(api, {
+    name: "nbhd_calendar_list_events",
+    description:
+      "List upcoming Google Calendar events for the tenant (read-only). " +
+      "PREFER `window_kind` (server resolves the date range in the tenant's tz) " +
+      "over hand-computing `time_min`/`time_max` from the `[Now: ...]` header — the " +
+      "latter drifts near midnight in the user's local time. " +
+      "window_kind options: today | yesterday | tomorrow | all | last_n_days | next_n_days | " +
+      "last_n_weeks | last_n_months | this_week | last_week | month_to_date | last_month | " +
+      "year_to_date | last_year | since | between. " +
+      "For value-bearing kinds, pass `window_value`: integer for last_n_*/next_n_days, " +
+      "\"YYYY-MM-DD\" for since, \"YYYY-MM-DD,YYYY-MM-DD\" for between. " +
+      "If you must pass `time_min`/`time_max` directly, omit window_kind — they're mutually exclusive.",
+    parameters: {
+      type: "object",
+      additionalProperties: false,
+      properties: {
+        window_kind: { type: "string" },
+        window_value: { type: "string" },
+        time_min: { type: "string" },
+        time_max: { type: "string" },
+        max_results: { type: "number", minimum: 1, maximum: 20 },
+      },
+    },
+    async execute(_id, params) {
+      const input = asObject(params);
+      const payload = await callNbhdRuntimeRequest(api, {
+        path: tenantPath(api, "/google-calendar/events/"),
+        method: "GET",
+        query: {
+          window_kind: asTrimmedString(input.window_kind),
+          window_value: asTrimmedString(input.window_value),
+          time_min: asTrimmedString(input.time_min),
+          time_max: asTrimmedString(input.time_max),
+          max_results: parseInteger(input.max_results, {
+            defaultValue: 10,
+            min: 1,
+            max: 20,
+          }),
+        },
+      });
+      return renderPayload(payload);
+    },
+  });
+
+  registerTool(api, {
+    name: "nbhd_calendar_get_freebusy",
+    description:
+      "Get busy windows from the tenant's primary Google Calendar (read-only). " +
+      "Accepts the same window_kind / window_value parameters as nbhd_calendar_list_events; " +
+      "prefer those over hand-computed time_min/time_max.",
+    parameters: {
+      type: "object",
+      additionalProperties: false,
+      properties: {
+        window_kind: { type: "string" },
+        window_value: { type: "string" },
+        time_min: { type: "string" },
+        time_max: { type: "string" },
+      },
+    },
+    async execute(_id, params) {
+      const input = asObject(params);
+      const payload = await callNbhdRuntimeRequest(api, {
+        path: tenantPath(api, "/google-calendar/freebusy/"),
+        method: "GET",
+        query: {
+          window_kind: asTrimmedString(input.window_kind),
+          window_value: asTrimmedString(input.window_value),
+          time_min: asTrimmedString(input.time_min),
+          time_max: asTrimmedString(input.time_max),
+        },
+      });
+      return renderPayload(payload);
+    },
+  });
+
+}

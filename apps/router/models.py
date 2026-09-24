@@ -1,0 +1,1042 @@
+"""Router models — message buffering for idle-hibernated tenants and
+per-tenant serialization for warm-tenant rapid-fire messages."""
+
+import uuid
+
+from django.db import models
+
+
+class BufferedMessage(models.Model):
+    """Messages received while a tenant's container was hibernated.
+
+    When a user sends a message to a hibernated container, a MINIMAL redacted
+    envelope is stored here — never the raw provider webhook (which holds the
+    real name/username/phone/chat-title the subscriber typed and is the
+    highest-sensitivity row in the system; docs/encryption-at-rest-directive.md
+    §7). ``payload`` is a schema-versioned envelope (see
+    ``apps.router.buffer_envelope``) carrying only the routing/media metadata the
+    drain needs; ``user_text`` is redacted at write time through the same seam a
+    live message goes through. After the container wakes (~45s), a QStash task
+    forwards all buffered messages in order, then hard-deletes them.
+
+    Backward compat: rows written before this change hold a raw webhook in
+    ``payload`` (no ``schema`` marker) and raw ``user_text``. The drain
+    shape-sniffs and handles both; legacy rows age out via the delete-on-forward
+    + TTL sweepers (PR #1082) rather than being migrated.
+    """
+
+    class Channel(models.TextChoices):
+        TELEGRAM = "telegram"
+        LINE = "line"
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    tenant = models.ForeignKey(
+        "tenants.Tenant",
+        on_delete=models.CASCADE,
+        related_name="buffered_messages",
+    )
+    channel = models.CharField(max_length=16, choices=Channel.choices)
+    payload = models.JSONField(
+        help_text=(
+            "Minimal schema-versioned envelope with the routing/media metadata "
+            "the drain needs (apps.router.buffer_envelope). Legacy rows hold a "
+            "raw webhook (no 'schema' marker) — the drain handles both."
+        ),
+    )
+    user_text = models.TextField(
+        blank=True,
+        default="",
+        help_text="Extracted user message text, redacted at write time.",
+    )
+    created_at = models.DateTimeField(auto_now_add=True)
+    delivered = models.BooleanField(default=False)
+    delivered_at = models.DateTimeField(null=True, blank=True)
+
+    class Status(models.TextChoices):
+        PENDING = "pending"
+        DELIVERED = "delivered"
+        FAILED = "failed"
+
+    delivery_attempts = models.PositiveSmallIntegerField(
+        default=0,
+        help_text="Number of times deliver_buffered_messages has tried and failed to deliver this message.",
+    )
+    delivery_status = models.CharField(
+        max_length=16,
+        choices=Status.choices,
+        default=Status.PENDING,
+        help_text="Terminal state: 'delivered' on success, 'failed' after attempts cap reached.",
+    )
+    delivery_in_flight_until = models.DateTimeField(
+        null=True,
+        blank=True,
+        help_text=(
+            "Soft lease: while now() < this timestamp, an in-progress "
+            "deliver_buffered_messages task is mid-POST for this row. "
+            "Concurrent QStash retries skip rows whose lease is still "
+            "live so we don't fire duplicate /v1/chat/completions calls "
+            "at the container while the first turn is still running."
+        ),
+    )
+
+    class Meta:
+        db_table = "buffered_messages"
+        ordering = ["created_at"]
+
+    def __str__(self) -> str:
+        return f"BufferedMessage({self.channel}, {self.delivery_status}, tenant={self.tenant_id})"
+
+
+class PendingMessage(models.Model):
+    """Messages awaiting forwarding to a warm tenant container, serialized
+    per (tenant, channel, channel_user_id).
+
+    Distinct from ``BufferedMessage`` (which covers hibernation buffering):
+    this queue exists to prevent the OpenClaw claude-cli backend from
+    receiving overlapping turns on the same live session. Claude rejects
+    a second concurrent turn with "Claude CLI live session is already
+    handling a turn", which previously caused a silent fallback to
+    MiniMax (or a hard error post-#427).
+
+    Flow:
+      1. LINE/Telegram webhook receives message → row inserted, status
+         ``pending``, ``delivery_in_flight_until=NULL``.
+      2. QStash ``drain_pending_messages_for_tenant`` task fires (almost
+         immediately for the typical case).
+      3. Drain task claims the oldest pending row for
+         ``(tenant, channel, channel_user_id)`` via
+         ``SELECT ... FOR UPDATE SKIP LOCKED``, takes a soft lease
+         (``delivery_in_flight_until``), POSTs to the container, relays
+         the response back to the user, marks row ``delivered``.
+      4. If more pending rows exist for the same key, the task
+         re-schedules itself; otherwise it exits.
+
+    The lease pattern mirrors PR #430's approach for ``BufferedMessage``:
+    a concurrent QStash retry / cron tick observes the live lease and
+    skips the row instead of firing a duplicate ``/v1/chat/completions``
+    while the first turn is mid-flight.
+
+    The ``channel_user_id`` is the per-channel user identifier
+    (``line_user_id`` for LINE, the Telegram ``chat_id`` as a string for
+    Telegram). Tenants are typically 1:1 with users today, but two
+    different LINE users on the same tenant must not block each other —
+    the queue is keyed by ``(tenant, channel, channel_user_id)``.
+    """
+
+    class Channel(models.TextChoices):
+        TELEGRAM = "telegram"
+        LINE = "line"
+        IOS = "ios"
+
+    class Status(models.TextChoices):
+        PENDING = "pending"
+        DELIVERED = "delivered"
+        FAILED = "failed"
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    tenant = models.ForeignKey(
+        "tenants.Tenant",
+        on_delete=models.CASCADE,
+        related_name="pending_messages",
+    )
+    channel = models.CharField(max_length=16, choices=Channel.choices)
+    channel_user_id = models.CharField(
+        max_length=128,
+        help_text=(
+            "Per-channel user identifier (line_user_id for LINE, Telegram "
+            "chat_id stringified for Telegram). Used to scope the queue "
+            "so two distinct users on the same tenant don't block each "
+            "other."
+        ),
+    )
+    payload = models.JSONField(
+        help_text=(
+            "Channel-specific bundle with everything the drain task needs "
+            "to forward the message and relay the reply: prepared "
+            "message_text (with workspace + datetime markers already "
+            "injected), user_param, user_timezone, reply_token, is_voice, "
+            "etc."
+        ),
+    )
+    user_text = models.TextField(
+        blank=True,
+        default="",
+        help_text="Redacted user-facing excerpt used for coalescing and logging.",
+    )
+    created_at = models.DateTimeField(auto_now_add=True)
+    delivered_at = models.DateTimeField(null=True, blank=True)
+    delivery_status = models.CharField(
+        max_length=16,
+        choices=Status.choices,
+        default=Status.PENDING,
+        help_text="Terminal state: 'delivered' on success, 'failed' after attempts cap reached.",
+    )
+    delivery_attempts = models.PositiveSmallIntegerField(
+        default=0,
+        help_text="Number of times the drain task has tried and failed to deliver this message.",
+    )
+    delivery_in_flight_until = models.DateTimeField(
+        null=True,
+        blank=True,
+        help_text=(
+            "Soft lease: while now() < this timestamp, an in-progress "
+            "drain task is mid-POST for this row. Concurrent QStash "
+            "retries skip rows whose lease is still live so we don't "
+            "fire duplicate /v1/chat/completions calls at the container "
+            "while the first turn is still running."
+        ),
+    )
+
+    class Meta:
+        db_table = "pending_messages"
+        ordering = ["created_at"]
+        indexes = [
+            models.Index(
+                fields=["tenant", "channel", "channel_user_id", "delivery_status", "created_at"],
+                name="pmsg_drain_lookup_idx",
+            ),
+        ]
+
+    def __str__(self) -> str:
+        return f"PendingMessage({self.channel}, {self.delivery_status}, tenant={self.tenant_id})"
+
+
+class ProcessedInboundEvent(models.Model):
+    """Idempotency ledger for inbound provider events.
+
+    LINE and Telegram both deliver webhooks *at least once*: LINE
+    redelivers an event (same ``webhookEventId``, ``deliveryContext.
+    isRedelivery=true``) whenever our endpoint is slow to 200 or on its
+    internal retry; Telegram replays any ``update_id`` that wasn't
+    acknowledged before the poller process restarted (the offset is
+    in-memory only). Without a dedupe gate every redelivery spawns a
+    fresh ``PendingMessage`` → a fresh drain → a duplicate assistant
+    reply. The ``PendingMessage`` SKIP-LOCKED lease only protects a
+    single row; two rows born from the same logical event are processed
+    independently.
+
+    Each channel claims its event here *before* any side effect, keyed
+    by the provider's stable id (``line:<webhookEventId>`` /
+    ``tg:<update_id>``). The unique constraint makes the claim race-safe
+    across the LINE webhook's per-event daemon threads and concurrent
+    redelivery. Rows are pruned probabilistically (see
+    ``apps.router.inbound_dedup``) so the table can't grow unbounded
+    without standing up new cron infrastructure.
+    """
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    event_key = models.CharField(
+        max_length=160,
+        unique=True,
+        help_text=(
+            "Provider-namespaced stable event id: 'line:<webhookEventId>' "
+            "or 'tg:<update_id>'. The unique constraint is the dedupe."
+        ),
+    )
+    created_at = models.DateTimeField(auto_now_add=True, db_index=True)
+
+    class Meta:
+        verbose_name = "processed inbound event"
+        verbose_name_plural = "processed inbound events"
+
+    def __str__(self) -> str:
+        return f"ProcessedInboundEvent({self.event_key})"
+
+
+class ProactiveOutbound(models.Model):
+    """Records proactive delivery events and internal eval evidence.
+
+    User-visible rows can surface as context on the next inbound; ``eval`` rows
+    are deliberately excluded from all user/model readers.
+
+    The conversation-state-loss problem this solves: cron-fired sessions
+    and main-chat sessions are separate OpenClaw sessions. When a cron
+    job sends a 3-bullet check-in via ``nbhd_send_to_user`` and the
+    container then hibernates, the user's reply arrives on a fresh main-
+    chat session with no record of what was asked — so the agent
+    conflates a multi-point reply because it can't anchor each paragraph
+    to the original question. The legacy mitigation
+    (``_phase2_sync_block``) prompts the agent to create a hidden
+    ``_sync:`` cron that injects a summary into the main session, but
+    that path is LLM-mediated and unreliably fired.
+
+    This model is the deterministic replacement: every accepted delivery from
+    ``CronDeliveryView`` writes a row here. For user-delivery channels, the
+    inbound envelope composer (LINE webhook, Telegram webhook, Telegram poller)
+    pulls unconsumed rows from the last 24h and prepends them as a
+    ``[earlier-from-you ...]`` block before the user's text.
+
+    ``parsed_items`` stores markdown bullets / numbered items extracted
+    from ``message_text`` so the envelope can render a structured
+    "previous question 1/2/3" block; the agent's chat marker then knows
+    to map reply paragraphs by index when the counts line up.
+
+    Distinct from ``LineOutboundMessage``: that table keys by LINE
+    ``message_id`` for quote-reply lookups and is LINE-specific. This
+    table is channel-agnostic and keys by ``(tenant, channel,
+    channel_user_id, created_at)`` for thread-continuity lookups.
+    """
+
+    class Channel(models.TextChoices):
+        TELEGRAM = "telegram"
+        LINE = "line"
+        # iOS-only users have no Telegram/LINE chat id — the message is delivered
+        # as an APNs push + a ?since= feed row, so the iOS app is its own channel.
+        APP = "app"
+        # EXPLICIT EVAL-SINK TENANTS ONLY (``Tenant.is_eval_sink``). No user
+        # transport is invoked; this internal evidence row is the delivery the eval
+        # suites assert on. Operational history/model readers exclude these rows.
+        # The dedicated flag prevents ordinary synthetic tenants (including demo
+        # accounts) from being reclassified merely because they are synthetic.
+        EVAL = "eval"
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    tenant = models.ForeignKey(
+        "tenants.Tenant",
+        on_delete=models.CASCADE,
+        related_name="proactive_outbounds",
+    )
+    channel = models.CharField(max_length=16, choices=Channel.choices)
+    channel_user_id = models.CharField(
+        max_length=128,
+        help_text=("Per-channel user identifier (line_user_id for LINE, Telegram chat_id stringified for Telegram)."),
+    )
+    message_text = models.TextField(
+        help_text="Full proactive message body in PII-placeholder space ([PERSON_1]), "
+        "as the agent authored it. Stored placeholder-space at rest "
+        "(pseudonymize-at-rest); rehydrated only at owner-facing egress "
+        "(the iOS APNs push and the ?since= feed builder).",
+    )
+    job_name = models.CharField(
+        max_length=64,
+        blank=True,
+        default="",
+        help_text=(
+            "Cron job name if the send originated from a cron session "
+            "(read from X-NBHD-Job-Name header). Empty for main-session "
+            "or ad-hoc proactive sends."
+        ),
+    )
+    parsed_items = models.JSONField(
+        default=list,
+        blank=True,
+        help_text=(
+            "Markdown bullets / numbered items extracted from "
+            "``message_text`` as list[str]. Empty list when the body has "
+            "no list structure. Used by the envelope to render structured "
+            "anchors so a multi-paragraph reply can be mapped by index."
+        ),
+    )
+    created_at = models.DateTimeField(auto_now_add=True)
+    consumed_at = models.DateTimeField(
+        null=True,
+        blank=True,
+        help_text=(
+            "Set when this row was first surfaced into an inbound "
+            "envelope. Kept for audit even after consumption — the "
+            "envelope still surfaces consumed rows within a short "
+            "follow-up window so back-to-back replies still see context."
+        ),
+    )
+    notified_at = models.DateTimeField(
+        null=True,
+        blank=True,
+        help_text=(
+            "Set when an APNs push was first claimed for this proactive / cron "
+            "send so the iOS app pings the user (the counterpart to "
+            "``AppChatMessage.notified_at``). The atomic isnull→now claim makes "
+            "the push idempotent. Distinct from ``consumed_at`` (inbound-envelope "
+            "thread continuity), which is deliberately re-surfaced."
+        ),
+    )
+    journal_link = models.JSONField(
+        null=True,
+        blank=True,
+        default=None,
+        help_text=(
+            "A tappable 'View in Journal' deep-link parsed from a trailing "
+            "``[[journal-link: kind|slug|title]]`` marker on a proactive / cron "
+            "send (see ``apps.router.journal_link.extract_journal_link``). "
+            "Stored as ``{kind, slug, title}`` in PII-placeholder space "
+            "(``title`` rehydrated only at the owner-facing ``?since=`` feed). "
+            "Populated only for app-channel sends; null on Telegram/LINE (marker "
+            "stripped, no transport) and when the send carried no marker. This "
+            "is the path MJ's morning report uses."
+        ),
+    )
+    # Up to 3 short tappable choice labels parsed from a trailing
+    # ``[[quick-replies: A | B | C]]`` marker on a proactive / cron send (see
+    # ``apps.router.quick_replies.extract_quick_replies``). Stored in
+    # PII-placeholder space and rehydrated only at the owner-facing ``?since=``
+    # feed. null/absent means the send carried no valid marker.
+    quick_replies = models.JSONField(null=True, blank=True, default=None)
+
+    class Meta:
+        db_table = "proactive_outbounds"
+        ordering = ["-created_at"]
+        indexes = [
+            models.Index(
+                fields=["tenant", "channel", "channel_user_id", "-created_at"],
+                name="proactive_outb_thread_idx",
+            ),
+            models.Index(
+                fields=["created_at"],
+                name="proactive_outb_created_idx",
+            ),
+            # Ascending walk for the ?since= cross-channel history feed.
+            models.Index(fields=["tenant", "created_at"], name="proactive_tenant_created_idx"),
+        ]
+
+    def __str__(self) -> str:
+        return f"ProactiveOutbound({self.channel}, tenant={self.tenant_id}, job={self.job_name or '-'})"
+
+
+class DeliveryAttempt(models.Model):
+    """Claims one degraded proactive-delivery occurrence before transport."""
+
+    class State(models.TextChoices):
+        CLAIMED = "claimed", "Transport not yet attempted"
+        SENT = "sent", "Transport confirmed acceptance"
+        FAILED = "failed", "Definitive failure; safe to retry"
+        AMBIGUOUS = "ambiguous", "Transport outcome unknown; do not retry"
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    tenant = models.ForeignKey(
+        "tenants.Tenant",
+        on_delete=models.CASCADE,
+        related_name="delivery_attempts",
+    )
+    occurrence_key = models.CharField(max_length=64, db_index=True)
+    job_name = models.CharField(max_length=128, blank=True, default="")
+    channel = models.CharField(max_length=16)
+    state = models.CharField(max_length=12, choices=State.choices, default=State.CLAIMED)
+    claimed_at = models.DateTimeField(auto_now_add=True)
+    resolved_at = models.DateTimeField(null=True, blank=True)
+    response_excerpt = models.CharField(max_length=500, blank=True, default="")
+    pii_receipts = models.JSONField(default=dict, blank=True)
+
+    class Meta:
+        constraints = [
+            models.UniqueConstraint(
+                fields=["tenant", "occurrence_key"],
+                name="delivery_attempt_unique_tenant_occurrence",
+            ),
+        ]
+
+    def __str__(self) -> str:
+        return f"DeliveryAttempt({self.channel}, tenant={self.tenant_id}, state={self.state})"
+
+
+class LineOutboundMessage(models.Model):
+    """Records LINE messages we've sent so quote-reply lookups can resolve
+    a ``quotedMessageId`` on inbound webhook events back to the original
+    text we sent.
+
+    LINE's webhook delivers only the *id* of the quoted message on a
+    quote-reply (``TextMessageContent.quotedMessageId``), unlike Telegram
+    which inlines ``reply_to_message.text``. To prepend
+    ``[Replying to: "..."]`` context to the user's message before
+    forwarding to the container, we have to look up what we said.
+
+    Rows are pruned probabilistically on insert so the table can't grow
+    unbounded (see ``apps.router.line_webhook._record_line_outbound``).
+    """
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    tenant = models.ForeignKey(
+        "tenants.Tenant",
+        on_delete=models.CASCADE,
+        related_name="line_outbound_messages",
+    )
+    line_user_id = models.CharField(max_length=128)
+    line_message_id = models.CharField(
+        max_length=64,
+        unique=True,
+        help_text="ID returned by LINE's push/reply API in sentMessages[].id.",
+    )
+    text_excerpt = models.TextField(
+        blank=True,
+        default="",
+        help_text="First ~500 chars of the message we sent, in PII-placeholder space "
+        "([PERSON_1]) — pseudonymize-at-rest. Its only reader "
+        "(_extract_line_reply_context) inlines it into the INBOUND agent turn, "
+        "which is model-facing, so placeholder space is correct and needs no "
+        "rehydration.",
+    )
+    sent_at = models.DateTimeField(auto_now_add=True, db_index=True)
+
+    class Meta:
+        db_table = "line_outbound_messages"
+        ordering = ["-sent_at"]
+        indexes = [
+            models.Index(
+                fields=["tenant", "line_user_id", "-sent_at"],
+                name="line_outb_tenant_user_idx",
+            ),
+        ]
+
+    def __str__(self) -> str:
+        return f"LineOutboundMessage({self.line_message_id})"
+
+
+class LineQuotaState(models.Model):
+    """Fleet-wide LINE Messaging API Push-message quota state.
+
+    Singleton row (``pk=1``) updated by the daily poll task in
+    ``apps.router.line_quota`` and by the 429 tripwire in the Push send
+    paths. Frontend channel-selector + state-transition handlers read
+    this row to decide whether LINE is currently selectable and whether
+    to fire user-facing emails (90% pre-warn, exhaustion fan-out,
+    recovery fan-out).
+
+    Why a singleton, not per-tenant: every tenant shares the *same*
+    LINE Messaging API channel (one bot, one access token, one monthly
+    Push allowance). When the cap is hit, no tenant can receive Push.
+    Per-tenant rows would invert the model — quota is a property of the
+    bot, not the tenant.
+    """
+
+    id = models.PositiveSmallIntegerField(primary_key=True, default=1)
+
+    line_quota_limit = models.PositiveIntegerField(
+        null=True,
+        blank=True,
+        help_text=("Monthly Push-message cap from /v2/bot/message/quota. Null before the first successful poll."),
+    )
+    line_quota_used = models.PositiveIntegerField(
+        default=0,
+        help_text="Push messages used this month from /v2/bot/message/quota/consumption.",
+    )
+    line_quota_checked_at = models.DateTimeField(
+        null=True,
+        blank=True,
+        help_text="Timestamp of the last successful poll.",
+    )
+    line_quota_pre_warn_sent_at = models.DateTimeField(
+        null=True,
+        blank=True,
+        help_text=(
+            "When the 90% pre-warn email was last sent. Cleared when usage "
+            "drops back below the threshold (next month) so the next event "
+            "fires fresh."
+        ),
+    )
+    line_quota_exhausted_at = models.DateTimeField(
+        null=True,
+        blank=True,
+        help_text=(
+            "When the system entered the exhausted state. Set by the 429 "
+            "tripwire or by the daily poll seeing used >= limit. Cleared "
+            "by the poll when usage drops back below the cap. Presence "
+            "drives the frontend LINE-disabled gate."
+        ),
+    )
+    line_quota_exhausted_notified_at = models.DateTimeField(
+        null=True,
+        blank=True,
+        help_text=(
+            "When the exhaustion fan-out (user emails + channel flips) "
+            "last completed. Compared against ``line_quota_exhausted_at`` "
+            "for idempotency: if the handler is dispatched twice for the "
+            "same exhaustion event (tripwire + poll race), the second "
+            "dispatch bails. Cleared on recovery so the next event fires "
+            "fresh."
+        ),
+    )
+    line_quota_recovered_notified_at = models.DateTimeField(
+        null=True,
+        blank=True,
+        help_text=(
+            "When the 'LINE is back — want to switch?' fan-out emails "
+            "last completed. Cleared the next time we enter exhausted."
+        ),
+    )
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        db_table = "line_quota_state"
+
+    def save(self, *args, **kwargs):
+        # Enforce singleton — pk=1 always.
+        self.pk = 1
+        super().save(*args, **kwargs)
+
+    @classmethod
+    def get(cls) -> "LineQuotaState":
+        """Return the singleton row, creating it on first access."""
+        obj, _ = cls.objects.get_or_create(pk=1)
+        return obj
+
+    @property
+    def is_exhausted(self) -> bool:
+        return self.line_quota_exhausted_at is not None
+
+    @property
+    def usage_ratio(self) -> float | None:
+        """Fraction of the monthly cap consumed (0.0–1.0+), or None if
+        the cap is unknown."""
+        if not self.line_quota_limit:
+            return None
+        return self.line_quota_used / self.line_quota_limit
+
+    def __str__(self) -> str:
+        if not self.line_quota_limit:
+            return "LineQuotaState(uninitialized)"
+        return (
+            f"LineQuotaState({self.line_quota_used}/{self.line_quota_limit}"
+            f"{', exhausted' if self.is_exhausted else ''})"
+        )
+
+
+class ChatThread(models.Model):
+    """A conversation thread the user owns, independent of channel.
+
+    Threads decouple "a conversation" from "a channel/device". The shared
+    ``is_main`` thread is the default conversation that every channel
+    (Telegram, LINE, iOS) resumes — so a conversation continues seamlessly
+    across devices. Rich clients (iOS/web) may create additional named
+    threads for topic separation.
+
+    The OpenClaw ``user`` param for a thread is ``thread:<id>`` (see
+    ``apps/router/chat_views.py``), so each thread hashes to its own
+    OpenClaw session/sessionKey while ``USER.md``/memory stays shared
+    tenant-wide (assembled channel-blind in
+    ``apps/orchestrator/workspace_envelope.py``). That is what lets a new
+    surface "know who you are" without copying any state — identity is the
+    tenant's, the thread is just the transcript.
+    """
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    tenant = models.ForeignKey(
+        "tenants.Tenant",
+        on_delete=models.CASCADE,
+        related_name="chat_threads",
+    )
+    user = models.ForeignKey(
+        "tenants.User",
+        on_delete=models.CASCADE,
+        related_name="chat_threads",
+    )
+    title = models.CharField(max_length=120, blank=True, default="")
+    # Encryption-at-rest Phase 2 (expand/contract): sealed envelope of the same
+    # value as ``title``, under box.encrypt with AAD
+    # ``enc_columns.CHAT_THREAD_TITLE``. Ships DARK — see AppChatMessage.user_text_enc.
+    title_enc = models.BinaryField(null=True)
+    is_main = models.BooleanField(
+        default=False,
+        help_text="The shared default thread resumed by every channel. One per tenant.",
+    )
+    created_at = models.DateTimeField(auto_now_add=True)
+    last_active_at = models.DateTimeField(null=True, blank=True)
+
+    class Meta:
+        db_table = "chat_threads"
+        ordering = ["-last_active_at", "-created_at"]
+        constraints = [
+            models.UniqueConstraint(
+                fields=["tenant"],
+                condition=models.Q(is_main=True),
+                name="uniq_main_thread_per_tenant",
+            ),
+        ]
+
+    def __str__(self) -> str:
+        # Non-content label only — never render self.title, which becomes
+        # ciphertext / a RedactedStr once encryption-at-rest is on (Phase 2).
+        label = "main" if self.is_main else str(self.id)
+        return f"ChatThread({label}, tenant={self.tenant_id})"
+
+
+class RuntimeWriteActivity(models.Model):
+    """Control-plane-authoritative timestamp of a tenant runtime mutation."""
+
+    tenant = models.OneToOneField(
+        "tenants.Tenant",
+        on_delete=models.CASCADE,
+        primary_key=True,
+        related_name="runtime_write_activity",
+    )
+    last_runtime_write_at = models.DateTimeField()
+
+    class Meta:
+        db_table = "runtime_write_activity"
+
+
+class AppChatMessage(models.Model):
+    """A single rich-client (iOS/web) chat turn: the user's message and the
+    assistant's reply, persisted so the client can POLL for the reply.
+
+    Telegram/LINE relay replies via their push APIs; rich clients have no
+    push transport, so the drain (``_drain_ios_batch`` in
+    ``apps/router/pending_queue.py``) writes the assistant reply here keyed
+    by the client-supplied ``client_msg_id`` and the client polls
+    ``GET /api/v1/chat/messages/<client_msg_id>/`` until ``status`` flips to
+    ``ready`` (or ``error``).
+
+    ``client_msg_id`` is the idempotency key: a retried POST with the same
+    id returns the existing turn instead of enqueuing a duplicate.
+    """
+
+    class Status(models.TextChoices):
+        PENDING = "pending"
+        READY = "ready"
+        ERROR = "error"
+
+    class Source(models.TextChoices):
+        # Reply produced by the tenant's OpenClaw runtime (the normal
+        # POST → enqueue → drain → poll flow).
+        TENANT = "tenant"
+        # Turn ran entirely on the client's local model (iOS private mode)
+        # and was recorded here AFTER the fact so thread history and the
+        # USER.md conversation digest still see it. Never enqueued.
+        ON_DEVICE = "on_device"
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    tenant = models.ForeignKey(
+        "tenants.Tenant",
+        on_delete=models.CASCADE,
+        related_name="app_chat_messages",
+    )
+    user = models.ForeignKey(
+        "tenants.User",
+        on_delete=models.CASCADE,
+        related_name="app_chat_messages",
+    )
+    thread = models.ForeignKey(
+        ChatThread,
+        on_delete=models.CASCADE,
+        related_name="messages",
+    )
+    client_msg_id = models.CharField(
+        max_length=64,
+        help_text="Client-supplied stable id. Idempotency key + poll key.",
+    )
+    user_text = models.TextField()
+    # Encryption-at-rest Phase 2 (expand/contract): sealed envelope of the same
+    # value as ``user_text``, under box.encrypt with AAD
+    # ``enc_columns.APP_CHAT_MESSAGE_USER_TEXT``. Ships DARK — nothing reads or
+    # writes it yet (PR-2 turns on dual-write behind ``Tenant.encrypt_chat_writes``,
+    # PR-4 reads behind ``Tenant.read_encrypted_chat``). NULL = not-yet-encrypted;
+    # ``b""`` = encrypted empty string (see apps/crypto/box.py sentinels).
+    user_text_enc = models.BinaryField(null=True)
+    # Assistant reply, marker-stripped and kept in PII-placeholder space
+    # ([PERSON_1]) at rest (pseudonymize-at-rest) for tenant-produced replies;
+    # rehydrated at the owner-facing seams (_serialize_message, the ?since=
+    # feed). ON_DEVICE replies (ChatLocalTurnView) are authored in real-name
+    # space on the device and stored verbatim — rehydration is a harmless no-op
+    # on them. reply_redactions carries the placeholder→real mapping.
+    reply_text = models.TextField(blank=True, default="")
+    status = models.CharField(
+        max_length=16,
+        choices=Status.choices,
+        default=Status.PENDING,
+    )
+    source = models.CharField(
+        max_length=16,
+        choices=Source.choices,
+        default=Source.TENANT,
+        help_text="Where the assistant reply was produced: the tenant runtime, "
+        "or the client's on-device model (recorded post-hoc).",
+    )
+    error = models.CharField(
+        max_length=64,
+        blank=True,
+        default="",
+        help_text="Machine-readable error reason when status=error (e.g. 'budget_exhausted').",
+    )
+    attachment_path = models.CharField(
+        max_length=255,
+        blank=True,
+        default="",
+        help_text="Workspace-relative path of an inbound image stored on the tenant "
+        "share (e.g. 'workspace/media/inbound/photo_ab12cd34.jpg'); empty for text-only "
+        "turns. The agent reads it via the '[Photo attached: <container-path>]' marker "
+        "baked into the queued message_text — the bytes never ride the queue payload.",
+    )
+    created_at = models.DateTimeField(auto_now_add=True)
+    replied_at = models.DateTimeField(null=True, blank=True)
+    retried_at = models.DateTimeField(
+        null=True,
+        blank=True,
+        help_text=(
+            "Set when a silently dropped tenant-runtime turn spends its one "
+            "bounded replay. The same row returns to pending if that replay runs."
+        ),
+    )
+    retry_health_deferred_at = models.DateTimeField(
+        null=True,
+        blank=True,
+        help_text="Set when the dropped-turn replay spends its one 120-second health deferral.",
+    )
+    waking_at = models.DateTimeField(
+        null=True,
+        blank=True,
+        help_text="Set while the tenant container is waking from hibernation "
+        "so polling clients can show honest 'assistant is waking up' copy "
+        "instead of an indefinite typing indicator. Meaningless once "
+        "status leaves 'pending'.",
+    )
+    # Live agent-activity narration while status=pending. The container's
+    # tool-call hooks report progress to ProgressEventView, which updates these
+    # in place; polling clients render them (in-app "searching your journal…"
+    # instead of dumb dots; the iOS-27 Siri Live Activity maps `phase` to
+    # progress.localizedDescription). Meaningless once status leaves 'pending'.
+    phase = models.CharField(
+        max_length=24,
+        blank=True,
+        default="",
+        help_text="Coarse activity phase: '', 'waking', 'thinking', 'tool', 'composing'.",
+    )
+    phase_detail = models.CharField(
+        max_length=200,
+        blank=True,
+        default="",
+        help_text="Human-readable detail for the current phase, e.g. 'searching your journal'.",
+    )
+    # Per-step partial assistant text (pseudo-streaming) while status=pending. The
+    # nbhd-stream-progress plugin's llm_output/before_agent_finalize hooks POST the
+    # cumulative text-so-far here (seq-guarded, monotonic) so a polling client can
+    # render progressive text instead of waiting for the whole reply. Cleared to ''
+    # when the terminal reply is written; meaningless once status leaves 'pending'.
+    partial_text = models.TextField(
+        blank=True,
+        default="",
+        help_text="Cumulative assistant text-so-far for the in-flight turn (streamed "
+        "per model-call step). Cleared when the final reply is written.",
+    )
+    partial_seq = models.IntegerField(
+        default=0,
+        help_text="Monotonic sequence of the latest partial_text write; a stale/duplicate "
+        "post (seq <= this) is ignored so out-of-order events can't rewind the stream.",
+    )
+    notified_at = models.DateTimeField(
+        null=True,
+        blank=True,
+        help_text="Set when an APNs 'reply ready' / 'error' push was first claimed "
+        "for this turn. The atomic isnull→now claim makes the push idempotent: a "
+        "re-drained batch (QStash retry, re-leased batch) won't push twice.",
+    )
+    # Per-turn PII transparency metadata: which real values were obfuscated
+    # behind placeholders before the turn reached the assistant. Each is a list
+    # of ``{"placeholder": "[LOCATION_330]", "value": "Sydney"}`` (``value`` is
+    # null for an unbound/orphan placeholder). null/absent = nothing was
+    # obfuscated for this turn OR the row predates the feature — a pre-feature
+    # row and a no-PII turn are indistinguishable and both mean "show nothing".
+    # ``reply_redactions`` is captured from the assistant reply BEFORE
+    # rehydration (the only point it is still in placeholder space) and lives
+    # only on the representative row of a coalesced batch (siblings stay null),
+    # mirroring where ``reply_text`` lands.
+    user_redactions = models.JSONField(null=True, blank=True, default=None)
+    reply_redactions = models.JSONField(null=True, blank=True, default=None)
+    # Up to 3 short tappable choice labels parsed from a trailing
+    # ``[[quick-replies: A | B | C]]`` marker on the assistant reply (see
+    # ``apps.router.quick_replies.extract_quick_replies``). Rides the SAME
+    # representative row as ``reply_text`` (siblings stay null). null/absent
+    # means the turn carried no marker (or predates the feature) — the two
+    # are indistinguishable and both mean "show no buttons". iOS-only for
+    # now; Telegram/LINE strip the marker but never populate this field.
+    quick_replies = models.JSONField(null=True, blank=True, default=None)
+    # A tappable "View in Journal" deep-link parsed from a trailing
+    # ``[[journal-link: kind|slug|title]]`` marker on the assistant reply (see
+    # ``apps.router.journal_link.extract_journal_link``). Rides the SAME
+    # representative row as ``reply_text`` (siblings stay null). Stored as
+    # ``{"kind", "slug", "title"}`` in PII-placeholder space; the owner-facing
+    # read seams rehydrate ``title``. null/absent means the turn carried no
+    # marker (or predates the feature) — both mean "show no chip". iOS-only;
+    # Telegram/LINE strip the marker but never populate this field.
+    journal_link = models.JSONField(null=True, blank=True, default=None)
+
+    @property
+    def attachment_flags(self) -> tuple[bool, bool]:
+        """``(has_image, has_document)`` for this turn's stored attachment.
+
+        One attachment per turn, typed off the stored file's extension (no
+        schema column): a ``.pdf`` path is a document, any other non-empty path
+        is an image, an empty path is neither. Null-safe. The single source of
+        truth shared by the per-message detail serializer
+        (``chat_views._serialize_message``) and the ``?since=`` history feed
+        (``apps.router.chat_history``) so the two rendering paths can never
+        drift on how a stored path maps to an attachment bubble.
+        """
+        path = self.attachment_path
+        if not path:
+            return False, False
+        is_pdf = path.lower().endswith(".pdf")
+        return (not is_pdf, is_pdf)
+
+    class Meta:
+        db_table = "app_chat_messages"
+        ordering = ["created_at"]
+        constraints = [
+            models.UniqueConstraint(
+                fields=["tenant", "client_msg_id"],
+                name="uniq_app_chat_client_msg",
+            ),
+        ]
+        indexes = [
+            models.Index(fields=["thread", "created_at"], name="appchat_thread_idx"),
+            # Ascending cross-channel walk for the ?since= history feed (both the
+            # user and assistant message rows of a turn key off created_at, so a
+            # single (tenant, created_at) index covers the keyset pagination).
+            models.Index(fields=["tenant", "created_at"], name="appchat_tenant_created_idx"),
+        ]
+
+    def __str__(self) -> str:
+        return f"AppChatMessage({self.status}, thread={self.thread_id})"
+
+
+class ConversationTurn(models.Model):
+    """One captured chat turn (user message + assistant reply) for a Telegram
+    or LINE conversation, persisted control-plane-side so ISOLATED cron
+    sessions and proactive comms can see what was actually discussed today and
+    on recent days.
+
+    Why this exists: Telegram/LINE conversations are relayed to the per-tenant
+    OpenClaw container and never otherwise persisted in Postgres —
+    ``PendingMessage`` is an ephemeral queue row that's gone after delivery.
+    Cron sessions (Evening Check-in, Heartbeat, Morning Briefing, …) run in a
+    SEPARATE OpenClaw session that cannot read the main chat transcript, and the
+    only "today" surfaces they CAN read (daily-note ``Document`` rows,
+    ``nbhd_journal_context``) are empty unless the agent voluntarily journaled —
+    which it often doesn't. The result was crons reporting "quiet day on the
+    chat front" on days with substantive conversations (e.g. a job interview).
+
+    This table is the deterministic record the USER.md "Conversation so far"
+    digest renders from (see ``apps.router.conversation_capture``). USER.md is
+    auto-loaded by OpenClaw on EVERY agent turn — cron, chat, or proactive — so
+    a section sourced from this table reaches even the isolated cheap-model
+    crons that never call a context tool.
+
+    iOS / web app chat is NOT stored here — it is already durably persisted in
+    :class:`AppChatMessage`; the digest reads that table for the iOS slice to
+    avoid double-storage.
+
+    Rows are pruned probabilistically on insert (35-day window) so the table is
+    self-bounding without a janitor cron — same pattern as
+    :class:`ProcessedInboundEvent` / :class:`LineOutboundMessage`.
+
+    At-rest posture (pseudonymize-at-rest): ``reply_text`` is stored in
+    PII-placeholder space ([PERSON_1]) and ``user_text`` is already
+    placeholder-space for Telegram/LINE. Rehydration to real values happens only
+    at the owner-facing read seam (the iOS ``?since=`` feed,
+    ``chat_history._conv_rows``); the model-facing USER.md digest reads the
+    placeholder-space text unchanged. (This supersedes the earlier "storage is
+    raw real content by design" decision.)
+    """
+
+    class Channel(models.TextChoices):
+        TELEGRAM = "telegram"
+        LINE = "line"
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    tenant = models.ForeignKey(
+        "tenants.Tenant",
+        on_delete=models.CASCADE,
+        related_name="conversation_turns",
+    )
+    channel = models.CharField(max_length=16, choices=Channel.choices)
+    channel_user_id = models.CharField(
+        max_length=128,
+        help_text="Per-channel user identifier (telegram chat_id stringified, line_user_id for LINE).",
+    )
+    local_date = models.DateField(
+        db_index=True,
+        help_text=(
+            "Tenant-LOCAL calendar date of the turn (via apps.common.tenant_tz.tenant_today). "
+            "The digest groups by this so 'today' matches the user's day, not the server's UTC day."
+        ),
+    )
+    user_text = models.TextField(
+        blank=True,
+        default="",
+        help_text="The user's message(s) for this turn, joined for a coalesced batch. Raw/real content.",
+    )
+    reply_text = models.TextField(
+        blank=True,
+        default="",
+        help_text="The assistant's reply, marker-stripped and kept in PII-placeholder "
+        "space ([PERSON_1]) at rest; rehydrated at the owner-facing ?since= "
+        "feed. May be empty on a failed turn.",
+    )
+    created_at = models.DateTimeField(auto_now_add=True, db_index=True)
+
+    class Meta:
+        db_table = "conversation_turns"
+        ordering = ["-created_at"]
+        indexes = [
+            models.Index(fields=["tenant", "local_date"], name="conv_turn_tenant_date_idx"),
+            models.Index(
+                fields=["tenant", "channel", "channel_user_id", "-created_at"],
+                name="conv_turn_thread_idx",
+            ),
+            models.Index(fields=["created_at"], name="conv_turn_created_idx"),
+            # Ascending walk for the ?since= cross-channel history feed.
+            models.Index(fields=["tenant", "created_at"], name="conv_turn_tenant_created_idx"),
+        ]
+
+    def __str__(self) -> str:
+        return f"ConversationTurn({self.channel}, {self.local_date}, tenant={self.tenant_id})"
+
+
+class DeviceToken(models.Model):
+    """An APNs device token for a user's iOS install.
+
+    Lets the control plane push "your answer is ready" when a fire-and-forget
+    (Siri-escalated) or backgrounded turn completes — the cross-cutting APNs gap
+    in ``HER_SIRI_ARCHITECTURE.md``. Without it, a fire-and-forget reply only
+    surfaces on the next app foreground (``SiriCaptureSync``).
+
+    A token belongs to one device install; ``(user, token)`` is unique and
+    upserted on registration. Tokens APNs reports as Unregistered (HTTP 410) are
+    pruned by the sender so the table self-heals on reinstall / token rotation.
+    """
+
+    class Environment(models.TextChoices):
+        SANDBOX = "sandbox"
+        PRODUCTION = "production"
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    tenant = models.ForeignKey(
+        "tenants.Tenant",
+        on_delete=models.CASCADE,
+        related_name="device_tokens",
+    )
+    user = models.ForeignKey(
+        "tenants.User",
+        on_delete=models.CASCADE,
+        related_name="device_tokens",
+    )
+    # APNs device tokens are 32-byte (64 hex char) today, but Apple has signalled
+    # they may grow; bound generously rather than pin to 64.
+    token = models.CharField(max_length=200)
+    environment = models.CharField(
+        max_length=16,
+        choices=Environment.choices,
+        default=Environment.PRODUCTION,
+        help_text="Which APNs host the token is valid for (sandbox builds vs App Store / TestFlight).",
+    )
+    bundle_id = models.CharField(max_length=128, blank=True, default="")
+    installation_id = models.CharField(max_length=64, null=True, blank=True, db_index=True)
+    revoked_at = models.DateTimeField(null=True, blank=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+    last_seen_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        db_table = "device_tokens"
+        ordering = ["-last_seen_at"]
+        constraints = [
+            # A device token identifies one physical install, which is owned by
+            # exactly one (current) user. Global uniqueness on the token makes
+            # registration a single atomic upsert that re-points the token to the
+            # registering user — no cross-user/-tenant delete (which would let a
+            # token-holder evict another tenant's row), no delete+create race, and
+            # it guarantees a push for user A never reaches a device now used by
+            # user B (the prior owner's row is overwritten, not duplicated).
+            models.UniqueConstraint(fields=["token"], name="uniq_device_token"),
+        ]
+        indexes = [
+            models.Index(fields=["tenant"], name="device_token_tenant_idx"),
+        ]
+
+    def __str__(self) -> str:
+        return f"DeviceToken({self.environment}, user={self.user_id})"

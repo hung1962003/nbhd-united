@@ -1,0 +1,777 @@
+"""Tests for tenants app."""
+
+from datetime import timedelta
+from unittest.mock import patch
+
+from django.core.cache import cache
+from django.test import TestCase, override_settings
+from django.utils import timezone
+from rest_framework.test import APIClient
+from rest_framework_simplejwt.tokens import RefreshToken
+
+from apps.router.models import DeviceToken
+
+from .models import Tenant, User
+from .serializers import TenantSerializer
+from .services import create_tenant
+
+
+class TenantModelTest(TestCase):
+    def test_create_tenant(self):
+        tenant = create_tenant(
+            display_name="Test User",
+            telegram_chat_id=123456789,
+        )
+        self.assertEqual(tenant.status, Tenant.Status.PENDING)
+        self.assertEqual(tenant.user.telegram_chat_id, 123456789)
+        self.assertEqual(tenant.user.display_name, "Test User")
+        self.assertTrue(tenant.key_vault_prefix.startswith("tenants-"))
+
+    def test_tenant_is_active(self):
+        tenant = create_tenant(display_name="Test", telegram_chat_id=111)
+        self.assertFalse(tenant.is_active)
+        tenant.status = Tenant.Status.ACTIVE
+        tenant.save()
+        self.assertTrue(tenant.is_active)
+
+    def test_tenant_budget(self):
+        tenant = create_tenant(display_name="Test", telegram_chat_id=222)
+        self.assertFalse(tenant.is_over_budget)
+        # Budget is now cost-based: exceed effective_cost_budget
+        tenant.estimated_cost_this_month = tenant.effective_cost_budget
+        tenant.save()
+        self.assertTrue(tenant.is_over_budget)
+
+    def test_unique_chat_id(self):
+        create_tenant(display_name="User1", telegram_chat_id=333)
+        with self.assertRaises(Exception):
+            create_tenant(display_name="User2", telegram_chat_id=333)
+
+
+@override_settings(
+    CACHES={"default": {"BACKEND": "django.core.cache.backends.locmem.LocMemCache", "LOCATION": "auth-login-test"}}
+)
+class AuthLoginTest(TestCase):
+    def setUp(self):
+        cache.clear()  # login is throttled; isolate per-test throttle state
+        self.email = "login@example.com"
+        self.password = "testpass123"
+        User.objects.create_user(
+            username=self.email,
+            email=self.email,
+            password=self.password,
+        )
+
+    def test_login_with_email_returns_tokens(self):
+        response = self.client.post(
+            "/api/v1/auth/login/",
+            {"email": self.email, "password": self.password},
+            content_type="application/json",
+        )
+        self.assertEqual(response.status_code, 200)
+        data = response.json()
+        self.assertIn("access", data)
+        self.assertIn("refresh", data)
+
+    def test_login_with_wrong_password_returns_401(self):
+        response = self.client.post(
+            "/api/v1/auth/login/",
+            {"email": self.email, "password": "wrongpass"},
+            content_type="application/json",
+        )
+        self.assertEqual(response.status_code, 401)
+
+    def test_login_by_email_when_username_differs(self):
+        # Footgun regression: a user whose ``username`` != email (e.g. a
+        # Telegram-onboarded ``tg_<chat_id>`` account that later set an email)
+        # must still log in by email. The old ``authenticate(username=email)``
+        # path silently rejected these as "no active account".
+        User.objects.create_user(
+            username="tg_99999",
+            email="kiho@example.com",
+            password="testpass123",
+        )
+        response = self.client.post(
+            "/api/v1/auth/login/",
+            {"email": "kiho@example.com", "password": "testpass123"},
+            content_type="application/json",
+        )
+        self.assertEqual(response.status_code, 200)
+        self.assertIn("access", response.json())
+
+    def test_login_email_is_case_insensitive(self):
+        response = self.client.post(
+            "/api/v1/auth/login/",
+            {"email": self.email.upper(), "password": self.password},
+            content_type="application/json",
+        )
+        self.assertEqual(response.status_code, 200)
+
+    def test_login_blank_email_rejected(self):
+        # Blank email is a bad request (DRF rejects the required field before
+        # auth runs); the key invariant is that it never returns tokens.
+        response = self.client.post(
+            "/api/v1/auth/login/",
+            {"email": "", "password": "irrelevant"},
+            content_type="application/json",
+        )
+        self.assertEqual(response.status_code, 400)
+        self.assertNotIn("access", response.json())
+
+    def test_login_inactive_user_rejected(self):
+        # is_active=False must be rejected. The validate() reorder hashes the
+        # password before the is_active gate so inactive accounts can't be
+        # distinguished from wrong-password by response timing.
+        User.objects.create_user(
+            username="inactive@example.com",
+            email="inactive@example.com",
+            password="testpass123",
+            is_active=False,
+        )
+        response = self.client.post(
+            "/api/v1/auth/login/",
+            {"email": "inactive@example.com", "password": "testpass123"},
+            content_type="application/json",
+        )
+        self.assertEqual(response.status_code, 401)
+        self.assertNotIn("access", response.json())
+
+
+@override_settings(
+    CACHES={"default": {"BACKEND": "django.core.cache.backends.locmem.LocMemCache", "LOCATION": "login-throttle-test"}}
+)
+class LoginThrottleTest(TestCase):
+    """Login must rate-limit credential guessing (per-IP + per-email)."""
+
+    def setUp(self):
+        cache.clear()
+        self.email = "throttle@example.com"
+        User.objects.create_user(username=self.email, email=self.email, password="testpass123")
+
+    def tearDown(self):
+        cache.clear()
+
+    def _login(self, email, password="wrongpass"):
+        return self.client.post(
+            "/api/v1/auth/login/",
+            {"email": email, "password": password},
+            content_type="application/json",
+        )
+
+    def test_per_email_throttle_returns_429(self):
+        # LoginEmailThrottle = 10/minute; the 11th attempt for the same email is 429.
+        for _ in range(10):
+            self.assertEqual(self._login(self.email).status_code, 401)
+        self.assertEqual(self._login(self.email).status_code, 429)
+
+    def test_per_ip_throttle_returns_429(self):
+        # LoginIpThrottle = 30/minute; across distinct emails (so the per-email
+        # cap never trips first), the 31st attempt from one IP is 429.
+        for i in range(30):
+            self._login(f"ip-probe-{i}@example.com")
+        self.assertEqual(self._login("ip-probe-final@example.com").status_code, 429)
+
+
+class AuthLogoutTest(TestCase):
+    def setUp(self):
+        self.user = User.objects.create_user(
+            username="logout@example.com",
+            email="logout@example.com",
+            password="testpass123",
+        )
+        refresh = RefreshToken.for_user(self.user)
+        self.refresh = str(refresh)
+        self.access = str(refresh.access_token)
+        self.auth_header = f"Bearer {self.access}"
+        self.tenant = Tenant.objects.create(user=self.user, status=Tenant.Status.ACTIVE)
+
+    def test_logout_blacklists_refresh_token(self):
+        response = self.client.post(
+            "/api/v1/auth/logout/",
+            {"refresh": self.refresh},
+            content_type="application/json",
+            HTTP_AUTHORIZATION=self.auth_header,
+        )
+        self.assertEqual(response.status_code, 204)
+
+        refresh_response = self.client.post(
+            "/api/v1/auth/refresh/",
+            {"refresh": self.refresh},
+            content_type="application/json",
+        )
+        self.assertEqual(refresh_response.status_code, 401)
+
+    def test_logout_requires_refresh_token(self):
+        response = self.client.post(
+            "/api/v1/auth/logout/",
+            {},
+            content_type="application/json",
+            HTTP_AUTHORIZATION=self.auth_header,
+        )
+        self.assertEqual(response.status_code, 400)
+
+    def test_logout_rejects_invalid_refresh_token(self):
+        response = self.client.post(
+            "/api/v1/auth/logout/",
+            {"refresh": "not-a-token"},
+            content_type="application/json",
+            HTTP_AUTHORIZATION=self.auth_header,
+        )
+        self.assertEqual(response.status_code, 400)
+
+    def test_logout_without_identifiers_revokes_all_tokens(self):
+        first = DeviceToken.objects.create(
+            user=self.user,
+            tenant=self.tenant,
+            token="a" * 64,
+            installation_id="install-a",
+        )
+        second = DeviceToken.objects.create(
+            user=self.user,
+            tenant=self.tenant,
+            token="b" * 64,
+            installation_id="install-b",
+        )
+
+        response = self.client.post(
+            "/api/v1/auth/logout/",
+            {"refresh": self.refresh},
+            content_type="application/json",
+            HTTP_AUTHORIZATION=self.auth_header,
+        )
+
+        self.assertEqual(response.status_code, 204)
+        first.refresh_from_db()
+        second.refresh_from_db()
+        self.assertIsNotNone(first.revoked_at)
+        self.assertIsNotNone(second.revoked_at)
+
+    def test_logout_with_installation_revokes_only_that_installation(self):
+        selected = DeviceToken.objects.create(
+            user=self.user,
+            tenant=self.tenant,
+            token="a" * 64,
+            installation_id="install-a",
+        )
+        other = DeviceToken.objects.create(
+            user=self.user,
+            tenant=self.tenant,
+            token="b" * 64,
+            installation_id="install-b",
+        )
+
+        response = self.client.post(
+            "/api/v1/auth/logout/",
+            {"refresh": self.refresh, "installation_id": "install-a"},
+            content_type="application/json",
+            HTTP_AUTHORIZATION=self.auth_header,
+        )
+
+        self.assertEqual(response.status_code, 204)
+        selected.refresh_from_db()
+        other.refresh_from_db()
+        self.assertIsNotNone(selected.revoked_at)
+        self.assertIsNone(other.revoked_at)
+
+        from apps.router.push_views import _push_to_user_devices
+
+        with patch(
+            "apps.common.apns.send_push",
+            return_value={"sent": 1, "failed": 0, "unregistered": [], "skipped": None},
+        ) as send_push:
+            _push_to_user_devices(
+                self.user,
+                body="safe test body",
+                thread_id=None,
+                collapse_id=None,
+                content_available=True,
+                extra={},
+            )
+
+        send_push.assert_called_once()
+        self.assertEqual(send_push.call_args.args[0], [other.token])
+
+    def test_logout_with_device_token_revokes_only_that_token(self):
+        selected = DeviceToken.objects.create(user=self.user, tenant=self.tenant, token="a" * 64)
+        other = DeviceToken.objects.create(user=self.user, tenant=self.tenant, token="b" * 64)
+
+        response = self.client.post(
+            "/api/v1/auth/logout/",
+            {"refresh": self.refresh, "device_token": selected.token},
+            content_type="application/json",
+            HTTP_AUTHORIZATION=self.auth_header,
+        )
+
+        self.assertEqual(response.status_code, 204)
+        selected.refresh_from_db()
+        other.refresh_from_db()
+        self.assertIsNotNone(selected.revoked_at)
+        self.assertIsNone(other.revoked_at)
+
+    def test_logout_with_unknown_installation_revokes_all_tokens(self):
+        first = DeviceToken.objects.create(
+            user=self.user,
+            tenant=self.tenant,
+            token="a" * 64,
+            installation_id="install-a",
+        )
+        second = DeviceToken.objects.create(
+            user=self.user,
+            tenant=self.tenant,
+            token="b" * 64,
+            installation_id="install-b",
+        )
+
+        response = self.client.post(
+            "/api/v1/auth/logout/",
+            {"refresh": self.refresh, "installation_id": "stale-install"},
+            content_type="application/json",
+            HTTP_AUTHORIZATION=self.auth_header,
+        )
+
+        self.assertEqual(response.status_code, 204)
+        first.refresh_from_db()
+        second.refresh_from_db()
+        self.assertIsNotNone(first.revoked_at)
+        self.assertIsNotNone(second.revoked_at)
+
+    def test_logout_with_already_revoked_installation_leaves_other_tokens_active(self):
+        revoked = DeviceToken.objects.create(
+            user=self.user,
+            tenant=self.tenant,
+            token="a" * 64,
+            installation_id="install-a",
+            revoked_at=timezone.now(),
+        )
+        other = DeviceToken.objects.create(
+            user=self.user,
+            tenant=self.tenant,
+            token="b" * 64,
+            installation_id="install-b",
+        )
+
+        response = self.client.post(
+            "/api/v1/auth/logout/",
+            {"refresh": self.refresh, "installation_id": revoked.installation_id},
+            content_type="application/json",
+            HTTP_AUTHORIZATION=self.auth_header,
+        )
+
+        self.assertEqual(response.status_code, 204)
+        other.refresh_from_db()
+        self.assertIsNone(other.revoked_at)
+
+
+class AuthSignupTest(TestCase):
+    @override_settings(PREVIEW_ACCESS_KEY="test-invite-code")
+    def test_signup_with_valid_invite_code(self):
+        response = self.client.post(
+            "/api/v1/auth/signup/",
+            {"email": "new@example.com", "password": "securepass123", "invite_code": "test-invite-code"},
+            content_type="application/json",
+        )
+        self.assertEqual(response.status_code, 201)
+        data = response.json()
+        self.assertIn("access", data)
+        self.assertIn("refresh", data)
+
+    @override_settings(PREVIEW_ACCESS_KEY="test-invite-code")
+    def test_signup_with_invalid_invite_code(self):
+        response = self.client.post(
+            "/api/v1/auth/signup/",
+            {"email": "new@example.com", "password": "securepass123", "invite_code": "wrong-code"},
+            content_type="application/json",
+        )
+        self.assertEqual(response.status_code, 403)
+
+    @override_settings(PREVIEW_ACCESS_KEY="test-invite-code")
+    def test_signup_without_invite_code(self):
+        response = self.client.post(
+            "/api/v1/auth/signup/",
+            {"email": "new@example.com", "password": "securepass123"},
+            content_type="application/json",
+        )
+        self.assertEqual(response.status_code, 403)
+
+    @override_settings(PREVIEW_ACCESS_KEY="")
+    def test_signup_open_when_no_key_configured(self):
+        response = self.client.post(
+            "/api/v1/auth/signup/",
+            {"email": "open@example.com", "password": "securepass123"},
+            content_type="application/json",
+        )
+        self.assertEqual(response.status_code, 201)
+
+
+class TenantSerializerTest(TestCase):
+    def test_active_with_subscription_returns_true(self):
+        tenant = create_tenant(display_name="Sub", telegram_chat_id=500)
+        tenant.stripe_subscription_id = "sub_x"
+        tenant.status = Tenant.Status.ACTIVE
+        tenant.save()
+        data = TenantSerializer(tenant).data
+        self.assertTrue(data["has_active_subscription"])
+
+    def test_trial_with_valid_end_date_returns_true(self):
+        tenant = create_tenant(display_name="Trial", telegram_chat_id=530)
+        now = timezone.now()
+        tenant.is_trial = True
+        tenant.trial_started_at = now - timedelta(hours=1)
+        tenant.trial_ends_at = now + timedelta(days=5, hours=1)
+        tenant.save(update_fields=["is_trial", "trial_started_at", "trial_ends_at", "updated_at"])
+
+        data = TenantSerializer(tenant).data
+        self.assertTrue(data["has_active_subscription"])
+        self.assertEqual(data["trial_days_remaining"], 5)
+
+    def test_trial_expired_without_subscription_returns_false(self):
+        tenant = create_tenant(display_name="Trial Expired", telegram_chat_id=531)
+        tenant.is_trial = True
+        tenant.trial_started_at = timezone.now() - timedelta(days=10)
+        tenant.trial_ends_at = timezone.now() - timedelta(days=1)
+        tenant.save(update_fields=["is_trial", "trial_started_at", "trial_ends_at", "updated_at"])
+
+        data = TenantSerializer(tenant).data
+        self.assertFalse(data["has_active_subscription"])
+        self.assertEqual(data["trial_days_remaining"], 0)
+
+    def test_deleted_with_subscription_returns_false(self):
+        tenant = create_tenant(display_name="Del", telegram_chat_id=501)
+        tenant.stripe_subscription_id = "sub_x"
+        tenant.status = Tenant.Status.DELETED
+        tenant.save()
+        data = TenantSerializer(tenant).data
+        self.assertFalse(data["has_active_subscription"])
+
+    def test_active_without_subscription_returns_false(self):
+        tenant = create_tenant(display_name="NoSub", telegram_chat_id=502)
+        tenant.stripe_subscription_id = ""
+        tenant.status = Tenant.Status.ACTIVE
+        tenant.save()
+        data = TenantSerializer(tenant).data
+        self.assertFalse(data["has_active_subscription"])
+
+
+class TenantHasEntitlementTest(TestCase):
+    """Tests for the Tenant.has_entitlement property."""
+
+    def test_paid_subscription(self):
+        tenant = create_tenant(display_name="Paid", telegram_chat_id=600)
+        tenant.stripe_subscription_id = "sub_live_1"
+        tenant.status = Tenant.Status.ACTIVE
+        tenant.save()
+        self.assertTrue(tenant.has_entitlement)
+
+    def test_valid_trial(self):
+        tenant = create_tenant(display_name="Trial", telegram_chat_id=601)
+        tenant.is_trial = True
+        tenant.trial_ends_at = timezone.now() + timedelta(days=5)
+        tenant.status = Tenant.Status.ACTIVE
+        tenant.save()
+        self.assertTrue(tenant.has_entitlement)
+
+    def test_expired_trial_no_subscription(self):
+        tenant = create_tenant(display_name="Expired", telegram_chat_id=602)
+        tenant.is_trial = True
+        tenant.trial_ends_at = timezone.now() - timedelta(hours=1)
+        tenant.stripe_subscription_id = ""
+        tenant.save()
+        self.assertFalse(tenant.has_entitlement)
+
+    def test_no_trial_no_subscription(self):
+        tenant = create_tenant(display_name="Nothing", telegram_chat_id=603)
+        tenant.is_trial = False
+        tenant.stripe_subscription_id = ""
+        tenant.save()
+        self.assertFalse(tenant.has_entitlement)
+
+    def test_entitled_active_excludes_expired_trials(self):
+        paid = create_tenant(display_name="Paid2", telegram_chat_id=604)
+        paid.stripe_subscription_id = "sub_live_2"
+        paid.status = Tenant.Status.ACTIVE
+        paid.container_id = "oc-paid"
+        paid.save()
+
+        expired = create_tenant(display_name="Exp2", telegram_chat_id=605)
+        expired.is_trial = True
+        expired.trial_ends_at = timezone.now() - timedelta(hours=1)
+        expired.stripe_subscription_id = ""
+        expired.status = Tenant.Status.ACTIVE
+        expired.container_id = "oc-expired"
+        expired.save()
+
+        qs = Tenant.entitled_active()
+        self.assertIn(paid, qs)
+        self.assertNotIn(expired, qs)
+
+
+class OnboardTenantViewTest(TestCase):
+    def setUp(self):
+        self.user = User.objects.create_user(
+            username="onboard_trial",
+            email="onboard_trial@example.com",
+            password="testpass123",
+        )
+        refresh = RefreshToken.for_user(self.user)
+        self.client = APIClient()
+        self.client.credentials(HTTP_AUTHORIZATION=f"Bearer {refresh.access_token}")
+
+    @patch("apps.cron.publish.publish_task")
+    @patch("apps.tenants.services.seed_default_templates_for_tenant")
+    def test_onboard_creates_trial_and_triggers_provisioning(self, mock_seed, mock_publish):
+        before_signup = timezone.now()
+        response = self.client.post(
+            "/api/v1/tenants/onboard/",
+            {
+                "display_name": "Trial User",
+                "timezone": "UTC",
+                "agent_persona": "neighbor",
+            },
+            format="json",
+        )
+        after_signup = timezone.now()
+
+        self.assertEqual(response.status_code, 201)
+        self.user.refresh_from_db()
+        tenant = self.user.tenant
+
+        self.assertTrue(tenant.is_trial)
+        self.assertIsNotNone(tenant.trial_started_at)
+        self.assertIsNotNone(tenant.trial_ends_at)
+        self.assertEqual(tenant.model_tier, Tenant.ModelTier.STARTER)
+        self.assertEqual(tenant.status, Tenant.Status.PROVISIONING)
+        self.assertGreaterEqual(
+            tenant.trial_ends_at,
+            before_signup + timedelta(days=30),
+        )
+        self.assertLessEqual(
+            tenant.trial_ends_at,
+            after_signup + timedelta(days=30),
+        )
+        mock_publish.assert_called_once_with("provision_tenant", str(tenant.id))
+        mock_seed.assert_called_once_with(tenant=tenant)
+
+    @patch("apps.cron.publish.publish_task", side_effect=RuntimeError("qstash down"))
+    @patch("apps.tenants.services.seed_default_templates_for_tenant")
+    def test_onboard_returns_503_and_marks_pending_when_publish_fails(self, mock_seed, _mock_publish):
+        response = self.client.post(
+            "/api/v1/tenants/onboard/",
+            {
+                "display_name": "Trial User",
+                "timezone": "UTC",
+                "agent_persona": "neighbor",
+            },
+            format="json",
+        )
+
+        self.assertEqual(response.status_code, 503)
+        self.assertIn("provisioning could not be started", response.data["detail"].lower())
+
+        self.user.refresh_from_db()
+        tenant = self.user.tenant
+        self.assertEqual(tenant.status, Tenant.Status.PENDING)
+        self.assertEqual(response.data["tenant_status"], Tenant.Status.PENDING)
+        mock_seed.assert_called_once_with(tenant=tenant)
+
+    def test_onboard_existing_pending_tenant_returns_provisioning_message(self):
+        Tenant.objects.create(user=self.user, status=Tenant.Status.PROVISIONING)
+
+        response = self.client.post(
+            "/api/v1/tenants/onboard/",
+            {
+                "display_name": "Trial User",
+                "timezone": "UTC",
+                "agent_persona": "neighbor",
+            },
+            format="json",
+        )
+
+        self.assertEqual(response.status_code, 409)
+        self.assertEqual(response.data["tenant_status"], Tenant.Status.PROVISIONING)
+        self.assertIn("provisioning", response.data["detail"].lower())
+
+
+class ProvisioningStatusViewTest(TestCase):
+    def setUp(self):
+        self.client = APIClient()
+
+    def test_requires_authentication(self):
+        response = self.client.get("/api/v1/tenants/provisioning-status/")
+        self.assertEqual(response.status_code, 401)
+
+    def test_returns_readiness_fields(self):
+        tenant = create_tenant(display_name="Provisioning Status", telegram_chat_id=605)
+        tenant.status = Tenant.Status.ACTIVE
+        tenant.container_id = "oc-ready"
+        tenant.container_fqdn = "oc-ready.internal.azurecontainerapps.io"
+        tenant.provisioned_at = timezone.now()
+        tenant.save(update_fields=["status", "container_id", "container_fqdn", "provisioned_at", "updated_at"])
+
+        self.client.force_authenticate(user=tenant.user)
+        response = self.client.get("/api/v1/tenants/provisioning-status/")
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.data["status"], Tenant.Status.ACTIVE)
+        self.assertEqual(response.data["container_id"], "oc-ready")
+        self.assertTrue(response.data["has_container_id"])
+        self.assertTrue(response.data["has_container_fqdn"])
+        self.assertTrue(response.data["ready"])
+
+
+class RetryProvisioningViewTest(TestCase):
+    def setUp(self):
+        self.client = APIClient()
+
+    @patch("apps.tenants.views.publish_task")
+    def test_retry_provisioning_queues_task(self, mock_publish):
+        tenant = create_tenant(display_name="Retry User", telegram_chat_id=606)
+        tenant.status = Tenant.Status.PENDING
+        tenant.save(update_fields=["status", "updated_at"])
+        self.client.force_authenticate(user=tenant.user)
+
+        response = self.client.post("/api/v1/tenants/retry-provisioning/")
+
+        self.assertEqual(response.status_code, 202)
+        self.assertEqual(response.data["tenant_status"], Tenant.Status.PROVISIONING)
+        self.assertFalse(response.data["ready"])
+        mock_publish.assert_called_once_with("provision_tenant", str(tenant.id))
+
+    @patch("apps.tenants.views.publish_task")
+    def test_retry_provisioning_returns_ready_for_active_tenant(self, mock_publish):
+        from apps.router.models import ProactiveOutbound
+
+        tenant = create_tenant(display_name="Ready User", telegram_chat_id=607)
+        tenant.status = Tenant.Status.ACTIVE
+        tenant.container_id = "oc-ready"
+        tenant.container_fqdn = "ready.internal"
+        tenant.save(update_fields=["status", "container_id", "container_fqdn", "updated_at"])
+        self.client.force_authenticate(user=tenant.user)
+
+        response = self.client.post("/api/v1/tenants/retry-provisioning/")
+
+        self.assertEqual(response.status_code, 200)
+        self.assertTrue(response.data["ready"])
+        mock_publish.assert_not_called()
+        self.assertFalse(ProactiveOutbound.objects.filter(tenant=tenant).exists())
+
+    @patch("apps.tenants.views.publish_task", side_effect=RuntimeError("qstash down"))
+    def test_retry_provisioning_publish_fail_sets_pending(self, _mock_publish):
+        tenant = create_tenant(display_name="Retry Fail", telegram_chat_id=608)
+        tenant.status = Tenant.Status.PENDING
+        tenant.save(update_fields=["status", "updated_at"])
+        self.client.force_authenticate(user=tenant.user)
+
+        response = self.client.post("/api/v1/tenants/retry-provisioning/")
+
+        self.assertEqual(response.status_code, 503)
+        tenant.refresh_from_db()
+        self.assertEqual(tenant.status, Tenant.Status.PENDING)
+
+
+class RefreshConfigViewTest(TestCase):
+    def setUp(self):
+        self.client = APIClient()
+
+    def _create_user_with_tenant(self, display_name: str, chat_id: int) -> Tenant:
+        tenant = create_tenant(display_name=display_name, telegram_chat_id=chat_id)
+        return tenant
+
+    @patch("apps.orchestrator.services.update_tenant_config")
+    def test_refresh_config_success(self, mock_update):
+        tenant = self._create_user_with_tenant("Refresh User", 600)
+        tenant.status = Tenant.Status.ACTIVE
+        tenant.pending_config_version = 2
+        tenant.save(update_fields=["status", "pending_config_version"])
+        self.client.force_authenticate(user=tenant.user)
+
+        response = self.client.post("/api/v1/tenants/refresh-config/")
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(
+            response.data["detail"],
+            "Configuration refreshed. Your assistant will restart momentarily.",
+        )
+        self.assertIn("last_refreshed", response.data)
+        mock_update.assert_called_once_with(str(tenant.id))
+
+        tenant.refresh_from_db()
+        self.assertIsNotNone(tenant.config_refreshed_at)
+        self.assertEqual(tenant.config_version, tenant.pending_config_version)
+
+    @patch("apps.orchestrator.services.update_tenant_config")
+    def test_refresh_config_cooldown(self, mock_update):
+        tenant = self._create_user_with_tenant("Cooldown User", 601)
+        tenant.status = Tenant.Status.ACTIVE
+        tenant.config_refreshed_at = timezone.now() - timedelta(minutes=1)
+        tenant.save(update_fields=["status", "config_refreshed_at"])
+        self.client.force_authenticate(user=tenant.user)
+
+        response = self.client.post("/api/v1/tenants/refresh-config/")
+
+        self.assertEqual(response.status_code, 429)
+        self.assertEqual(response.data["detail"], "Please wait before refreshing again.")
+        self.assertEqual(response.data["cooldown_seconds"], 300)
+        mock_update.assert_not_called()
+
+    @patch("apps.orchestrator.services.update_tenant_config")
+    def test_refresh_config_pending_tenant_returns_provisioning_message(self, mock_update):
+        tenant = self._create_user_with_tenant("Pending User", 602)
+        tenant.status = Tenant.Status.PENDING
+        tenant.save(update_fields=["status"])
+        self.client.force_authenticate(user=tenant.user)
+
+        response = self.client.post("/api/v1/tenants/refresh-config/")
+
+        self.assertEqual(response.status_code, 409)
+        self.assertIn("provisioning", response.data["detail"].lower())
+        self.assertEqual(response.data["tenant_status"], Tenant.Status.PENDING)
+        mock_update.assert_not_called()
+
+    @patch("apps.orchestrator.services.update_tenant_config")
+    def test_refresh_config_no_tenant(self, mock_update):
+        user = User.objects.create_user(
+            username="notenant@example.com",
+            email="notenant@example.com",
+            password="pass1234",
+        )
+        self.client.force_authenticate(user=user)
+
+        response = self.client.post("/api/v1/tenants/refresh-config/")
+
+        self.assertEqual(response.status_code, 404)
+        self.assertEqual(response.data["detail"], "No tenant found.")
+        mock_update.assert_not_called()
+
+    @patch("apps.orchestrator.services.update_tenant_config")
+    def test_refresh_config_get_status(self, mock_update):
+        tenant = self._create_user_with_tenant("Status User", 603)
+        tenant.status = Tenant.Status.ACTIVE
+        tenant.save(update_fields=["status"])
+        tenant.config_refreshed_at = timezone.now() - timedelta(minutes=10)
+        tenant.save(update_fields=["config_refreshed_at"])
+        self.client.force_authenticate(user=tenant.user)
+
+        response = self.client.get("/api/v1/tenants/refresh-config/")
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.data["cooldown_seconds"], 300)
+        self.assertEqual(response.data["status"], tenant.status)
+        self.assertTrue(response.data["can_refresh"])
+        self.assertFalse(response.data["has_pending_update"])
+        mock_update.assert_not_called()
+
+    @patch("apps.orchestrator.services.update_tenant_config")
+    def test_refresh_config_get_status_with_pending_update(self, mock_update):
+        tenant = self._create_user_with_tenant("Pending Status User", 604)
+        tenant.status = Tenant.Status.ACTIVE
+        tenant.pending_config_version = 3
+        tenant.config_version = 1
+        tenant.config_refreshed_at = timezone.now() - timedelta(minutes=10)
+        tenant.save(update_fields=["status", "pending_config_version", "config_version", "config_refreshed_at"])
+        self.client.force_authenticate(user=tenant.user)
+
+        response = self.client.get("/api/v1/tenants/refresh-config/")
+
+        self.assertEqual(response.status_code, 200)
+        self.assertTrue(response.data["has_pending_update"])
+        mock_update.assert_not_called()

@@ -1,0 +1,117 @@
+"""Path-component validation for journal Document kind/slug.
+
+The agent (LLM-driven runtime client) supplies ``kind`` and ``slug`` strings
+that flow through the runtime endpoints into ``journal_document`` rows AND
+into Azure SMB file share paths shaped like ``memory/journal/<kind>/<slug>.md``
+(see ``apps.orchestrator.memory_sync``). Treat both as path components from
+an untrusted source: validate at the trust boundary so the file share never
+sees NTFS-hostile names, escape sequences, or out-of-enum kinds.
+
+Reused in two places:
+
+1. ``apps.integrations.runtime_views`` — endpoint boundary, hard reject 400.
+2. ``apps.orchestrator.memory_sync`` — defense-in-depth, skip-with-warning
+   so a future direct DB write that bypasses validation can't grind the
+   sync worker against an SMB-hostile path.
+
+History: the canary tenant accumulated two garbage rows (``kind=':' slug=':'``
+and ``kind='cron' slug='_sync:Heartbeat Check-in'``) because the runtime
+endpoint pre-this-module accepted any string. The ``:`` row produced
+``memory/journal/:/:.md`` — NTFS reserves ``:`` (alternate data stream
+separator) — and every ``sync_documents_to_workspace`` invocation made ~6
+failed SMB roundtrips against it.
+"""
+
+from __future__ import annotations
+
+import datetime
+import re
+
+from apps.journal.models import Document
+
+VALID_KINDS: frozenset[str] = frozenset(c.value for c in Document.Kind)
+
+# Exactly matches ``apps.journal.document_views._VALID_SLUG_RE`` so every slug
+# accepted at the runtime write boundary is addressable by the console read
+# API. The leading character must be alphanumeric so a slug can't start with
+# ``/`` or ``-`` — defense against absolute paths and option flags.
+RUNTIME_SLUG_RE = re.compile(r"^[a-zA-Z0-9][a-zA-Z0-9\-/]*$")
+
+# Daily notes are keyed by ISO calendar date; a non-date slug corrupts the
+# date-cutoff filter in the journal context bundle (slug__gte text compare),
+# so enforce it on every write path, not just GET.
+DAILY_SLUG_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+
+MAX_SLUG_LEN = 128  # matches Document.slug max_length
+
+# Kinds that are app-wide singletons: exactly one such document per tenant,
+# addressed everywhere by a single canonical slug (see
+# apps/router/extraction_callbacks.py, apps/journal/envelope.py, and the agent
+# instructions in apps/orchestrator/config_generator.py). The runtime endpoints
+# historically defaulted an omitted slug to the *kind* string, so a ``goal``
+# write landed under slug "goal" (singular) instead of the canonical "goals"
+# (plural). Combined with ``_default_title`` returning the identical "Goals"
+# title for any kind="goal" row, that minted stray duplicate cards
+# indistinguishable from the real one. Coerce these two kinds onto their
+# canonical slug at the trust boundary so the agent tools can never fork a
+# second copy. Other kinds (daily/weekly/monthly/project/ideas/memory) are
+# intentionally multi-instance and pass through untouched.
+CANONICAL_SINGLETON_SLUGS: dict[str, str] = {
+    Document.Kind.GOAL.value: "goals",
+    Document.Kind.TASKS.value: "tasks",
+}
+
+
+def canonical_singleton_slug(kind: str, slug: str) -> str:
+    """Resolve singleton-kind documents onto their one-per-tenant slug.
+
+    ``goal`` → ``goals`` and ``tasks`` → ``tasks`` regardless of what the caller
+    passed — an omitted/blank slug (which the endpoint would otherwise default
+    to the kind string), the singular ``goal``, or anything else. Every other
+    kind is returned unchanged.
+    """
+    return CANONICAL_SINGLETON_SLUGS.get(kind, slug)
+
+
+def validate_kind_slug(kind: str, slug: str) -> tuple[str, str] | None:
+    """Return ``(error_code, detail)`` if invalid, else ``None``.
+
+    Caller (HTTP endpoint) maps the error to a 400 Response; library callers
+    (``memory_sync``) treat a non-None return as "skip this row."
+    """
+    if kind not in VALID_KINDS:
+        return (
+            "invalid_kind",
+            f"kind must be one of: {sorted(VALID_KINDS)}",
+        )
+    if not slug:
+        return ("invalid_slug", f"slug must be 1..{MAX_SLUG_LEN} chars")
+    if len(slug) > MAX_SLUG_LEN:
+        return ("invalid_slug", f"slug must be 1..{MAX_SLUG_LEN} chars")
+    if not RUNTIME_SLUG_RE.match(slug):
+        return (
+            "invalid_slug",
+            f"slug contains invalid characters: {slug!r}",
+        )
+    if ".." in slug.split("/"):
+        return ("invalid_slug", "slug may not contain '..' segments")
+    # Daily notes must be keyed by an ISO date so the date-cutoff filter in the
+    # journal context bundle stays correct. Enforce on every write path.
+    if kind == "daily":
+        if not DAILY_SLUG_RE.match(slug):
+            return (
+                "invalid_slug",
+                f"Daily note slug must be a date (YYYY-MM-DD), got: {slug!r}",
+            )
+        # The regex matches the shape but accepts impossible dates like
+        # 2026-02-30; round-trip through the date parser so this (runtime) path
+        # rejects the same calendar-invalid dates as the frontend isISODate()
+        # and the console _validate_slug().
+        try:
+            datetime.date.fromisoformat(slug)
+        except ValueError:
+            return (
+                "invalid_slug",
+                f"Daily note slug is not a real calendar date: {slug!r}",
+            )
+    return None

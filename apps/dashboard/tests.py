@@ -1,0 +1,726 @@
+"""Dashboard view tests — Horizons Weekly Pulse helpers + HorizonsView Phase 2 extension."""
+
+from __future__ import annotations
+
+from datetime import date, timedelta
+
+from django.test import SimpleTestCase, TestCase, override_settings
+from django.utils import timezone
+from rest_framework.test import APIClient
+from rest_framework_simplejwt.tokens import RefreshToken
+
+from apps.dashboard.views import _clean_markdown_preview, _derive_week_bounds
+from apps.insights.models import AssistantInsight, TopicRegistry
+from apps.insights.pillars import Pillar
+from apps.journal.models import Document, Goal, JournalEntry, PendingExtraction, Purpose, WeeklyReview
+from apps.journal.services import STARTER_DOCUMENT_TEMPLATES
+from apps.journal.templates_md import GOALS_TEMPLATE
+from apps.tenants.services import create_tenant
+
+
+class CleanMarkdownPreviewTests(SimpleTestCase):
+    def test_strips_headings_bold_and_lists(self):
+        md = (
+            "# Weekly Review — 2026-W14\n"
+            "*Week of April 6–12, 2026*\n\n"
+            "## 🏆 Wins\n"
+            "- Shipped **billing** fix\n"
+            "- Landed *reflection* gate\n"
+        )
+        out = _clean_markdown_preview(md)
+        self.assertNotIn("#", out)
+        self.assertNotIn("**", out)
+        self.assertNotIn("- ", out)
+        self.assertIn("Shipped billing fix", out)
+        self.assertIn("Landed reflection gate", out)
+
+    def test_drops_links_keeps_visible_text(self):
+        md = "See [the doc](https://example.com/thing) for details."
+        self.assertEqual(
+            _clean_markdown_preview(md),
+            "See the doc for details.",
+        )
+
+    def test_strips_inline_code_and_blockquotes(self):
+        md = "> quoted line\n`inline` snippet here"
+        out = _clean_markdown_preview(md)
+        self.assertEqual(out, "quoted line inline snippet here")
+
+    def test_empty_input_returns_empty(self):
+        self.assertEqual(_clean_markdown_preview(""), "")
+        self.assertEqual(_clean_markdown_preview(None), "")  # type: ignore[arg-type]
+
+    def test_truncates_with_ellipsis(self):
+        md = "a " * 200
+        out = _clean_markdown_preview(md, max_chars=50)
+        self.assertLessEqual(len(out), 50)
+        self.assertTrue(out.endswith("\u2026"))
+
+    def test_preserves_underscore_in_identifiers(self):
+        # A bare `some_var` should not be treated as italic
+        md = "Look at some_var and another_name in the logs."
+        out = _clean_markdown_preview(md)
+        self.assertIn("some_var", out)
+        self.assertIn("another_name", out)
+
+
+class DeriveWeekBoundsTests(SimpleTestCase):
+    def test_parses_monday_date_slug(self):
+        start, end = _derive_week_bounds("2026-04-06", date(2026, 4, 13))
+        self.assertEqual(start, date(2026, 4, 6))
+        self.assertEqual(end, date(2026, 4, 12))
+
+    def test_parses_iso_week_slug(self):
+        start, end = _derive_week_bounds("2026-W32", date(2026, 1, 1))
+        self.assertEqual(start, date(2026, 8, 3))
+        self.assertEqual(end, date(2026, 8, 9))
+
+    def test_falls_back_to_week_of_fallback(self):
+        # Wednesday 2026-04-15 → Monday is 2026-04-13
+        start, end = _derive_week_bounds("not-a-date", date(2026, 4, 15))
+        self.assertEqual(start, date(2026, 4, 13))
+        self.assertEqual(end, date(2026, 4, 19))
+
+    def test_invalid_month_falls_back(self):
+        start, _ = _derive_week_bounds("2026-13-01", date(2026, 4, 20))
+        self.assertEqual(start, date(2026, 4, 20))  # Monday
+
+
+@override_settings(NBHD_DISABLE_BACKGROUND_THREADS=True)
+class HorizonsOwnerRehydrationTests(TestCase):
+    def setUp(self):
+        self.tenant = create_tenant(display_name="Horizons-Owner", telegram_chat_id=900699)
+        self.tenant.layer1_placeholder_writes = True
+        self.tenant.pii_entity_map = {"[PERSON_1]": {"name": "Alice"}}
+        self.tenant.save(update_fields=["layer1_placeholder_writes", "pii_entity_map"])
+        self.client = APIClient()
+        token = RefreshToken.for_user(self.tenant.user)
+        self.client.credentials(HTTP_AUTHORIZATION=f"Bearer {token.access_token}")
+
+    @staticmethod
+    def _receipt():
+        return {
+            "text": {
+                "state": "placeholder",
+                "writer": "background",
+                "redactions": [{"placeholder": "[PERSON_1]"}],
+            }
+        }
+
+    def test_purpose_and_pending_rows_rehydrate_with_resolved_receipts(self):
+        purpose = Purpose.objects.create(
+            tenant=self.tenant,
+            statement="Build with [PERSON_1]",
+            status=Purpose.Status.CONFIRMED,
+            pii_receipts={
+                "statement": {
+                    "state": "placeholder",
+                    "writer": "owner",
+                    "redactions": [{"placeholder": "[PERSON_1]"}],
+                }
+            },
+        )
+        purpose_card = PendingExtraction.objects.create(
+            tenant=self.tenant,
+            kind=PendingExtraction.Kind.PURPOSE,
+            text="A future with [PERSON_1]",
+            pii_receipts=self._receipt(),
+            expires_at=timezone.now() + timedelta(days=1),
+        )
+        pending_task = PendingExtraction.objects.create(
+            tenant=self.tenant,
+            kind=PendingExtraction.Kind.TASK,
+            text="Call [PERSON_1]",
+            pii_receipts=self._receipt(),
+            expires_at=timezone.now() + timedelta(days=1),
+        )
+
+        response = self.client.get("/api/v1/dashboard/horizons/")
+
+        self.assertEqual(response.status_code, 200)
+        body = response.json()
+        purpose_row = next(row for row in body["north_star"] if row["id"] == str(purpose.id))
+        purpose_card_row = next(row for row in body["north_star"] if row["id"] == str(purpose_card.id))
+        pending_row = next(row for row in body["pending_extractions"] if row["id"] == str(pending_task.id))
+        self.assertEqual(purpose_row["statement"], "Build with Alice")
+        self.assertEqual(purpose_card_row["statement"], "A future with Alice")
+        self.assertEqual(pending_row["text"], "Call Alice")
+        self.assertEqual(
+            purpose_row["pii_receipts"]["statement"]["redactions"],
+            [{"placeholder": "[PERSON_1]", "value": "Alice"}],
+        )
+        self.assertEqual(
+            purpose_card_row["pii_receipts"]["text"]["redactions"],
+            [{"placeholder": "[PERSON_1]", "value": "Alice"}],
+        )
+        self.assertEqual(
+            pending_row["pii_receipts"]["text"]["redactions"],
+            [{"placeholder": "[PERSON_1]", "value": "Alice"}],
+        )
+
+    def test_weekly_mood_and_insight_projections_rehydrate_with_receipts(self):
+        today = timezone.now().date()
+        receipt = {
+            "state": "placeholder",
+            "writer": "background",
+            "redactions": [{"placeholder": "[PERSON_1]"}],
+        }
+        weekly_document = Document.objects.create(
+            tenant=self.tenant,
+            kind=Document.Kind.WEEKLY,
+            slug=str(today - timedelta(days=today.weekday())),
+            title="Week with [PERSON_1]",
+            markdown="# Review\n\nShipped with [PERSON_1].",
+            pii_receipts={"title": receipt, "markdown": receipt},
+        )
+        WeeklyReview.objects.create(
+            tenant=self.tenant,
+            week_start=today - timedelta(days=today.weekday()),
+            week_end=today - timedelta(days=today.weekday()) + timedelta(days=6),
+            mood_summary="steady",
+            top_wins=["Shipped with [PERSON_1]"],
+            top_challenges=[],
+            lessons=[],
+            week_rating=WeeklyReview.WeekRating.THUMBS_UP,
+            intentions_next_week=[],
+            raw_text="",
+            pii_receipts={"top_wins": receipt},
+        )
+        JournalEntry.objects.create(
+            tenant=self.tenant,
+            date=today,
+            mood="focused with [PERSON_1]",
+            energy=JournalEntry.Energy.HIGH,
+            raw_text="",
+            pii_receipts={"mood": receipt},
+        )
+        topic, _ = TopicRegistry.objects.get_or_create(
+            pillar=Pillar.JOURNAL.value,
+            slug="mood",
+            defaults={"display_name": "Mood", "status": TopicRegistry.Status.CANONICAL},
+        )
+        insight = AssistantInsight.objects.create(
+            tenant=self.tenant,
+            pillar=Pillar.JOURNAL.value,
+            topic=topic,
+            statement="You work well with [PERSON_1]",
+        )
+
+        response = self.client.get("/api/v1/dashboard/horizons/")
+
+        self.assertEqual(response.status_code, 200)
+        body = response.json()
+        document = next(item for item in body["weekly_documents"] if item["id"] == str(weekly_document.id))
+        self.assertEqual(document["title"], "Week with Alice")
+        self.assertEqual(document["markdown"], "# Review\n\nShipped with Alice.")
+        self.assertIn("Shipped with Alice", document["preview"])
+        self.assertEqual(document["pii_receipts"]["markdown"]["redactions"][0]["value"], "Alice")
+        self.assertEqual(body["weekly_pulse"][0]["top_win"], "Shipped with Alice")
+        self.assertEqual(body["weekly_pulse"][0]["pii_receipts"]["top_wins"]["writer"], "background")
+        self.assertEqual(body["mood_trend"][0]["mood"], "focused with Alice")
+        self.assertEqual(body["mood_trend"][0]["pii_receipts"]["mood"]["writer"], "background")
+        insight_row = next(item for item in body["assistant_insights"] if item["id"] == str(insight.id))
+        self.assertEqual(insight_row["statement"], "You work well with Alice")
+        self.assertEqual(
+            insight_row["pii_receipts"]["statement"]["redactions"],
+            [{"placeholder": "[PERSON_1]", "value": "Alice"}],
+        )
+
+
+@override_settings(NBHD_DISABLE_BACKGROUND_THREADS=True)
+class HorizonsViewAssistantInsightsTests(TestCase):
+    """Phase 2 extension: assistant_insights surfaced in /api/v1/dashboard/horizons/.
+
+    Threads disabled so each AssistantInsight / Document save runs its
+    envelope-refresh receiver synchronously inside on_commit. Daemon
+    threads opening their own Postgres connection leak past test-DB
+    teardown — caught when Day 2's higher-volume tests started failing
+    CI on the post-merge run.
+    """
+
+    def setUp(self):
+        self.tenant = create_tenant(display_name="Horizons-P2", telegram_chat_id=900700)
+        self.other_tenant = create_tenant(display_name="Horizons-Other", telegram_chat_id=900701)
+        self.client = APIClient()
+        token = RefreshToken.for_user(self.tenant.user)
+        self.client.credentials(HTTP_AUTHORIZATION=f"Bearer {token.access_token}")
+        # "debt" is pre-seeded by insights migration 0002.
+        self.topic, _ = TopicRegistry.objects.get_or_create(
+            pillar=Pillar.GRAVITY.value,
+            slug="debt",
+            defaults={
+                "display_name": "Debt",
+                "status": TopicRegistry.Status.CANONICAL,
+                "source": TopicRegistry.Source.SEED,
+            },
+        )
+
+    def _make(self, *, tenant=None, statement="An observation.", status=AssistantInsight.Status.OPEN):
+        return AssistantInsight.objects.create(
+            tenant=tenant or self.tenant,
+            pillar=Pillar.GRAVITY.value,
+            topic=self.topic,
+            statement=statement,
+            status=status,
+        )
+
+    def test_goal_receipts_resolve_against_the_live_map(self):
+        self.tenant.pii_entity_map = {"[PERSON_1]": {"name": "Live Alice"}}
+        self.tenant.save(update_fields=["pii_entity_map"])
+        Goal.objects.create(
+            tenant=self.tenant,
+            title="Help [PERSON_1] and [PERSON_404]",
+            description="body",
+            status=Goal.Status.ACTIVE,
+            pii_receipts={
+                "title": {
+                    "state": "placeholder",
+                    "redactions": [
+                        {"placeholder": "[PERSON_1]", "value": "Stale Alice"},
+                        {"placeholder": "[PERSON_404]", "value": "Stale Ghost"},
+                    ],
+                }
+            },
+        )
+
+        resp = self.client.get("/api/v1/dashboard/horizons/")
+
+        self.assertEqual(resp.status_code, 200)
+        goal = next(g for g in resp.json()["goals"] if g["pii_receipts"])
+        redactions = goal["pii_receipts"]["title"]["redactions"]
+        self.assertEqual(redactions[0], {"placeholder": "[PERSON_1]", "value": "Live Alice"})
+        self.assertEqual(redactions[1], {"placeholder": "[PERSON_404]"})
+        self.assertNotIn("Stale Ghost", str(resp.json()))
+
+    def test_horizons_includes_assistant_insights_field(self):
+        resp = self.client.get("/api/v1/dashboard/horizons/")
+        self.assertEqual(resp.status_code, 200)
+        self.assertIn("assistant_insights", resp.json())
+        self.assertEqual(resp.json()["assistant_insights"], [])
+
+    def test_open_and_confirmed_surface_refuted_hidden(self):
+        self._make(statement="Open one")
+        self._make(statement="Confirmed one", status=AssistantInsight.Status.CONFIRMED)
+        self._make(statement="Refuted one", status=AssistantInsight.Status.REFUTED)
+        resp = self.client.get("/api/v1/dashboard/horizons/")
+        statements = {i["statement"] for i in resp.json()["assistant_insights"]}
+        self.assertIn("Open one", statements)
+        self.assertIn("Confirmed one", statements)
+        self.assertNotIn("Refuted one", statements)
+
+    def test_ordered_newest_first(self):
+        first = self._make(statement="Older")
+        second = self._make(statement="Newer")
+        # Force-stamp first one to be older
+        AssistantInsight.objects.filter(id=first.id).update(created_at=second.created_at.replace(year=2025))
+        resp = self.client.get("/api/v1/dashboard/horizons/")
+        statements = [i["statement"] for i in resp.json()["assistant_insights"]]
+        self.assertEqual(statements[0], "Newer")
+        self.assertEqual(statements[1], "Older")
+
+    def test_capped_at_twenty(self):
+        for i in range(25):
+            self._make(statement=f"Insight {i}")
+        resp = self.client.get("/api/v1/dashboard/horizons/")
+        self.assertLessEqual(len(resp.json()["assistant_insights"]), 20)
+
+    def test_isolates_other_tenant_insights(self):
+        self._make(tenant=self.other_tenant, statement="Other tenant private")
+        resp = self.client.get("/api/v1/dashboard/horizons/")
+        statements = {i["statement"] for i in resp.json()["assistant_insights"]}
+        self.assertNotIn("Other tenant private", statements)
+
+    def test_payload_shape(self):
+        ins = self._make(statement="Shape check", status=AssistantInsight.Status.CONFIRMED)
+        resp = self.client.get("/api/v1/dashboard/horizons/")
+        row = next(i for i in resp.json()["assistant_insights"] if i["id"] == str(ins.id))
+        self.assertEqual(row["pillar"], Pillar.GRAVITY.value)
+        self.assertEqual(row["topic_slug"], "debt")
+        self.assertEqual(row["topic_display_name"], "Debt")
+        self.assertEqual(row["status"], "confirmed")
+        self.assertIn("confidence", row)
+        self.assertIn("created_at", row)
+
+
+@override_settings(NBHD_DISABLE_BACKGROUND_THREADS=True)
+class HorizonsViewGoalsDualReadTests(TestCase):
+    """Dual-read: HorizonsView 'goals' section returns typed Goal rows
+    unioned with legacy Document(kind=GOAL) rows, deduped via
+    Goal.migrated_from_document.
+
+    Threads disabled to prevent daemon-thread connection leaks from
+    envelope-refresh receivers on Document/Goal saves.
+    """
+
+    def setUp(self):
+        self.tenant = create_tenant(display_name="Horizons-Goals", telegram_chat_id=900710)
+        self.client = APIClient()
+        token = RefreshToken.for_user(self.tenant.user)
+        self.client.credentials(HTTP_AUTHORIZATION=f"Bearer {token.access_token}")
+
+    def _titles(self):
+        resp = self.client.get("/api/v1/dashboard/horizons/")
+        self.assertEqual(resp.status_code, 200)
+        return [g["title"] for g in resp.json()["goals"]]
+
+    def test_typed_goals_appear_in_goals_list(self):
+        Goal.objects.create(tenant=self.tenant, title="Typed only goal", status=Goal.Status.ACTIVE)
+        self.assertIn("Typed only goal", self._titles())
+
+    def test_typed_goal_rehydrates_and_emits_receipt_metadata(self):
+        self.tenant.pii_entity_map = {"[PERSON_1]": {"name": "Alice"}}
+        self.tenant.save(update_fields=["pii_entity_map"])
+        receipt = {
+            "state": "placeholder",
+            "redactions": [{"placeholder": "[PERSON_1]", "value": "Alice"}],
+        }
+        goal = Goal.objects.create(
+            tenant=self.tenant,
+            title="Support [PERSON_1]",
+            description="Plan with [PERSON_1]",
+            status=Goal.Status.ACTIVE,
+            pii_receipts={"title": receipt, "description": receipt},
+        )
+
+        resp = self.client.get("/api/v1/dashboard/horizons/")
+
+        card = next(item for item in resp.json()["goals"] if item["id"] == str(goal.id))
+        self.assertEqual(card["title"], "Support Alice")
+        self.assertEqual(card["markdown"], "Plan with Alice")
+        self.assertEqual(card["pii_receipts"]["title"], receipt)
+
+    def test_legacy_documents_still_appear_when_no_typed_goals(self):
+        Document.objects.create(
+            tenant=self.tenant,
+            kind=Document.Kind.GOAL,
+            slug="legacy-goal",
+            title="Legacy doc goal",
+            markdown="some content",
+        )
+        self.assertIn("Legacy doc goal", self._titles())
+
+    def test_services_pristine_goals_scaffold_is_excluded(self):
+        scaffold = next(spec["markdown"] for spec in STARTER_DOCUMENT_TEMPLATES if spec["slug"] == "goals")
+        doc = Document.objects.get(tenant=self.tenant, kind=Document.Kind.GOAL, slug="goals")
+        doc.markdown = scaffold
+        doc.save(update_fields=["markdown"])
+
+        self.assertNotIn("Goals", self._titles())
+
+    def test_templates_md_pristine_goals_scaffold_is_excluded(self):
+        doc = Document.objects.get(tenant=self.tenant, kind=Document.Kind.GOAL, slug="goals")
+        doc.markdown = GOALS_TEMPLATE
+        doc.save(update_fields=["markdown"])
+
+        self.assertNotIn("Goals", self._titles())
+
+    def test_one_character_edit_to_goals_scaffold_is_included(self):
+        doc = Document.objects.get(tenant=self.tenant, kind=Document.Kind.GOAL, slug="goals")
+        doc.markdown = GOALS_TEMPLATE + "x"
+        doc.save(update_fields=["markdown"])
+
+        self.assertIn("Goals", self._titles())
+
+    def test_migrated_document_is_deduped(self):
+        legacy = Document.objects.create(
+            tenant=self.tenant,
+            kind=Document.Kind.GOAL,
+            slug="orig",
+            title="Old prose goal",
+            markdown="x",
+        )
+        Goal.objects.create(
+            tenant=self.tenant,
+            title="Migrated typed goal",
+            status=Goal.Status.ACTIVE,
+            migrated_from_document=legacy,
+        )
+        titles = self._titles()
+        self.assertIn("Migrated typed goal", titles)
+        self.assertNotIn("Old prose goal", titles)
+
+    def test_inactive_typed_goals_excluded(self):
+        Goal.objects.create(tenant=self.tenant, title="Achieved goal", status=Goal.Status.ACHIEVED)
+        Goal.objects.create(tenant=self.tenant, title="Abandoned goal", status=Goal.Status.ABANDONED)
+        titles = self._titles()
+        self.assertNotIn("Achieved goal", titles)
+        self.assertNotIn("Abandoned goal", titles)
+
+    def test_mixed_typed_and_unrelated_legacy_coexist(self):
+        Goal.objects.create(tenant=self.tenant, title="Typed goal A", status=Goal.Status.ACTIVE)
+        Document.objects.create(
+            tenant=self.tenant,
+            kind=Document.Kind.GOAL,
+            slug="unrelated-legacy",
+            title="Unmigrated legacy goal",
+            markdown="x",
+        )
+        titles = self._titles()
+        self.assertIn("Typed goal A", titles)
+        self.assertIn("Unmigrated legacy goal", titles)
+
+    def test_title_colliding_legacy_docs_collapse_to_one_clean_card(self):
+        """Un-migrated legacy goal docs whose titles singularize to the same key
+        ("Goals" / "Goal") must render as ONE card (the most-recently-updated
+        one), and its preview must be markdown-clean — no raw #, ##, or >
+        syntax leaking into the goal card. Reproduces the reported screenshot:
+        three "Goals" cards with raw markdown headings/blockquotes.
+
+        create_tenant already seeds a Document(kind=goal, slug="goals",
+        title="Goals") — that is collision #1. We add two more legacy goal docs
+        under distinct slugs (the (tenant,kind,slug) unique constraint forbids a
+        second "goals" slug) whose titles collapse to the same normalized key.
+        """
+        from django.utils import timezone
+
+        older = Document.objects.create(
+            tenant=self.tenant,
+            kind=Document.Kind.GOAL,
+            slug="goals-legacy-a",
+            title="Goals",
+            markdown="# Goals\n\n## Active Goals\n\n> **Note:** stale earlier draft\n\nold body text here",
+        )
+        winner = Document.objects.create(
+            tenant=self.tenant,
+            kind=Document.Kind.GOAL,
+            slug="goals-legacy-b",
+            title="Goal",
+            markdown="# Goals\n\n## Active Goals\n\n> **Note:** the winner\n\nfresh body text here",
+        )
+        # Make every OTHER goal doc for this tenant (the seeded "goals" doc plus
+        # `older`) strictly older so `winner` is the deterministic survivor.
+        # .update() bypasses the auto_now stamp that .save() would apply.
+        Document.objects.filter(tenant=self.tenant, kind=Document.Kind.GOAL).exclude(id=winner.id).update(
+            updated_at=timezone.now() - timezone.timedelta(days=3)
+        )
+
+        resp = self.client.get("/api/v1/dashboard/horizons/")
+        self.assertEqual(resp.status_code, 200)
+        goals = resp.json()["goals"]
+
+        # (a) all three title-colliding docs collapse to a single card
+        self.assertEqual(len(goals), 1, goals)
+        card = goals[0]
+
+        # (a cont.) the survivor is the most-recently-updated doc
+        self.assertIn("fresh body text here", card["preview"])
+        self.assertNotIn("old body text here", card["preview"])
+
+        # (b) preview is markdown-clean — no raw heading / blockquote / bold syntax
+        self.assertNotIn("#", card["preview"])
+        self.assertNotIn(">", card["preview"])
+        self.assertNotIn("**", card["preview"])
+        # blockquote/bold CONTENT survives, only the markers are stripped
+        self.assertIn("Note: the winner", card["preview"])
+
+    def test_legacy_goal_preview_strips_markdown_even_without_collision(self):
+        """A single legacy goal doc's preview is cleaned, not raw-sliced."""
+        # Reuse the tenant's seeded goals doc (slug "goals") — give it real
+        # markdown with headings + a blockquote and confirm the preview is clean.
+        doc = Document.objects.get(tenant=self.tenant, kind=Document.Kind.GOAL, slug="goals")
+        doc.markdown = "# Goals\n\n## Active\n\n> quoted intent\n\nplain goal prose"
+        doc.save()
+
+        resp = self.client.get("/api/v1/dashboard/horizons/")
+        card = next(g for g in resp.json()["goals"] if g["slug"] == "goals")
+        self.assertNotIn("#", card["preview"])
+        self.assertNotIn(">", card["preview"])
+        self.assertIn("plain goal prose", card["preview"])
+        self.assertIn("quoted intent", card["preview"])
+
+
+@override_settings(NBHD_DISABLE_BACKGROUND_THREADS=True)
+class HorizonsViewTopicSignalsTests(TestCase):
+    """Phase 3 Day 2: HorizonsView surfaces a ``topic_signals`` array — one
+    entry per topic the tenant has engaged with, showing the meta-state
+    behind the assistant's voice register.
+
+    Threads disabled because this class creates ``AssistantInsight``,
+    ``PillarSnapshot``, and ``Document`` rows across 9 tests. Each save
+    triggers ``_universal_refresh_receiver`` which spawns a daemon
+    thread; with threads enabled, those threads open their own Postgres
+    connections that linger past test-DB teardown and break CI cleanup
+    with ``database is being accessed by other users``.
+    """
+
+    def setUp(self):
+        from apps.insights.models import PillarSnapshot, UserVoicePref
+
+        self.PillarSnapshot = PillarSnapshot
+        self.UserVoicePref = UserVoicePref
+
+        self.tenant = create_tenant(display_name="Horizons-Topics", telegram_chat_id=900720)
+        self.other_tenant = create_tenant(display_name="Horizons-Topics-Other", telegram_chat_id=900721)
+        self.client = APIClient()
+        token = RefreshToken.for_user(self.tenant.user)
+        self.client.credentials(HTTP_AUTHORIZATION=f"Bearer {token.access_token}")
+
+        # Both "dining" and "debt" are pre-seeded by insights migration 0002.
+        self.dining, _ = TopicRegistry.objects.get_or_create(
+            pillar=Pillar.GRAVITY.value,
+            slug="dining",
+            defaults={
+                "display_name": "Dining",
+                "status": TopicRegistry.Status.CANONICAL,
+                "source": TopicRegistry.Source.SEED,
+            },
+        )
+        self.debt, _ = TopicRegistry.objects.get_or_create(
+            pillar=Pillar.GRAVITY.value,
+            slug="debt",
+            defaults={
+                "display_name": "Debt",
+                "status": TopicRegistry.Status.CANONICAL,
+                "source": TopicRegistry.Source.SEED,
+            },
+        )
+
+    def _signals(self):
+        resp = self.client.get("/api/v1/dashboard/horizons/")
+        self.assertEqual(resp.status_code, 200)
+        body = resp.json()
+        self.assertIn("topic_signals", body)
+        return body["topic_signals"]
+
+    def test_empty_state_returns_empty_list(self):
+        self.assertEqual(self._signals(), [])
+
+    def test_topic_with_snapshots_appears(self):
+        # PillarSnapshot has no topic FK — sample_size is derived via the
+        # per-pillar extractor map (apps/insights/baselines.py). "debt" is
+        # one of the gravity extractors, keyed off payload['totals']['debt'].
+        from django.utils import timezone
+
+        for weeks_ago in range(3):
+            self.PillarSnapshot.objects.create(
+                tenant=self.tenant,
+                pillar=Pillar.GRAVITY.value,
+                granularity=self.PillarSnapshot.Granularity.WEEKLY,
+                ts=timezone.now() - timezone.timedelta(weeks=weeks_ago),
+                payload={"totals": {"debt": 1000 + weeks_ago * 100}},
+            )
+        signals = self._signals()
+        self.assertEqual(len(signals), 1)
+        row = signals[0]
+        self.assertEqual(row["topic_slug"], "debt")
+        self.assertEqual(row["sample_size"], 3)
+        self.assertEqual(row["confirmed"], 0)
+        self.assertEqual(row["refuted"], 0)
+        self.assertFalse(row["has_goal"])
+        self.assertEqual(row["register_offset"], 0)
+        self.assertIsNone(row["register_scope"])
+
+    def test_topic_with_insights_appears_with_counts(self):
+        for status in [
+            AssistantInsight.Status.OPEN,
+            AssistantInsight.Status.CONFIRMED,
+            AssistantInsight.Status.CONFIRMED,
+            AssistantInsight.Status.REFUTED,
+        ]:
+            AssistantInsight.objects.create(
+                tenant=self.tenant,
+                pillar=Pillar.GRAVITY.value,
+                topic=self.dining,
+                statement="s",
+                status=status,
+            )
+        row = next(r for r in self._signals() if r["topic_slug"] == "dining")
+        self.assertEqual(row["confirmed"], 2)
+        self.assertEqual(row["refuted"], 1)
+
+    def test_topic_with_typed_goal_has_goal_true(self):
+        Goal.objects.create(
+            tenant=self.tenant,
+            title="Pay down dining",
+            pillar=Pillar.GRAVITY.value,
+            topic=self.dining,
+            status=Goal.Status.ACTIVE,
+        )
+        row = next(r for r in self._signals() if r["topic_slug"] == "dining")
+        self.assertTrue(row["has_goal"])
+
+    def test_topic_with_legacy_document_goal_has_goal_true(self):
+        Document.objects.create(
+            tenant=self.tenant,
+            kind=Document.Kind.GOAL,
+            slug="legacy-dining-goal",
+            title="Legacy",
+            markdown="x",
+            pillar=Pillar.GRAVITY.value,
+            topic=self.dining,
+        )
+        row = next(r for r in self._signals() if r["topic_slug"] == "dining")
+        self.assertTrue(row["has_goal"])
+
+    def test_topic_specific_voice_pref_surfaces_with_scope(self):
+        self.UserVoicePref.objects.create(
+            tenant=self.tenant,
+            pillar=Pillar.GRAVITY.value,
+            topic=self.dining,
+            register_offset=1,
+        )
+        row = next(r for r in self._signals() if r["topic_slug"] == "dining")
+        self.assertEqual(row["register_offset"], 1)
+        self.assertEqual(row["register_scope"], "topic")
+
+    def test_pillar_voice_pref_applies_to_topic_when_no_topic_pref(self):
+        self.UserVoicePref.objects.create(
+            tenant=self.tenant,
+            pillar=Pillar.GRAVITY.value,
+            topic=None,
+            register_offset=-1,
+        )
+        # Need at least one source of engagement so the topic appears.
+        AssistantInsight.objects.create(
+            tenant=self.tenant,
+            pillar=Pillar.GRAVITY.value,
+            topic=self.dining,
+            statement="x",
+        )
+        row = next(r for r in self._signals() if r["topic_slug"] == "dining")
+        self.assertEqual(row["register_offset"], -1)
+        self.assertEqual(row["register_scope"], "pillar")
+
+    def test_topic_pref_wins_over_pillar_pref(self):
+        self.UserVoicePref.objects.create(
+            tenant=self.tenant,
+            pillar=Pillar.GRAVITY.value,
+            topic=None,
+            register_offset=-1,
+        )
+        self.UserVoicePref.objects.create(
+            tenant=self.tenant,
+            pillar=Pillar.GRAVITY.value,
+            topic=self.dining,
+            register_offset=1,
+        )
+        row = next(r for r in self._signals() if r["topic_slug"] == "dining")
+        self.assertEqual(row["register_offset"], 1)
+        self.assertEqual(row["register_scope"], "topic")
+
+    def test_tenant_isolation(self):
+        AssistantInsight.objects.create(
+            tenant=self.other_tenant,
+            pillar=Pillar.GRAVITY.value,
+            topic=self.dining,
+            statement="other tenant",
+        )
+        self.assertEqual(self._signals(), [])
+
+    def test_topics_sorted_by_pillar_then_display_name(self):
+        # Both dining + debt have engagement; expect alphabetical by
+        # display_name within the gravity pillar (Debt before Dining).
+        AssistantInsight.objects.create(
+            tenant=self.tenant,
+            pillar=Pillar.GRAVITY.value,
+            topic=self.dining,
+            statement="d",
+        )
+        AssistantInsight.objects.create(
+            tenant=self.tenant,
+            pillar=Pillar.GRAVITY.value,
+            topic=self.debt,
+            statement="x",
+        )
+        slugs = [r["topic_slug"] for r in self._signals()]
+        self.assertEqual(slugs, ["debt", "dining"])

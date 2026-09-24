@@ -1,0 +1,10 @@
+{
+  "id": "nbhd-routing-context",
+  "name": "NBHD Routing Context",
+  "description": "Output sanitization — rejects degenerate model output (token loops, system-prompt echo, doubled-date artifacts) before it reaches the user.",
+  "configSchema": {
+    "type": "object",
+    "additionalProperties": false,
+    "properties": {}
+  }
+}

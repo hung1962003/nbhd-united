@@ -1,0 +1,1813 @@
+"""Idle hibernation service — scale-to-zero for inactive tenants.
+
+Tenants whose containers have been idle for 2+ hours get their revisions
+deactivated (0 replicas, 0 cost). When a message arrives, the container
+wakes and buffered messages are auto-forwarded via QStash.
+
+Cron-aware wake: before hibernating, we capture the tenant's cron
+schedules and schedule a QStash task to wake the container just before
+the next cron fires. After 30 minutes, if no user messages arrived, the
+container is re-hibernated (and the next cron wake is scheduled again).
+
+This is distinct from billing-based SUSPENDED status — hibernated tenants
+remain status=ACTIVE with a non-null ``hibernated_at`` timestamp.
+"""
+
+from __future__ import annotations
+
+import logging
+import time
+from dataclasses import dataclass
+from datetime import UTC, datetime
+
+from django.db import models
+from django.utils import timezone
+
+from apps.common.eval_sink import suppresses_real_transport
+from apps.tenants.models import Tenant
+
+logger = logging.getLogger(__name__)
+
+# How early (seconds) to wake the container before a cron fires.
+#
+# Worst-case cold-start path observed in production: revision flip +
+# image pull + node startup + plugin-runtime-deps install on EmptyDir
+# (PR #387) + first plugin spawn. Image refresh on wake (PR #384)
+# stacks on top when ``container_image_tag`` is stale. End-to-end this
+# regularly runs past 2 minutes and has hit 3 in the worst case.
+#
+# 240s leaves a ~60s buffer past the typical worst case before the
+# cron's intended fire time. Marginal cost (the container is awake
+# slightly earlier each cycle); the alternative — a missed cron — is
+# user-visible.
+_CRON_WAKE_LEAD_SECONDS = 240
+
+# How long (seconds) to keep a cron-woken container alive before
+# re-hibernating if no user messages arrive.
+_CRON_WAKE_IDLE_SECONDS = 1800  # 30 minutes
+
+# Look-ahead window used by ``check_cron_wake_idle_task`` to decide whether
+# to defer re-hibernation. If another cron is due to fire within this
+# window from "now" (i.e. when the idle check fires), keep the container
+# awake instead of re-hibernating just to cold-start again for the next
+# fire. 90 min covers typical morning patterns (e.g. 7 AM Morning
+# Briefing + 8:30 AM Project Check-in) without holding tenants awake
+# unnecessarily for sparse cron schedules.
+_CRON_LOOKAHEAD_WINDOW_SECONDS = 5400  # 90 minutes
+
+# Defer-window used by ``_cron_active_or_imminent`` for hourly sweeps
+# (hibernate-idle, image-bump). Catches the common "sweep fires at :00,
+# user cron fires at :00" race. Wider than the gateway's worst-case
+# response time so a slow cron.list call doesn't accidentally race past
+# the deferral. Smaller than the 90 min look-ahead because that one is
+# about keeping a warm container warm; this one is about not killing
+# a cron mid-fire.
+_CRON_DEFER_WINDOW_SECONDS = 300  # 5 minutes
+
+
+def hibernate_idle_tenant(tenant: Tenant) -> bool:
+    """Hibernate a single idle tenant's container.
+
+    Order matters:
+    1. Capture cron schedules (container must be reachable)
+    2. Suspend crons (container must be reachable)
+    3. Deactivate revisions
+    4. Schedule next cron wake
+
+    Returns True on success.
+    """
+    tid = str(tenant.id)[:8]
+
+    # 1. Capture cron schedules before suspending (for cron-aware wake)
+    cron_jobs = _capture_tenant_cron_schedules(tenant)
+
+    # 2. Suspend crons while container is still up
+    if tenant.container_fqdn:
+        try:
+            from apps.cron.suspension import suspend_tenant_crons
+
+            result = suspend_tenant_crons(tenant)
+            logger.info(
+                "idle_hibernate: suspended %d crons for tenant %s",
+                result.get("disabled", 0),
+                tid,
+            )
+        except Exception:
+            logger.exception(
+                "idle_hibernate: failed to suspend crons for %s — proceeding anyway",
+                tid,
+            )
+
+    # 3. Deactivate all revisions → 0 replicas
+    try:
+        from apps.orchestrator.azure_client import hibernate_container_app
+
+        hibernate_container_app(tenant.container_id)
+    except Exception:
+        logger.exception("idle_hibernate: failed to hibernate container for %s", tid)
+        return False
+
+    # 4. Mark tenant as hibernated, clear any stale cron_wake_at
+    Tenant.objects.filter(id=tenant.id).update(
+        hibernated_at=timezone.now(),
+        cron_wake_at=None,
+    )
+    logger.info("idle_hibernate: tenant %s hibernated successfully", tid)
+
+    # 5. Schedule wake for the next cron job
+    _schedule_next_cron_wake(tenant, cron_jobs)
+
+    return True
+
+
+def _capture_tenant_cron_schedules(tenant: Tenant) -> list[dict]:
+    """Query tenant's enabled cron jobs and save a snapshot.
+
+    Returns the raw job list for use by ``_schedule_next_cron_wake``.
+
+    Resilience: when the live gateway call fails (typical case: the
+    per-tenant container is in an inactive revision state at the moment
+    of hibernation and Azure returns an HTML 404), fall back to the
+    persisted ``tenant.cron_jobs_snapshot`` or, failing that, the
+    ``build_cron_seed_jobs`` recomputation. This keeps the wake chain
+    intact even when the upstream is unreachable — without the fallback,
+    a single failed ``cron.list`` would silently leave the tenant with
+    no future wake scheduled.
+    """
+    if not tenant.container_fqdn:
+        return []
+
+    try:
+        from apps.cron.gateway_client import invoke_gateway_tool
+
+        result = invoke_gateway_tool(tenant, "cron.list", {"includeDisabled": False})
+        data = result.get("details", result) if isinstance(result, dict) else result
+        jobs = data.get("jobs", []) if isinstance(data, dict) else data if isinstance(data, list) else []
+
+        # Persist snapshot for debugging / restore purposes
+        Tenant.objects.filter(id=tenant.id).update(
+            cron_jobs_snapshot={"jobs": jobs, "snapshot_at": timezone.now().isoformat()},
+        )
+        return jobs
+    except Exception:
+        logger.warning(
+            "idle_hibernate: live cron.list failed for tenant %s — falling back to snapshot/seed",
+            str(tenant.id)[:8],
+            exc_info=True,
+        )
+        return _load_fallback_cron_jobs(tenant)
+
+
+def _load_fallback_cron_jobs(tenant: Tenant) -> list[dict]:
+    """Return cron jobs from the persisted snapshot or, failing that,
+    from a fresh seed-job recomputation.
+
+    Used when the live gateway is unreachable. Jobs returned from the
+    snapshot path retain whatever ``nextRunAtMs`` the gateway last
+    reported; jobs returned from the seed path have no ``nextRunAtMs``,
+    so the caller's ``_find_earliest_next_run`` will fall back to
+    computing from the cron expression via ``_next_run_from_expr``.
+    """
+    snapshot = tenant.cron_jobs_snapshot or {}
+    snapshot_jobs = snapshot.get("jobs") if isinstance(snapshot, dict) else None
+    if snapshot_jobs:
+        enabled = [j for j in snapshot_jobs if isinstance(j, dict) and j.get("enabled", True)]
+        if enabled:
+            logger.info(
+                "idle_hibernate: using cron_jobs_snapshot for tenant %s (%d enabled jobs)",
+                str(tenant.id)[:8],
+                len(enabled),
+            )
+            return enabled
+
+    try:
+        from apps.orchestrator.config_generator import build_cron_seed_jobs
+
+        seed = build_cron_seed_jobs(tenant)
+        enabled_seed = [j for j in seed if isinstance(j, dict) and j.get("enabled", True)]
+        if enabled_seed:
+            logger.info(
+                "idle_hibernate: using build_cron_seed_jobs for tenant %s (%d jobs, no live snapshot)",
+                str(tenant.id)[:8],
+                len(enabled_seed),
+            )
+            return enabled_seed
+    except Exception:
+        logger.exception(
+            "idle_hibernate: seed-job fallback failed for tenant %s",
+            str(tenant.id)[:8],
+        )
+
+    logger.warning(
+        "idle_hibernate: no cron jobs available for tenant %s "
+        "(gateway, snapshot, and seed all empty) — wake will NOT be scheduled",
+        str(tenant.id)[:8],
+    )
+    return []
+
+
+def _schedule_next_cron_wake(tenant: Tenant, cron_jobs: list[dict]) -> None:
+    """Schedule a QStash task to wake the tenant before their next cron fires."""
+    if not cron_jobs:
+        return
+
+    now_ms = int(timezone.now().timestamp() * 1000)
+    earliest_ms = _find_earliest_next_run(cron_jobs, now_ms)
+
+    if not earliest_ms:
+        logger.info(
+            "idle_hibernate: no upcoming crons for tenant %s, skipping cron wake",
+            str(tenant.id)[:8],
+        )
+        return
+
+    delay_seconds = max(60, (earliest_ms - now_ms) // 1000 - _CRON_WAKE_LEAD_SECONDS)
+
+    try:
+        from apps.cron.publish import publish_task
+
+        publish_task(
+            "wake_for_cron",
+            str(tenant.id),
+            delay_seconds=delay_seconds,
+            idempotency_key=f"wake-cron-{tenant.id}-{earliest_ms}",
+        )
+        logger.info(
+            "idle_hibernate: scheduled cron wake for tenant %s in %ds (next cron ~%s)",
+            str(tenant.id)[:8],
+            delay_seconds,
+            datetime.fromtimestamp(earliest_ms / 1000, tz=UTC).isoformat(),
+        )
+    except Exception:
+        logger.exception(
+            "idle_hibernate: failed to schedule cron wake for %s",
+            str(tenant.id)[:8],
+        )
+
+
+def _find_earliest_next_run(cron_jobs: list[dict], now_ms: int) -> int | None:
+    """Return the earliest ``nextRunAtMs`` from the job list.
+
+    OpenClaw's ``cron.list`` returns each job with its mutable runtime
+    state nested under ``state`` (see plugin-sdk's ``Cron.JobState``):
+
+        {"id": ..., "name": ..., "schedule": {...}, "enabled": true,
+         "state": {"nextRunAtMs": ..., "lastRunAtMs": ..., ...}}
+
+    Reading the top-level ``nextRunAtMs`` (where it doesn't live) always
+    returned ``None``, sending every job through the croniter fallback.
+    That hid the bug for ``cron``-kind schedules (croniter recomputed)
+    but skipped ``every`` and ``at`` kinds entirely (no ``expr`` to
+    recompute from), so those tenants got no cron-aware wake scheduled.
+
+    Falls back to computing the next run from ``schedule.expr`` only
+    when ``state.nextRunAtMs`` is missing or already in the past.
+    """
+    candidates: list[int] = []
+
+    for job in cron_jobs:
+        if not job.get("enabled", True):
+            continue
+
+        state = job.get("state") or {}
+        next_run = state.get("nextRunAtMs")
+        if next_run and next_run > now_ms:
+            candidates.append(next_run)
+            continue
+
+        # Fallback: compute from cron expression
+        schedule = job.get("schedule", {})
+        expr = schedule.get("expr")
+        tz_name = schedule.get("tz", "UTC")
+        if expr:
+            computed = _next_run_from_expr(expr, tz_name)
+            if computed and computed > now_ms:
+                candidates.append(computed)
+
+    return min(candidates) if candidates else None
+
+
+def _next_run_from_expr(expr: str, tz_name: str) -> int | None:
+    """Compute next run time in epoch ms from a cron expression + timezone."""
+    try:
+        from zoneinfo import ZoneInfo
+
+        from croniter import croniter
+
+        now = datetime.now(ZoneInfo(tz_name))
+        cron = croniter(expr, now)
+        next_dt = cron.get_next(datetime)
+        return int(next_dt.timestamp() * 1000)
+    except Exception:
+        logger.debug("Failed to parse cron expr %r tz=%s", expr, tz_name)
+        return None
+
+
+def _next_cron_within_window(
+    tenant: Tenant,
+    *,
+    window_seconds: int = _CRON_LOOKAHEAD_WINDOW_SECONDS,
+) -> int | None:
+    """Return ``state.nextRunAtMs`` of the earliest enabled cron firing within
+    ``[now, now + window_seconds]``, or ``None`` if no qualifying cron exists.
+
+    Used by ``check_cron_wake_idle_task`` to decide whether to defer
+    re-hibernation when another cron is about to fire — avoids forcing
+    back-to-back crons through cold-start cycles when ``last_message_at``
+    can't be used to keep the container awake (cron output never moves it).
+
+    Source order, mirroring ``_capture_tenant_cron_schedules``:
+
+    1. Live ``cron.list`` against the gateway. The tenant is awake at this
+       point (the idle check only runs after a successful cron wake), so
+       the gateway should respond. This catches schedule changes that
+       happened during the wake window — the snapshot would miss them.
+    2. ``tenant.cron_jobs_snapshot`` if the live call raises. Stale by
+       design (point-in-time at the last hibernation), but better than
+       nothing if the gateway is briefly unreachable.
+    3. ``None`` if both fail. Caller hibernates conservatively.
+
+    Reads ``state.nextRunAtMs`` directly (the gateway's actual field
+    location — see plugin-sdk's ``Cron.JobState``) rather than calling
+    ``_find_earliest_next_run`` so this helper doesn't inherit that
+    function's wrong-field-path bug. Skips jobs without a valid future
+    ``state.nextRunAtMs`` instead of falling back to croniter — for
+    look-ahead semantics, "no fire time we can read" means "not about
+    to fire from our perspective", which is the right conservative
+    answer here.
+    """
+    from apps.cron.gateway_client import GatewayError, invoke_gateway_tool
+    from apps.orchestrator.services import _extract_cron_jobs
+
+    jobs: list | None = None
+
+    try:
+        result = invoke_gateway_tool(tenant, "cron.list", {"includeDisabled": False})
+        jobs = _extract_cron_jobs(result)
+    except GatewayError:
+        logger.warning(
+            "lookahead: live cron.list failed for tenant %s — falling back to snapshot",
+            str(tenant.id)[:8],
+            exc_info=True,
+        )
+
+    if not jobs:
+        snapshot = tenant.cron_jobs_snapshot or {}
+        snapshot_jobs = snapshot.get("jobs") if isinstance(snapshot, dict) else None
+        if isinstance(snapshot_jobs, list):
+            jobs = snapshot_jobs
+
+    if not jobs:
+        return None
+
+    now_ms = int(timezone.now().timestamp() * 1000)
+    cutoff_ms = now_ms + window_seconds * 1000
+
+    candidates: list[int] = []
+    for job in jobs:
+        if not isinstance(job, dict) or not job.get("enabled", True):
+            continue
+        state = job.get("state") or {}
+        next_run = state.get("nextRunAtMs")
+        if not isinstance(next_run, int):
+            continue
+        if next_run <= now_ms or next_run > cutoff_ms:
+            continue
+        candidates.append(next_run)
+
+    return min(candidates) if candidates else None
+
+
+def _cron_active_or_imminent(
+    tenant: Tenant,
+    *,
+    window_seconds: int = _CRON_DEFER_WINDOW_SECONDS,
+) -> str | None:
+    """Return a skip reason if ``tenant`` has a cron mid-flight or about to
+    fire within ``window_seconds`` — else ``None``.
+
+    Used by the hourly sweeps (``hibernate_idle_tenants_task``,
+    ``apply_pending_configs``'s image batch) to defer a tenant when killing
+    the container right now would interrupt a user-visible cron run. The
+    existing backward-looking ``cron_wake_at`` guard only catches tenants
+    that were just woken for a cron; it misses two failure modes that
+    triggered the canary 2026-05-12 12:00 evening-check-in loss:
+
+    1. ``cron_in_flight`` — a job is mid-execution
+       (``state.runningAtMs`` set). Hibernating now sends SIGTERM
+       mid-run; the agent's reply never reaches the user.
+    2. ``cron_imminent`` — a job is scheduled to fire within
+       ``window_seconds``. The sweep would start hibernation just as the
+       cron timer fires, racing the Azure revision-deactivation against
+       the in-process cron dispatch.
+
+    Single live ``cron.list`` services both checks. Conservative on
+    failure: returns ``None`` (don't block the sweep) if the gateway is
+    unreachable — the 2h idle cutoff and ``cron_wake_at`` still act as
+    backstops, and the next sweep will retry.
+    """
+    from apps.cron.gateway_client import GatewayError, invoke_gateway_tool
+    from apps.orchestrator.services import _extract_cron_jobs
+
+    try:
+        result = invoke_gateway_tool(tenant, "cron.list", {"includeDisabled": False})
+        jobs = _extract_cron_jobs(result)
+    except GatewayError:
+        logger.warning(
+            "defer-for-cron: live cron.list failed for tenant %s — proceeding without deferral",
+            str(tenant.id)[:8],
+            exc_info=True,
+        )
+        return None
+
+    if not jobs:
+        return None
+
+    now_ms = int(timezone.now().timestamp() * 1000)
+    cutoff_ms = now_ms + window_seconds * 1000
+
+    # In-flight check first — it's a stronger signal (we know a cron is
+    # actively running right now, not just scheduled).
+    for job in jobs:
+        if not isinstance(job, dict) or not job.get("enabled", True):
+            continue
+        state = job.get("state") or {}
+        running_at = state.get("runningAtMs")
+        if isinstance(running_at, int):
+            return "cron_in_flight"
+
+    for job in jobs:
+        if not isinstance(job, dict) or not job.get("enabled", True):
+            continue
+        state = job.get("state") or {}
+        next_run = state.get("nextRunAtMs")
+        if not isinstance(next_run, int):
+            continue
+        if next_run <= now_ms or next_run > cutoff_ms:
+            continue
+        return "cron_imminent"
+
+    return None
+
+
+def wake_hibernated_tenant(tenant: Tenant) -> bool:
+    """Wake a hibernated tenant's container and schedule follow-up tasks.
+
+    Returns True on success.
+
+    Image refresh on wake: if the latest image tag (``OPENCLAW_IMAGE_TAG``)
+    differs from the tenant's stored ``container_image_tag``, push the new
+    image instead of activating the existing latest revision. In single-
+    revision mode that simultaneously wakes the container AND lands it on
+    the current image, fixing the "wake-on-old-image" bug where hibernated
+    tenants come back stale because fleet rollouts skip them.
+    """
+    tid = str(tenant.id)[:8]
+
+    # Tracks whether the image refresh below moved openclaw_version (the field
+    # that drives config SCHEMA generation). When it does, step 3 must force a
+    # config regen so the new schema reaches the file share before the
+    # container reads it — otherwise the just-deployed image boots against a
+    # stale-schema config and crash-loops on "agents.defaults: Invalid input".
+    version_synced = False
+
+    # 1. Wake the container — image-refresh path takes priority over plain wake
+    try:
+        from django.conf import settings as django_settings
+
+        from apps.orchestrator.azure_client import (
+            ensure_plugin_runtime_deps_mount,
+            update_container_image,
+            wake_container_app,
+        )
+        from apps.orchestrator.tool_policy import openclaw_version_for_image_tag
+
+        desired_tag = getattr(django_settings, "OPENCLAW_IMAGE_TAG", "latest") or "latest"
+        current_tag = tenant.container_image_tag or ""
+        needs_image_refresh = desired_tag != "latest" and current_tag != desired_tag
+
+        if needs_image_refresh:
+            # update_container_image bakes the EmptyDir mount into the same
+            # revision as the image bump, so a single restart lands both.
+            registry = getattr(django_settings, "AZURE_ACR_SERVER", "nbhdunited.azurecr.io")
+            desired_image = f"{registry}/nbhd-openclaw:{desired_tag}"
+            update_container_image(tenant.container_id, desired_image)
+
+            # Keep openclaw_version (config SCHEMA) in lockstep with the image
+            # we just deployed. Fleet version bumps skip hibernated tenants, so
+            # a tenant can wake onto a much newer image while its
+            # openclaw_version is stale; the next config it gets is then the
+            # wrong schema for the running image → crash loop. Mirror
+            # bump_openclaw_version_for_tenant (incident 2026-06-17: 44aaee8d
+            # woke onto 2026.5.28 with openclaw_version stuck at 2026.4.25).
+            new_version = openclaw_version_for_image_tag(desired_tag)
+            image_updates = {"container_image_tag": desired_tag}
+            if new_version and (tenant.openclaw_version or "") != new_version:
+                image_updates["openclaw_version"] = new_version
+                tenant.openclaw_version = new_version  # in-memory sync for step 3
+                version_synced = True
+            Tenant.objects.filter(id=tenant.id).update(**image_updates)
+            tenant.container_image_tag = desired_tag
+            logger.info(
+                "idle_wake: refreshed image for %s (%s -> %s, version -> %s)",
+                tid,
+                current_tag[:10] if current_tag else "?",
+                desired_tag[:10],
+                new_version,
+            )
+        elif ensure_plugin_runtime_deps_mount(tenant.container_id):
+            # In single-revision mode, adding the mount creates a new revision
+            # which auto-activates — that wakes the container too. No separate
+            # wake call needed.
+            logger.info("idle_wake: added plugin-runtime-deps mount and woke %s", tid)
+        else:
+            wake_container_app(tenant.container_id)
+    except Exception:
+        logger.exception("idle_wake: failed to wake container for %s", tid)
+        return False
+
+    # 2. Clear hibernation flag; stamp the wake so the message drain can
+    # tell "still booting after a wake" (retry soon, keep delivery
+    # attempts) apart from a genuinely down container.
+    Tenant.objects.filter(id=tenant.id).update(hibernated_at=None, last_wake_at=timezone.now())
+
+    # 3. Apply pending config (writes to file share before container finishes
+    # booting). Normally gated on pending>config, but two states need a forced
+    # regen even when pending==config — both otherwise invisible to the apply
+    # machinery and both proven crash-loop causes (incident 2026-06-17):
+    #   - version_synced: the image refresh above moved openclaw_version, so
+    #     the on-share config is now the wrong schema for the running image.
+    #   - config_version == 0: the tenant never had a version-tracked config
+    #     write; its openclaw.json exists only if the provision-time env-var
+    #     seed succeeded. If that seed failed, the share has no config and the
+    #     container crash-loops on the startup gate ("Config file missing").
+    # Bump pending so the apply below actually writes (the apply task and this
+    # gate both no-op while pending<=config).
+    if (version_synced or tenant.config_version == 0) and tenant.pending_config_version <= tenant.config_version:
+        try:
+            tenant.bump_pending_config()  # increments pending_config_version + saves
+        except Exception:
+            logger.exception("idle_wake: failed to bump pending config for %s", tid)
+
+    if tenant.pending_config_version > tenant.config_version:
+        try:
+            from apps.cron.publish import publish_task
+
+            publish_task("apply_single_tenant_config", str(tenant.id))
+            logger.info(
+                "idle_wake: queued config apply for %s (v%d→v%d, version_synced=%s)",
+                tid,
+                tenant.config_version,
+                tenant.pending_config_version,
+                version_synced,
+            )
+        except Exception:
+            logger.exception("idle_wake: failed to queue config apply for %s", tid)
+
+    # 4. Schedule buffered message delivery (45s delay for container startup).
+    #
+    # ``retries=1`` (vs QStash's default 3) because the task already has
+    # application-level resilience (per-message attempt cap +
+    # ``delivery_in_flight_until`` lease). Letting QStash retry 3x meant
+    # a slow first turn — typical for BYO Claude with full agent context —
+    # spawned overlapping ``/v1/chat/completions`` POSTs at the container,
+    # which the claude-cli backend rejected as concurrent turns and fell
+    # back off to MiniMax. One QStash retry is enough to cover a genuine
+    # cron-trigger transport failure without re-firing for slow inference.
+    try:
+        from apps.cron.publish import publish_task
+
+        publish_task(
+            "deliver_buffered_messages",
+            str(tenant.id),
+            delay_seconds=45,
+            retries=1,
+        )
+    except Exception:
+        logger.exception("idle_wake: failed to schedule buffer delivery for %s", tid)
+
+    # 5. Schedule cron resumption (60s delay — container must be ready)
+    try:
+        from apps.cron.publish import publish_task
+
+        publish_task(
+            "resume_hibernated_crons",
+            str(tenant.id),
+            delay_seconds=60,
+        )
+    except Exception:
+        logger.exception("idle_wake: failed to schedule cron resume for %s", tid)
+
+    logger.info("idle_wake: tenant %s wake initiated", tid)
+    return True
+
+
+# ---------------------------------------------------------------------------
+# Hibernation-aware deferral for settings-time gateway calls
+# ---------------------------------------------------------------------------
+
+# Sentinel returned by ``apply_or_defer_gateway_call`` to signal that the
+# gateway side-effect was *not* run synchronously. The DB mutation already
+# happened; the desired state has been written to the file share, so the
+# OpenClaw container will pick it up on next startup. The existing async
+# ``apply_pending_configs`` scheduler also catches drift between
+# ``config_version`` and ``pending_config_version`` and re-runs the apply
+# at wake.
+DEFERRED = object()
+
+
+def apply_or_defer_gateway_call(tenant: Tenant, fn, *, label: str):
+    """Run ``fn()`` synchronously when awake, otherwise defer the gateway call.
+
+    The narrow awake-path fallthrough — catching ``GatewayError`` *and only*
+    when ``is_container_unavailable_error`` returns True — exists so a
+    just-hibernated container that the DB still thinks is awake doesn't surface
+    a 5xx to the user. Anything else (Azure SDK errors, real app bugs,
+    non-availability gateway flakes) propagates so we don't swallow real
+    failures.
+
+    Caller contract: the DB mutation that produced the new desired state must
+    already have happened (and the caller is responsible for bumping
+    ``pending_config_version`` once per request — the helper only writes the
+    file-share copy on the deferred path, deduped within the request).
+    """
+    from apps.cron.cache import is_container_unavailable_error
+    from apps.cron.gateway_client import GatewayError
+
+    tid = str(tenant.id)[:8]
+
+    if tenant.hibernated_at is None:
+        try:
+            result = fn()
+        except GatewayError as exc:
+            if is_container_unavailable_error(exc):
+                logger.info(
+                    "defer_gateway: %s container-unavailable for awake tenant %s, deferring",
+                    label,
+                    tid,
+                )
+                _write_deferred_state(tenant, label=label)
+                return DEFERRED
+            raise
+        logger.info("defer_gateway: %s applied for tenant %s", label, tid)
+        return result
+
+    logger.info(
+        "defer_gateway: %s deferred for hibernated tenant %s",
+        label,
+        tid,
+    )
+    _write_deferred_state(tenant, label=label)
+    return DEFERRED
+
+
+def _write_deferred_state(tenant: Tenant, *, label: str) -> None:
+    """Write the desired config to the file share so the container picks it up at wake.
+
+    The pending-version bump is the caller's responsibility — this only handles
+    the file-share side of the defer. Deduped per-request via an instance flag
+    so endpoints with multiple deferred wraps don't re-upload the same bytes.
+    """
+    if getattr(tenant, "_deferred_config_written", False):
+        return
+
+    from apps.orchestrator.azure_client import upload_config_to_file_share
+    from apps.orchestrator.config_generator import config_to_json, generate_openclaw_config
+
+    try:
+        config = generate_openclaw_config(tenant)
+        config_json = config_to_json(config)
+        upload_config_to_file_share(str(tenant.id), config_json)
+        tenant._deferred_config_written = True
+    except Exception:
+        # The apply_pending_configs scheduler will catch up at next wake using
+        # the bumped pending_config_version the caller already recorded.
+        logger.exception(
+            "defer_gateway: %s file-share write failed for tenant %s",
+            label,
+            tenant.id,
+        )
+
+
+# ---------------------------------------------------------------------------
+# Cron-aware wake tasks
+# ---------------------------------------------------------------------------
+
+
+def wake_for_cron_task(tenant_id: str) -> dict:
+    """Wake a hibernated tenant's container for a scheduled cron job.
+
+    Called by QStash ~2 minutes before the tenant's next cron is due.
+    After 30 minutes, if no user messages arrived, the container is
+    re-hibernated via ``check_cron_wake_idle_task``.
+    """
+    tenant = Tenant.objects.filter(id=tenant_id).first()
+    if not tenant:
+        logger.warning("wake_for_cron: tenant %s not found", tenant_id[:8])
+        return {"status": "tenant_not_found"}
+
+    if not tenant.hibernated_at:
+        # Tenant is already awake — the local gateway will fire the cron
+        # itself, no wake-up needed. But re-arm the next cron-aware wake
+        # so the chain doesn't break if the tenant later hibernates and
+        # the next idle-hibernation cycle fails to re-arm (e.g. gateway
+        # 404 at hibernation time exhausts the snapshot fallback). QStash
+        # idempotency on the wake key dedupes this against the eventual
+        # idle-hibernation arming.
+        logger.info(
+            "wake_for_cron: tenant %s already awake, re-arming next cron wake",
+            tenant_id[:8],
+        )
+        try:
+            cron_jobs = _capture_tenant_cron_schedules(tenant)
+            _schedule_next_cron_wake(tenant, cron_jobs)
+        except Exception:
+            logger.warning(
+                "wake_for_cron: re-arm failed for awake tenant %s — relying on next idle-hibernation",
+                tenant_id[:8],
+                exc_info=True,
+            )
+        return {"status": "already_awake"}
+
+    if tenant.status != Tenant.Status.ACTIVE:
+        logger.info(
+            "wake_for_cron: tenant %s not active (status=%s), skipping",
+            tenant_id[:8],
+            tenant.status,
+        )
+        return {"status": "not_active"}
+
+    # Wake the container (clears hibernated_at, resumes crons, delivers buffers)
+    if not wake_hibernated_tenant(tenant):
+        return {"status": "wake_failed"}
+
+    # Mark this as a cron-triggered wake
+    Tenant.objects.filter(id=tenant.id).update(cron_wake_at=timezone.now())
+
+    # Schedule idle check — if no user messages in 30 min, re-hibernate
+    try:
+        from apps.cron.publish import publish_task
+
+        publish_task(
+            "check_cron_wake_idle",
+            str(tenant.id),
+            delay_seconds=_CRON_WAKE_IDLE_SECONDS,
+        )
+    except Exception:
+        logger.exception(
+            "wake_for_cron: failed to schedule idle check for %s",
+            tenant_id[:8],
+        )
+
+    logger.info("wake_for_cron: tenant %s woken for scheduled cron", tenant_id[:8])
+    return {"status": "woken_for_cron"}
+
+
+def check_cron_wake_idle_task(tenant_id: str) -> dict:
+    """Check if a cron-woken tenant should be re-hibernated.
+
+    Called 30 minutes after a cron wake. If no user messages were sent
+    during the wake window, hibernate immediately (which also schedules
+    the next cron wake). If the user messaged, clear ``cron_wake_at``
+    and let normal idle detection handle it.
+    """
+    tenant = Tenant.objects.filter(id=tenant_id).first()
+    if not tenant:
+        return {"status": "tenant_not_found"}
+
+    if not tenant.cron_wake_at:
+        logger.info(
+            "check_cron_wake_idle: tenant %s has no cron_wake_at, skipping",
+            tenant_id[:8],
+        )
+        return {"status": "not_cron_wake"}
+
+    if tenant.hibernated_at:
+        logger.info(
+            "check_cron_wake_idle: tenant %s already hibernated, skipping",
+            tenant_id[:8],
+        )
+        return {"status": "already_hibernated"}
+
+    # Did the user send any messages since the cron wake?
+    user_messaged = tenant.last_message_at and tenant.last_message_at > tenant.cron_wake_at
+
+    if user_messaged:
+        # User is active — hand off to normal idle detection (2h threshold)
+        Tenant.objects.filter(id=tenant.id).update(cron_wake_at=None)
+        logger.info(
+            "check_cron_wake_idle: tenant %s has user activity, staying awake",
+            tenant_id[:8],
+        )
+        return {"status": "user_active"}
+
+    # Look-ahead: if another cron is due to fire soon, defer re-hibernation
+    # so that cron lands on the warm container instead of forcing a
+    # cold-start cycle. ``last_message_at`` doesn't move on cron output, so
+    # without this check a back-to-back pattern (e.g. 7am + 8:30am) always
+    # paid two cold-starts.
+    upcoming_cron_ms = _next_cron_within_window(tenant)
+    if upcoming_cron_ms is not None:
+        now_ms = int(timezone.now().timestamp() * 1000)
+        # Re-check 30 min after the upcoming cron fires. If by then no
+        # further cron is due and the user hasn't messaged, we'll
+        # re-hibernate then.
+        delay_seconds = (upcoming_cron_ms - now_ms) // 1000 + _CRON_WAKE_IDLE_SECONDS
+        try:
+            from apps.cron.publish import publish_task
+
+            publish_task(
+                "check_cron_wake_idle",
+                str(tenant.id),
+                delay_seconds=delay_seconds,
+            )
+        except Exception:
+            logger.exception(
+                "check_cron_wake_idle: failed to schedule deferred check for %s",
+                tenant_id[:8],
+            )
+            # Fall through to re-hibernate so we don't end up in a state
+            # with no future check pending.
+        else:
+            logger.info(
+                "check_cron_wake_idle: tenant %s — upcoming cron in %ds, deferring re-hibernation (next check in %ds)",
+                tenant_id[:8],
+                (upcoming_cron_ms - now_ms) // 1000,
+                delay_seconds,
+            )
+            return {"status": "deferred_for_upcoming_cron"}
+
+    # No user activity, no upcoming cron — re-hibernate (this also
+    # schedules the next cron wake).
+    logger.info(
+        "check_cron_wake_idle: tenant %s idle after cron wake, re-hibernating",
+        tenant_id[:8],
+    )
+    Tenant.objects.filter(id=tenant.id).update(cron_wake_at=None)
+    tenant.refresh_from_db()
+    hibernate_idle_tenant(tenant)
+
+    return {"status": "re_hibernated"}
+
+
+_MAX_DELIVERY_ATTEMPTS = 3
+_TRANSIENT_BACKOFFS_SECONDS: tuple[float, ...] = (5.0, 15.0, 45.0)
+# Lease padding factor: how much wall-clock the in-flight lock covers
+# beyond the per-request timeout. Slightly more than the worst-case POST
+# duration (timeout + backoffs) so a concurrent QStash retry doesn't
+# steal the row mid-flight, but bounded so a truly stuck row is freed
+# on the next task tick.
+_IN_FLIGHT_LEASE_FACTOR = 1.5
+
+
+def _resolve_chat_timeout(tenant) -> float:
+    """Return the per-attempt chat-completion timeout for a tenant.
+
+    BYO Claude (anthropic/* via the bundled CLI) and reasoning models
+    (Kimi K2.6) get the longer ``REASONING_MODEL_TIMEOUT`` because
+    cold-start of the agent runtime + first-turn tool use regularly
+    runs past the 120s default. Standard models keep
+    ``DEFAULT_CHAT_TIMEOUT``. Both stay below the 300s gunicorn worker
+    cap (CLAUDE.md gotcha).
+    """
+    from apps.billing.constants import (
+        BYO_SLOW_MODELS,
+        DEFAULT_CHAT_TIMEOUT,
+        REASONING_MODEL_TIMEOUT,
+        REASONING_MODELS,
+    )
+
+    model = (getattr(tenant, "preferred_model", "") or "").strip()
+    if model in REASONING_MODELS or model in BYO_SLOW_MODELS:
+        return REASONING_MODEL_TIMEOUT
+    return DEFAULT_CHAT_TIMEOUT
+
+
+def _post_chat_completion_with_backoff(
+    url: str,
+    *,
+    payload: dict,
+    headers: dict,
+    timeout: float = 120.0,
+    backoffs: tuple[float, ...] = _TRANSIENT_BACKOFFS_SECONDS,
+):
+    """POST to OpenClaw `/v1/chat/completions` with retry on transient errors.
+
+    A "transient" error is a connection/timeout error or any 5xx response —
+    typically a still-cold container or a brief gateway hiccup. Those get
+    retried with the given backoffs *before* this counts as a failed
+    delivery attempt against the buffered message. Permanent errors (4xx)
+    raise immediately.
+
+    Returns the parsed JSON body on success.
+    """
+
+    import httpx
+
+    delays = [0.0, *backoffs]
+    last_error: Exception | None = None
+    for i, delay in enumerate(delays):
+        if delay:
+            time.sleep(delay)
+        try:
+            resp = httpx.post(url, json=payload, headers=headers, timeout=timeout)
+        except httpx.RequestError as exc:
+            last_error = exc
+            logger.warning(
+                "post_chat: transient %s on attempt %d/%d",
+                type(exc).__name__,
+                i + 1,
+                len(delays),
+            )
+            continue
+
+        if resp.status_code >= 500:
+            last_error = httpx.HTTPStatusError(
+                f"Server error {resp.status_code}",
+                request=resp.request,
+                response=resp,
+            )
+            logger.warning(
+                "post_chat: %d on attempt %d/%d",
+                resp.status_code,
+                i + 1,
+                len(delays),
+            )
+            continue
+
+        resp.raise_for_status()
+        return resp.json()
+
+    assert last_error is not None
+    raise last_error
+
+
+def _send_apology_for_dropped_message(tenant: Tenant, msg) -> None:
+    """Notify the user we couldn't process their buffered message after the
+    attempts cap. Uses channel-native plain push (NOT
+    `relay_ai_response_to_line`) since this is system status, not assistant
+    content. Localized via the existing `error_msg` framework — falls back
+    to English for languages without a translated key."""
+    from apps.pii.redactor import rehydrate_for_tenant
+    from apps.router.error_messages import error_msg, strip_internal_framing
+    from apps.router.models import BufferedMessage
+
+    if suppresses_real_transport(tenant):
+        logger.error(
+            "eval-sink transport block: tenant=%s transport=%s",
+            tenant.id,
+            msg.channel,
+        )
+        return
+
+    # ``user_text`` now rests REDACTED (placeholder-space). Rehydrate before
+    # quoting it back so the user sees the real words they typed, not
+    # ``[PERSON_5]`` \u2014 mirrors the PendingMessage apology seam
+    # (pending_queue._send_apology_for_dropped_pending_message). Defense in
+    # depth: peel any agent-only ``[System: \u2026]`` / ``[Now: \u2026]`` framing
+    # off the head too \u2014 call sites pass clean ``raw_user_text`` but this catches
+    # any future site that forgets.
+    excerpt = strip_internal_framing(rehydrate_for_tenant(tenant, msg.user_text or "")).strip().replace("\n", " ")
+    if len(excerpt) > 50:
+        excerpt = excerpt[:50] + "\u2026"
+
+    lang = getattr(tenant.user, "language", None) or "en"
+    if excerpt:
+        text = error_msg(lang, "dropped_message_with_excerpt", excerpt=excerpt)
+    else:
+        text = error_msg(lang, "dropped_message")
+
+    if msg.channel == BufferedMessage.Channel.LINE:
+        line_user_id = getattr(tenant.user, "line_user_id", None)
+        if not line_user_id:
+            return
+        from apps.router.line_webhook import _send_line_text
+
+        try:
+            _send_line_text(line_user_id, text)
+        except Exception:
+            logger.exception(
+                "deliver_buffered: failed to push apology to LINE for tenant %s",
+                str(tenant.id)[:8],
+            )
+    else:
+        # Telegram: send the same localized apology via the existing
+        # send_telegram_message helper (plain Bot API call, no assistant loop).
+        telegram_chat_id = getattr(tenant.user, "telegram_chat_id", None)
+        if not telegram_chat_id:
+            return
+        from apps.router.services import send_telegram_message
+
+        try:
+            send_telegram_message(telegram_chat_id, text)
+        except Exception:
+            logger.exception(
+                "deliver_buffered: failed to push apology to Telegram for tenant %s",
+                str(tenant.id)[:8],
+            )
+
+
+def _buffered_row_is_voice(msg) -> bool:
+    """Buffered-row voice detection over the stored envelope.
+
+    New rows carry an explicit ``is_voice`` flag in the minimal envelope; legacy
+    rows are shape-sniffed against the raw webhook (backward compat). Voice rows
+    are excluded from cold-start LINE coalescing — they're a different content
+    shape (transcribed audio) and shouldn't fold into a multi-message bundle.
+    """
+    from apps.router.buffer_envelope import envelope_is_voice
+
+    return envelope_is_voice(msg.payload)
+
+
+def _claim_next_buffered_message(tenant, timeout_seconds: float):
+    """Backwards-compatible single-row claim, kept for Telegram path.
+
+    Telegram hibernation delivery forwards the redacted ``user_text`` one row
+    at a time via ``/v1/chat/completions`` (``_forward_buffered_telegram``);
+    coalescing the Telegram hibernated path is still deferred. LINE hibernation
+    delivery uses ``_claim_buffered_batch_for_tenant`` instead, which can return
+    >1 rows for a single coalesced ``/v1/chat/completions`` POST.
+
+    Returns the claimed row (with ``delivery_in_flight_until`` extended)
+    or ``None`` if no row is available — either the queue is empty for
+    this tenant or every undelivered row currently has a live lease held
+    by a concurrent task.
+    """
+    from datetime import timedelta
+
+    from django.db import transaction
+
+    from apps.router.models import BufferedMessage
+
+    lease_seconds = timeout_seconds * _IN_FLIGHT_LEASE_FACTOR
+
+    with transaction.atomic():
+        now = timezone.now()
+        qs = (
+            BufferedMessage.objects.select_for_update(skip_locked=True)
+            .filter(tenant=tenant, delivered=False)
+            .filter(models.Q(delivery_in_flight_until__isnull=True) | models.Q(delivery_in_flight_until__lt=now))
+            .order_by("created_at")
+        )
+        msg = qs.first()
+        if not msg:
+            return None
+
+        # Past the cap → drop without taking a lease (no network call needed).
+        if msg.delivery_attempts >= _MAX_DELIVERY_ATTEMPTS:
+            return msg
+
+        msg.delivery_in_flight_until = now + timedelta(seconds=lease_seconds)
+        msg.save(update_fields=["delivery_in_flight_until"])
+        return msg
+
+
+def _claim_buffered_batch_for_tenant(tenant, channel: str, timeout_seconds: float):
+    """Claim a contiguous head batch of BufferedMessage rows for one channel.
+
+    Used by the hibernated-LINE coalescing path: when the user fires off
+    N messages during the ~45s revision-activate window, we want OpenClaw
+    to see ONE turn with delineated follow-ups instead of N consecutive
+    single-message turns. This helper picks up the entire current LINE
+    backlog (under the cap, fresh, non-voice) in a single
+    ``SELECT ... FOR UPDATE SKIP LOCKED`` transaction so concurrent drain
+    workers can never end up with overlapping batches for the same
+    tenant.
+
+    Returns ``(batch, info)`` mirroring the warm-path semantics in
+    ``apps/router/pending_queue._claim_pending_batch_for_key``:
+
+      - ``info["past_cap_head"]`` — head row past the attempts cap, no
+        lease; caller drops + apologizes.
+      - Otherwise ``batch`` is the leased head batch (always at least
+        1 element if non-empty). Voice rows are singletons.
+
+    Hibernated-side rows have no ``channel_user_id`` scope (the
+    BufferedMessage model is single-user-per-tenant by construction —
+    delivery uses ``tenant.user.line_user_id`` directly), so the batch
+    can safely span every LINE row for the tenant.
+    """
+    from datetime import timedelta
+
+    from django.db import transaction
+
+    from apps.router.models import BufferedMessage
+
+    lease_seconds = timeout_seconds * _IN_FLIGHT_LEASE_FACTOR
+
+    with transaction.atomic():
+        now = timezone.now()
+        qs = (
+            BufferedMessage.objects.select_for_update(skip_locked=True)
+            .filter(tenant=tenant, channel=channel, delivered=False)
+            .filter(models.Q(delivery_in_flight_until__isnull=True) | models.Q(delivery_in_flight_until__lt=now))
+            .order_by("created_at")
+        )
+        rows = list(qs)
+        if not rows:
+            return ([], {})
+
+        head = rows[0]
+
+        if head.delivery_attempts >= _MAX_DELIVERY_ATTEMPTS:
+            return ([], {"past_cap_head": head})
+
+        # Voice head → singleton batch (voice stays singular).
+        if _buffered_row_is_voice(head):
+            head.delivery_in_flight_until = now + timedelta(seconds=lease_seconds)
+            head.save(update_fields=["delivery_in_flight_until"])
+            return ([head], {})
+
+        # Build contiguous head batch: same channel (guaranteed by filter),
+        # under cap, non-voice. Break at first row that fails.
+        batch = [head]
+        for row in rows[1:]:
+            if row.delivery_attempts >= _MAX_DELIVERY_ATTEMPTS:
+                break
+            if _buffered_row_is_voice(row):
+                break
+            batch.append(row)
+
+        for row in batch:
+            row.delivery_in_flight_until = now + timedelta(seconds=lease_seconds)
+            row.save(update_fields=["delivery_in_flight_until"])
+
+        return (batch, {})
+
+
+def _buffered_telegram_chat_id(tenant, msg):
+    """Recipient chat_id for a buffered Telegram row.
+
+    Prefer the message's own chat_id (from the minimal envelope, or a legacy
+    raw update), fall back to the tenant's stored ``telegram_chat_id``. Returns
+    an ``int`` or ``None``.
+    """
+    from apps.router.buffer_envelope import envelope_telegram_chat_id
+
+    chat_id = envelope_telegram_chat_id(msg.payload)
+    if chat_id is None:
+        chat_id = getattr(tenant.user, "telegram_chat_id", None)
+    if chat_id is None:
+        return None
+    try:
+        return int(chat_id)
+    except (TypeError, ValueError):
+        return None
+
+
+@dataclass(frozen=True)
+class _BufferedForwardResult:
+    ai_text: str
+    relay_result: object
+    model_response_ref: str = ""
+
+
+def _forward_buffered_telegram(tenant, msg, chat_timeout: float) -> _BufferedForwardResult:
+    """Forward one buffered Telegram row to the container and relay the reply.
+
+    Converges on the live poller drain (``pending_queue._drain_telegram_batch``)
+    and the buffered-LINE path: POST the redacted ``user_text`` to
+    ``/v1/chat/completions`` and relay the *rehydrated* reply via
+    ``relay_ai_response_to_telegram``. This replaces the legacy re-POST of the
+    raw provider webhook to ``/telegram-webhook`` — which required the raw update
+    at rest and could not rehydrate placeholders (it would have leaked
+    ``[PERSON_N]`` to the user). Raises on a non-2xx / transient-exhausted POST
+    so the caller advances the attempt counter, exactly like the legacy path.
+    """
+    from apps.cron.gateway_client import get_gateway_token_for_tenant
+    from apps.router.buffer_envelope import envelope_media
+    from apps.router.pending_queue import _extract_ai_response, relay_ai_response_to_telegram
+
+    chat_id = _buffered_telegram_chat_id(tenant, msg)
+    if chat_id is None:
+        raise ValueError(f"buffered telegram row {msg.id} has no resolvable chat_id")
+
+    content = msg.user_text or "..."
+    # Media parity for the (latent) Telegram webhook path: the converged
+    # /v1/chat/completions forward can't re-fetch media by file_id the way the
+    # old /telegram-webhook re-POST let the container do. We keep the file-id
+    # references at rest (envelope 'media') and tell the agent media was
+    # attached so it can ask the user to resend — mirroring the poller's media
+    # fallback markers — rather than silently dropping it. (Prod Telegram media
+    # flows through the poller/PendingMessage path, not this latent buffer.)
+    if envelope_media(msg.payload):
+        content = "[The user attached media that isn't available after wake — ask them to resend it.]\n" + content
+
+    from apps.pii.redactor import annotate_model_context
+
+    content = annotate_model_context(content, getattr(tenant, "pii_entity_map", None))
+
+    url = f"https://{tenant.container_fqdn}/v1/chat/completions"
+    gateway_token = get_gateway_token_for_tenant(tenant)
+    user_tz = tenant.user.timezone or "UTC"
+
+    result = _post_chat_completion_with_backoff(
+        url,
+        payload={
+            "model": "openclaw",
+            "messages": [{"role": "user", "content": content}],
+            "user": str(chat_id),
+        },
+        headers={
+            "Authorization": f"Bearer {gateway_token}",
+            "X-User-Timezone": user_tz,
+            "X-Telegram-Chat-Id": str(chat_id),
+            "X-Channel": "telegram",
+        },
+        timeout=chat_timeout,
+    )
+
+    ai_text = _extract_ai_response(result) or ""
+    from apps.router.pending_queue import DeliveryState, SendResult
+
+    relay_result = SendResult(DeliveryState.SENT, detail="empty_ai_text")
+    if ai_text:
+        relay_result = relay_ai_response_to_telegram(tenant, chat_id, ai_text)
+    model_response_ref = str(result.get("id") or "") if isinstance(result, dict) else ""
+    return _BufferedForwardResult(ai_text, relay_result, model_response_ref)
+
+
+def _capture_buffered_transcripts(
+    tenant,
+    rows,
+    channel: str,
+    forward_result: _BufferedForwardResult,
+) -> None:
+    """Capture relay-complete buffered turns without affecting delivery flow."""
+    if not getattr(tenant, "recall_capture_enabled", False):
+        return
+
+    ordered = sorted(rows, key=lambda row: (row.created_at, str(row.id)))
+    if not ordered:
+        return
+    primary_source_event_id = str(ordered[0].id)
+    assistant_occurred_at = timezone.now() if forward_result.ai_text else None
+    turn_id = None
+
+    try:
+        from apps.pii.redactor import (
+            RedactionOutcome,
+            confirm_assistant_output,
+            confirmed_from_receipt_row,
+            redaction_receipt,
+        )
+        from apps.router.pending_queue import DeliveryState
+        from apps.transcripts.capture import (
+            capture_transcript_event,
+            derive_turn_id,
+            quarantine_transcript_event,
+        )
+        from apps.transcripts.models import TranscriptEvent
+
+        delivery_state = getattr(forward_result.relay_result, "state", DeliveryState.FAILED)
+        delivery_value = getattr(delivery_state, "value", "failed")
+        if delivery_value not in {"sent", "partial", "failed", "ambiguous"}:
+            delivery_value = ""
+        delivered_chunks = int(getattr(forward_result.relay_result, "delivered_chunks", 0) or 0)
+        total_chunks = int(getattr(forward_result.relay_result, "total_chunks", 0) or 0)
+
+        assistant_confirmed = None
+        assistant_quarantine = None
+        if forward_result.ai_text:
+            assistant_confirmed = confirm_assistant_output(tenant, forward_result.ai_text)
+            if assistant_confirmed is None:
+                assistant_quarantine = RedactionOutcome(
+                    text="",
+                    confirmed=False,
+                    reason="assistant-confirm-failed",
+                )
+
+        turn_id = derive_turn_id(
+            tenant.id,
+            TranscriptEvent.SourceType.BUFFERED,
+            primary_source_event_id,
+        )
+        for msg in ordered:
+            source_event_id = str(msg.id)
+            confirmed = confirmed_from_receipt_row(msg.payload, msg.user_text or "")
+            receipt = redaction_receipt(msg.payload) if confirmed is None else None
+            if confirmed is not None:
+                capture_transcript_event(
+                    tenant=tenant,
+                    source_type=TranscriptEvent.SourceType.BUFFERED,
+                    source_event_id=source_event_id,
+                    role=TranscriptEvent.Role.USER,
+                    channel=channel,
+                    turn_id=turn_id,
+                    occurred_at=msg.created_at,
+                    redaction=confirmed,
+                    thread_key=channel,
+                )
+            else:
+                quarantine_transcript_event(
+                    tenant=tenant,
+                    source_type=TranscriptEvent.SourceType.BUFFERED,
+                    source_event_id=source_event_id,
+                    channel=channel,
+                    outcome=receipt,
+                    turn_id=turn_id,
+                    occurred_at=msg.created_at,
+                    thread_key=channel,
+                )
+
+        if assistant_confirmed is not None:
+            capture_transcript_event(
+                tenant=tenant,
+                source_type=TranscriptEvent.SourceType.ASSISTANT_REPLY,
+                source_event_id=primary_source_event_id,
+                role=TranscriptEvent.Role.ASSISTANT,
+                channel=channel,
+                turn_id=turn_id,
+                occurred_at=assistant_occurred_at,
+                redaction=assistant_confirmed,
+                thread_key=channel,
+                delivery_state=delivery_value,
+                delivered_chunks=delivered_chunks,
+                total_chunks=total_chunks,
+                model_response_ref=forward_result.model_response_ref,
+            )
+        elif assistant_quarantine is not None:
+            quarantine_transcript_event(
+                tenant=tenant,
+                source_type=TranscriptEvent.SourceType.ASSISTANT_REPLY,
+                source_event_id=primary_source_event_id,
+                channel=channel,
+                outcome=assistant_quarantine,
+                turn_id=turn_id,
+                occurred_at=assistant_occurred_at,
+                thread_key=channel,
+            )
+    except Exception:
+        try:
+            from apps.pii.redactor import RedactionOutcome
+            from apps.transcripts.capture import derive_turn_id, quarantine_transcript_event
+            from apps.transcripts.models import TranscriptEvent
+
+            if turn_id is None:
+                turn_id = derive_turn_id(
+                    tenant.id,
+                    TranscriptEvent.SourceType.BUFFERED,
+                    primary_source_event_id,
+                )
+            capture_error = RedactionOutcome(text="", confirmed=False, reason="capture-error")
+            for msg in ordered:
+                quarantine_transcript_event(
+                    tenant=tenant,
+                    source_type=TranscriptEvent.SourceType.BUFFERED,
+                    source_event_id=str(msg.id),
+                    channel=channel,
+                    outcome=capture_error,
+                    turn_id=turn_id,
+                    occurred_at=msg.created_at,
+                    thread_key=channel,
+                )
+            if forward_result.ai_text:
+                quarantine_transcript_event(
+                    tenant=tenant,
+                    source_type=TranscriptEvent.SourceType.ASSISTANT_REPLY,
+                    source_event_id=primary_source_event_id,
+                    channel=channel,
+                    outcome=capture_error,
+                    turn_id=turn_id,
+                    occurred_at=assistant_occurred_at,
+                    thread_key=channel,
+                )
+        except Exception:
+            logger.exception(
+                "deliver_buffered: transcript capture failed tenant=%s channel=%s",
+                str(tenant.id)[:8],
+                channel,
+            )
+
+
+def deliver_buffered_messages_task(tenant_id: str) -> dict:
+    """Forward all buffered messages for a tenant to its container.
+
+    Called via QStash ~45s after wake to give the container time to start.
+
+    Resilience semantics (regression guard for 2026-04-28 head-of-line
+    incident + 2026-05-02 BYO Claude retry-storm incident):
+      - Each row is claimed inside a SELECT ... FOR UPDATE SKIP LOCKED
+        transaction with a soft ``delivery_in_flight_until`` lease, so a
+        concurrent QStash retry can't re-fire ``/v1/chat/completions``
+        while the first POST is still running. The lease is set to
+        ``timeout * 1.5`` and cleared on success / final failure / cap.
+      - Per-attempt timeout adapts to the tenant's preferred model: BYO
+        Claude (via the claude CLI backend) and reasoning models get the
+        ``REASONING_MODEL_TIMEOUT`` since cold-start of the agent runtime
+        + first-turn tool use can take 150s+ for the first reply.
+      - Transient 5xx / connection errors retry inside the task with
+        backoff before counting as a delivery attempt.
+      - On a real per-message failure we increment ``delivery_attempts``
+        and break to preserve queue order; QStash retries the task.
+      - Once a message has hit ``_MAX_DELIVERY_ATTEMPTS`` we mark it
+        ``delivered=True / status=failed`` and push a one-shot apology
+        to the user so the head of the queue can never block forever.
+    """
+    from apps.router.models import BufferedMessage
+
+    tenant = Tenant.objects.select_related("user").filter(id=tenant_id).first()
+    if not tenant:
+        logger.warning("deliver_buffered: tenant %s not found", tenant_id[:8])
+        return {"delivered": 0, "failed": 0, "dropped": 0, "skipped_in_flight": 0}
+
+    if suppresses_real_transport(tenant):
+        now = timezone.now()
+        dropped = BufferedMessage.objects.filter(tenant=tenant, delivered=False).update(
+            delivered=True,
+            delivered_at=now,
+            delivery_status=BufferedMessage.Status.FAILED,
+            delivery_in_flight_until=None,
+        )
+        logger.warning(
+            "deliver_buffered: dropped %d eval-sink row(s) tenant=%s without transport",
+            dropped,
+            tenant.id,
+        )
+        return {"delivered": 0, "failed": 0, "dropped": dropped, "skipped_in_flight": 0}
+
+    if not tenant.container_fqdn:
+        logger.warning("deliver_buffered: tenant %s not found or no FQDN", tenant_id[:8])
+        return {"delivered": 0, "failed": 0, "dropped": 0, "skipped_in_flight": 0}
+
+    chat_timeout = _resolve_chat_timeout(tenant)
+
+    delivered = 0
+    failed = 0
+    dropped = 0
+    skipped_in_flight = 0
+
+    while True:
+        # Decide channel for this iteration. We process LINE rows as
+        # coalesced batches (cold-start coalescing) and Telegram rows as
+        # singletons (Telegram cold-start coalescing is still deferred).
+        next_undelivered = BufferedMessage.objects.filter(tenant=tenant, delivered=False).order_by("created_at").first()
+        if next_undelivered is None:
+            break
+
+        if next_undelivered.channel == BufferedMessage.Channel.LINE:
+            line_batch, info = _claim_buffered_batch_for_tenant(tenant, BufferedMessage.Channel.LINE, chat_timeout)
+            past_cap_head = info.get("past_cap_head")
+            if past_cap_head is not None:
+                logger.warning(
+                    "deliver_buffered: dropping msg %s for tenant %s after %d attempts",
+                    past_cap_head.id,
+                    tenant_id[:8],
+                    past_cap_head.delivery_attempts,
+                )
+                past_cap_head.delivered = True
+                past_cap_head.delivered_at = timezone.now()
+                past_cap_head.delivery_status = BufferedMessage.Status.FAILED
+                past_cap_head.delivery_in_flight_until = None
+                past_cap_head.save(
+                    update_fields=[
+                        "delivered",
+                        "delivered_at",
+                        "delivery_status",
+                        "delivery_in_flight_until",
+                    ]
+                )
+                _send_apology_for_dropped_message(tenant, past_cap_head)
+                dropped += 1
+                continue
+
+            if not line_batch:
+                # Held by a concurrent in-flight lease.
+                undelivered = BufferedMessage.objects.filter(tenant=tenant, delivered=False).count()
+                if undelivered:
+                    skipped_in_flight = undelivered
+                    logger.info(
+                        "deliver_buffered: tenant %s — %d msg(s) held by concurrent in-flight lease",
+                        tenant_id[:8],
+                        undelivered,
+                    )
+                break
+
+            batch_size = len(line_batch)
+            if batch_size > 1:
+                logger.info(
+                    "deliver_buffered: tenant %s — coalescing %d LINE messages into one OC turn (cold-start)",
+                    tenant_id[:8],
+                    batch_size,
+                )
+
+            try:
+                url = f"https://{tenant.container_fqdn}/v1/chat/completions"
+                from apps.cron.gateway_client import get_gateway_token_for_tenant
+                from apps.router.services import format_coalesced_user_content
+
+                gateway_token = get_gateway_token_for_tenant(tenant)
+                user_tz = tenant.user.timezone or "UTC"
+                line_user_id = tenant.user.line_user_id or ""
+
+                if batch_size == 1:
+                    content = line_batch[0].user_text or "..."
+                else:
+                    raw_texts = [(row.user_text or "") for row in line_batch]
+                    timestamps = [row.created_at for row in line_batch]
+                    content = format_coalesced_user_content(
+                        raw_texts,
+                        user_timezone=user_tz,
+                        timestamps=timestamps,
+                        channel="line",
+                    )
+
+                from apps.pii.redactor import annotate_model_context
+
+                content = annotate_model_context(content, getattr(tenant, "pii_entity_map", None))
+
+                result = _post_chat_completion_with_backoff(
+                    url,
+                    payload={
+                        "model": "openclaw",
+                        "messages": [{"role": "user", "content": content}],
+                        "user": line_user_id,
+                    },
+                    headers={
+                        "Authorization": f"Bearer {gateway_token}",
+                        "X-User-Timezone": user_tz,
+                        "X-Line-User-Id": line_user_id,
+                    },
+                    timeout=chat_timeout,
+                )
+
+                # Send response back via LINE — use the same pipeline as the
+                # live webhook so markdown stripping, Flex bubbles, charts,
+                # and PII rehydration all apply (no reply_token: buffered
+                # delivery happens long after the webhook reply window).
+                ai_text = result.get("choices", [{}])[0].get("message", {}).get("content", "")
+                from apps.router.pending_queue import DeliveryState, SendResult
+
+                relay_result = SendResult(DeliveryState.SENT, detail="empty_ai_text")
+                if ai_text:
+                    sent = False
+                    if line_user_id:
+                        from apps.router.line_webhook import relay_ai_response_to_line
+
+                        sent = relay_ai_response_to_line(tenant, line_user_id, ai_text)
+                    relay_result = SendResult(
+                        DeliveryState.SENT if sent else DeliveryState.FAILED,
+                        delivered_chunks=int(bool(sent)),
+                        total_chunks=1,
+                        detail="" if sent else "relay_failed",
+                    )
+
+                forward_result = _BufferedForwardResult(
+                    ai_text=ai_text or "",
+                    relay_result=relay_result,
+                    model_response_ref=(str(result.get("id") or "") if isinstance(result, dict) else ""),
+                )
+                if not relay_result:
+                    logger.warning(
+                        "deliver_buffered: relay failed tenant=%s channel=line rows=%d",
+                        tenant_id[:8],
+                        batch_size,
+                    )
+                _capture_buffered_transcripts(
+                    tenant,
+                    line_batch,
+                    BufferedMessage.Channel.LINE,
+                    forward_result,
+                )
+
+                now = timezone.now()
+                for row in line_batch:
+                    row.delivered = True
+                    row.delivered_at = now
+                    row.delivery_status = BufferedMessage.Status.DELIVERED
+                    row.delivery_in_flight_until = None
+                    row.save(
+                        update_fields=[
+                            "delivered",
+                            "delivered_at",
+                            "delivery_status",
+                            "delivery_in_flight_until",
+                        ]
+                    )
+                delivered += batch_size
+
+                # Privacy hard-delete on confirmed forward
+                # (docs/encryption-at-rest-directive.md §7, Phase 0 PR-3):
+                # BufferedMessage holds the RAW pre-redaction webhook — the
+                # highest-sensitivity payload in the system. The forward
+                # succeeded and the reply was relayed above, so nothing re-reads
+                # these rows. We mark DELIVERED *first* (committed above) so a
+                # crash before the delete leaves a sweepable DELIVERED row, not
+                # an undelivered one that would be re-forwarded (duplicate
+                # reply); cleanup_delivered_buffers_task sweeps any residue.
+                try:
+                    BufferedMessage.objects.filter(id__in=[row.id for row in line_batch]).delete()
+                except Exception:
+                    logger.exception(
+                        "deliver_buffered: failed to hard-delete forwarded LINE batch for tenant %s "
+                        "(rows remain DELIVERED; 7-day cleanup cron will sweep)",
+                        tenant_id[:8],
+                    )
+
+            except Exception:
+                logger.exception(
+                    "deliver_buffered: failed to deliver LINE batch of %d for tenant %s (rows %s)",
+                    batch_size,
+                    tenant_id[:8],
+                    ",".join(str(r.id)[:8] for r in line_batch),
+                )
+                for row in line_batch:
+                    row.delivery_attempts += 1
+                    row.delivery_in_flight_until = None
+                    row.save(update_fields=["delivery_attempts", "delivery_in_flight_until"])
+                failed += batch_size
+                # Stop processing further batches to preserve order.
+                # QStash will retry the task and the same batch will be
+                # re-claimed and re-attempted (or dropped past cap).
+                break
+
+            continue
+
+        # Telegram path (singleton). Forwarding converges on the same
+        # ``/v1/chat/completions`` + rehydrating relay the live poller drain
+        # (pending_queue._drain_telegram_batch) and the buffered-LINE path use,
+        # so we forward the redacted ``user_text`` (never a raw webhook) and the
+        # relay rehydrates the reply — see ``_forward_buffered_telegram``.
+        msg = _claim_next_buffered_message(tenant, chat_timeout)
+        if msg is None:
+            undelivered = BufferedMessage.objects.filter(tenant=tenant, delivered=False).count()
+            if undelivered:
+                skipped_in_flight = undelivered
+                logger.info(
+                    "deliver_buffered: tenant %s — %d msg(s) held by concurrent in-flight lease, "
+                    "letting that task complete",
+                    tenant_id[:8],
+                    undelivered,
+                )
+            break
+
+        if msg.delivery_attempts >= _MAX_DELIVERY_ATTEMPTS:
+            logger.warning(
+                "deliver_buffered: dropping msg %s for tenant %s after %d attempts",
+                msg.id,
+                tenant_id[:8],
+                msg.delivery_attempts,
+            )
+            msg.delivered = True
+            msg.delivered_at = timezone.now()
+            msg.delivery_status = BufferedMessage.Status.FAILED
+            msg.delivery_in_flight_until = None
+            msg.save(
+                update_fields=[
+                    "delivered",
+                    "delivered_at",
+                    "delivery_status",
+                    "delivery_in_flight_until",
+                ]
+            )
+            _send_apology_for_dropped_message(tenant, msg)
+            dropped += 1
+            continue
+
+        try:
+            forward_result = _forward_buffered_telegram(tenant, msg, chat_timeout)
+            if not forward_result.relay_result:
+                logger.warning(
+                    "deliver_buffered: relay failed tenant=%s channel=telegram rows=1",
+                    tenant_id[:8],
+                )
+            _capture_buffered_transcripts(
+                tenant,
+                [msg],
+                BufferedMessage.Channel.TELEGRAM,
+                forward_result,
+            )
+
+            msg.delivered = True
+            msg.delivered_at = timezone.now()
+            msg.delivery_status = BufferedMessage.Status.DELIVERED
+            msg.delivery_in_flight_until = None
+            msg.save(
+                update_fields=[
+                    "delivered",
+                    "delivered_at",
+                    "delivery_status",
+                    "delivery_in_flight_until",
+                ]
+            )
+            delivered += 1
+
+            # Privacy hard-delete on confirmed forward — see the LINE batch
+            # path above and docs/encryption-at-rest-directive.md §7 (Phase 0).
+            # Nothing re-reads the row once forwarded; the 7-day cleanup cron
+            # sweeps the rare row whose delete didn't land after the DELIVERED
+            # commit.
+            try:
+                BufferedMessage.objects.filter(id=msg.id).delete()
+            except Exception:
+                logger.exception(
+                    "deliver_buffered: failed to hard-delete forwarded msg %s for tenant %s "
+                    "(row remains DELIVERED; 7-day cleanup cron will sweep)",
+                    msg.id,
+                    tenant_id[:8],
+                )
+
+        except Exception:
+            logger.exception(
+                "deliver_buffered: failed to deliver msg %s for tenant %s (attempt %d/%d)",
+                msg.id,
+                tenant_id[:8],
+                msg.delivery_attempts + 1,
+                _MAX_DELIVERY_ATTEMPTS,
+            )
+            msg.delivery_attempts += 1
+            msg.delivery_in_flight_until = None
+            msg.save(update_fields=["delivery_attempts", "delivery_in_flight_until"])
+            failed += 1
+            # Stop processing further messages to preserve order.
+            # QStash will retry the task once (we set retries=1 at publish
+            # time); on that retry this message will be tried again, and
+            # eventually dropped if it keeps failing.
+            break
+
+    logger.info(
+        "deliver_buffered: tenant %s — delivered=%d failed=%d dropped=%d skipped_in_flight=%d",
+        tenant_id[:8],
+        delivered,
+        failed,
+        dropped,
+        skipped_in_flight,
+    )
+
+    if failed > 0:
+        # Surface a non-2xx so QStash retries the task. Dropped messages
+        # and in-flight skips don't count — they've already been resolved
+        # (apology sent) or are owned by another worker.
+        raise RuntimeError(f"deliver_buffered: {failed} message(s) failed for tenant {tenant_id[:8]}")
+
+    return {
+        "delivered": delivered,
+        "failed": failed,
+        "dropped": dropped,
+        "skipped_in_flight": skipped_in_flight,
+    }
+
+
+def resume_hibernated_crons_task(tenant_id: str) -> None:
+    """Resume crons for a freshly-woken tenant. Called via QStash ~60s after wake."""
+    from apps.cron.suspension import resume_tenant_crons
+
+    tenant = Tenant.objects.filter(id=tenant_id).first()
+    if not tenant:
+        return
+
+    try:
+        result = resume_tenant_crons(tenant)
+        logger.info(
+            "resume_hibernated_crons: tenant %s — enabled=%d",
+            tenant_id[:8],
+            result.get("enabled", 0),
+        )
+    except Exception:
+        logger.exception("resume_hibernated_crons: failed for tenant %s", tenant_id[:8])
+        raise
+
+
+def cleanup_delivered_buffers_task() -> dict:
+    """Delete delivered BufferedMessage rows older than 7 days, and
+    undelivered rows older than 30 days.
+
+    Delivered rows are now hard-deleted the instant
+    ``deliver_buffered_messages_task`` confirms a successful forward, so the
+    7-day pass is a residual sweeper for the rare row whose post-forward delete
+    didn't land (a worker crash between the DELIVERED commit and the delete).
+
+    Undelivered rows are the highest-sensitivity data in the system: RAW
+    pre-redaction webhooks buffered for a tenant that never woke (a dead or
+    permanently-hibernated tenant). Nothing else prunes them — before this pass
+    they lived forever. 30 days is well past any legitimate wake-and-deliver
+    window; a tenant offline for a month is not resuming a buffered
+    conversation mid-thread. See docs/encryption-at-rest-directive.md §7
+    (Phase 0 PR-3).
+    """
+    from datetime import timedelta
+
+    from apps.router.models import BufferedMessage
+
+    now = timezone.now()
+    delivered_deleted, _ = BufferedMessage.objects.filter(
+        delivered=True,
+        created_at__lt=now - timedelta(days=7),
+    ).delete()
+    undelivered_deleted, _ = BufferedMessage.objects.filter(
+        delivered=False,
+        created_at__lt=now - timedelta(days=30),
+    ).delete()
+
+    total = delivered_deleted + undelivered_deleted
+    logger.info(
+        "cleanup_delivered_buffers: deleted %d delivered (>7d) + %d undelivered (>30d)",
+        delivered_deleted,
+        undelivered_deleted,
+    )
+    return {
+        "deleted": total,
+        "delivered_deleted": delivered_deleted,
+        "undelivered_deleted": undelivered_deleted,
+    }

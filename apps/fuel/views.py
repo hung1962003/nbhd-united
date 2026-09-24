@@ -1,0 +1,1831 @@
+"""Consumer-facing Fuel API views (JWT auth, frontend)."""
+
+import calendar
+import logging
+from collections import defaultdict
+from datetime import date as date_cls
+from datetime import timedelta
+from urllib.parse import urlparse
+
+from django.db.models import Count, Q, Sum
+from rest_framework import status
+from rest_framework.permissions import IsAuthenticated
+from rest_framework.response import Response
+from rest_framework.throttling import SimpleRateThrottle
+from rest_framework.views import APIView
+
+from apps.common.cache import tenant_cache
+from apps.common.llm_contracts import today_in_tenant_tz
+from apps.common.tenant_tz import tenant_today
+from apps.integrations import sautai_client
+
+
+def _safe_int(value, default):
+    """Parse an int from query params, returning default on failure."""
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
+
+
+from .models import (
+    BodyWeightLog,
+    FuelGoal,
+    FuelProfile,
+    PersonalRecord,
+    PlanStatus,
+    RestingHeartRateLog,
+    SleepLog,
+    Workout,
+    WorkoutCategory,
+    WorkoutPlan,
+    WorkoutStatus,
+    WorkoutTemplate,
+)
+from .serializers import (
+    BodyWeightLogSerializer,
+    FuelGoalSerializer,
+    FuelProfileSerializer,
+    PersonalRecordSerializer,
+    RestingHeartRateLogSerializer,
+    SleepLogSerializer,
+    WorkoutPlanSerializer,
+    WorkoutSerializer,
+    WorkoutStubSerializer,
+    WorkoutTemplateSerializer,
+)
+from .services import (
+    aggregate_calisthenics_progress,
+    aggregate_cardio_progress,
+    aggregate_hiit_progress,
+    aggregate_strength_progress,
+    detect_prs,
+    rest_dates_for_window,
+)
+
+_FUEL_WELCOME_PROMPT_TEMPLATE = (
+    "Fuel was just enabled for this user. Send them a brief, warm welcome "
+    "via `nbhd_send_to_user` letting them know their fitness assistant is "
+    "ready. Keep it to 2-3 sentences — invite them to start a conversation "
+    "about their fitness goals whenever they're ready. Don't start the full "
+    "onboarding questionnaire in this message — just let them know the "
+    "feature is live and you're here when they want to set things up.\n\n"
+    "**Do NOT ask questions in this message.** Just welcome them and let "
+    "them know they can come to you when ready.\n\n"
+    "**After `nbhd_send_to_user` succeeds**, mark the welcome as delivered "
+    "so the deploy-time backfill knows not to re-send. Run via Bash:\n"
+    "  curl -fsS -X POST \\\n"
+    '    "$NBHD_API_BASE_URL/api/v1/tenants/runtime/{tenant_id}/welcomes/fuel/" \\\n'
+    '    -H "X-NBHD-Internal-Key: $NBHD_INTERNAL_API_KEY" \\\n'
+    '    -H "X-NBHD-Tenant-Id: {tenant_id}"\n\n'
+    "If `nbhd_send_to_user` returned an error (timeout, channel rejection, "
+    "etc.), DO NOT run the curl — leave the welcome unmarked so the next "
+    "deploy's backfill retries."
+)
+
+
+# Backwards-compat alias — older deployed welcome crons reference this name
+# in ``_KNOWN_DEFAULT_PREFIXES``-style heuristics. The template version is
+# what the scheduler actually formats per-tenant.
+_FUEL_WELCOME_PROMPT = _FUEL_WELCOME_PROMPT_TEMPLATE
+
+_logger = logging.getLogger(__name__)
+
+_SAUTAI_MEALS_CACHE_SECONDS = 15 * 60
+_SAUTAI_MEALS_TIMEOUT_SECONDS = 3.0
+
+
+def _validated_sautai_web_link(value):
+    if not isinstance(value, str) or any(character.isspace() for character in value):
+        return None
+    try:
+        parsed = urlparse(value)
+        host, _port = parsed.hostname, parsed.port
+    except ValueError:
+        return None
+    if parsed.scheme != "https" or host not in {"sautai.com", "www.sautai.com"}:
+        return None
+    return value
+
+
+def _today_meals_from_sautai_plan(plan, today):
+    """Return the public meal shape for ``today`` from a Sautai weekly plan."""
+    if not isinstance(plan, dict):
+        return []
+
+    expected_week_start = today - timedelta(days=today.weekday())
+    try:
+        plan_week_start = date_cls.fromisoformat(str(plan.get("week_start", "")))
+    except ValueError:
+        return []
+    if plan_week_start != expected_week_start:
+        return []
+
+    days = plan.get("days")
+    if not isinstance(days, list):
+        return []
+
+    today_name = today.strftime("%A").casefold()
+    for day in days:
+        if not isinstance(day, dict) or str(day.get("day", "")).casefold() != today_name:
+            continue
+        meals = day.get("meals")
+        if not isinstance(meals, list):
+            return []
+
+        payload = []
+        for meal in meals:
+            if not isinstance(meal, dict):
+                continue
+            slot = meal.get("meal_type")
+            name = meal.get("name")
+            if not isinstance(slot, str) or not slot.strip() or not isinstance(name, str) or not name.strip():
+                continue
+            note = meal.get("note", "")
+            item = {
+                "slot": slot.strip().lower(),
+                "name": name,
+                "note": note if isinstance(note, str) else "",
+                "date": today.isoformat(),
+            }
+            web_link = _validated_sautai_web_link(meal.get("web_link"))
+            if web_link is not None:
+                item["web_link"] = web_link
+            payload.append(item)
+        return payload
+    return []
+
+
+def _schedule_fuel_welcome(tenant):
+    """Create a one-shot cron that sends a Fuel welcome message.
+
+    Fires ~5 minutes after enablement. Self-healing: if a previous
+    welcome cron is still registered with a fire date in the past
+    (e.g., the original scheduled fire happened during an outage and
+    the agent never self-removed), it is replaced with a fresh one.
+
+    Returns the ``WelcomeStatus`` enum so callers can distinguish
+    fresh schedule / stale replacement / pending skip / already
+    delivered. Raises on transport failure — callers that want
+    fire-and-forget semantics (live toggle path, QStash tasks)
+    should wrap; backfill and the watchdog surface failures so
+    telemetry is honest.
+    """
+    from apps.orchestrator.welcome_scheduler import schedule_welcome
+
+    return schedule_welcome(
+        tenant,
+        feature="fuel",
+        cron_name="_fuel:welcome",
+        prompt_template=_FUEL_WELCOME_PROMPT_TEMPLATE,
+    )
+
+
+class FuelSettingsView(APIView):
+    """PATCH: toggle fuel_enabled for the tenant.
+
+    Enabling Fuel adds a plugin (requires assistant restart). The response
+    includes ``restart_required: true`` so the frontend can show a
+    confirmation dialog. The actual restart is triggered by the user
+    calling ``POST /api/v1/fuel/restart/``.
+    """
+
+    permission_classes = [IsAuthenticated]
+
+    def patch(self, request):
+        tenant = getattr(request.user, "tenant", None)
+        if not tenant:
+            return Response({"error": "no_tenant"}, status=status.HTTP_404_NOT_FOUND)
+        fuel_enabled = request.data.get("fuel_enabled")
+        if fuel_enabled is None:
+            return Response(
+                {"error": "fuel_enabled is required"},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        was_enabled = tenant.fuel_enabled
+        tenant.fuel_enabled = bool(fuel_enabled)
+        update_fields = ["fuel_enabled"]
+
+        # On a fresh enable (off → on), clear the welcome-delivery marker
+        # so the welcome re-fires. Supports the "disable then re-enable
+        # to retest the welcome" flow.
+        if tenant.fuel_enabled and not was_enabled:
+            marks = dict(tenant.welcomes_sent or {})
+            if marks.pop("fuel", None) is not None:
+                tenant.welcomes_sent = marks
+                update_fields.append("welcomes_sent")
+
+        tenant.save(update_fields=update_fields)
+        tenant.bump_pending_config()
+
+        # Create profile on enable (no-op if already exists)
+        profile_status = None
+        if tenant.fuel_enabled:
+            profile, _created = FuelProfile.objects.get_or_create(tenant=tenant)
+            profile_status = profile.onboarding_status
+
+        # Write config to file share so it's ready when the container restarts.
+        try:
+            from apps.cron.publish import publish_task
+
+            publish_task("apply_single_tenant_config", str(tenant.id))
+        except Exception:
+            _logger.warning("Failed to enqueue config deploy for tenant %s", tenant.id)
+
+        # Plugin changes require a container restart. Tell the frontend
+        # so it can ask the user to confirm before calling /restart/.
+        plugin_changed = was_enabled != tenant.fuel_enabled
+        restart_required = plugin_changed and bool(tenant.container_id)
+
+        return Response(
+            {
+                "fuel_enabled": tenant.fuel_enabled,
+                "fuel_profile_status": profile_status,
+                "restart_required": restart_required,
+            }
+        )
+
+
+class FuelRestartView(APIView):
+    """POST: restart the assistant to pick up plugin changes.
+
+    Called after the user confirms the restart in the frontend.
+    """
+
+    permission_classes = [IsAuthenticated]
+
+    def post(self, request):
+        tenant = getattr(request.user, "tenant", None)
+        if not tenant:
+            return Response({"error": "no_tenant"}, status=status.HTTP_404_NOT_FOUND)
+        if not tenant.container_id:
+            return Response({"error": "no_container"}, status=status.HTTP_400_BAD_REQUEST)
+
+        try:
+            from apps.orchestrator.azure_client import restart_container_app
+
+            restart_container_app(tenant.container_id)
+        except Exception:
+            _logger.exception("Container restart failed for tenant %s", tenant.id)
+            return Response(
+                {"error": "restart_failed", "detail": "Could not restart your assistant. Try again in a moment."},
+                status=status.HTTP_502_BAD_GATEWAY,
+            )
+
+        # Schedule welcome cron AFTER the container is back up (~90s for
+        # cold start). We can't call the Gateway API on a restarting container.
+        if tenant.fuel_enabled:
+            try:
+                profile = FuelProfile.objects.get(tenant=tenant)
+                if profile.onboarding_status == "pending":
+                    from apps.cron.publish import publish_task
+
+                    publish_task(
+                        "schedule_fuel_welcome",
+                        str(tenant.id),
+                        delay_seconds=90,
+                    )
+            except FuelProfile.DoesNotExist:
+                pass
+
+        return Response({"restarted": True})
+
+
+class FuelProfileView(APIView):
+    """GET/PATCH the tenant's fitness profile."""
+
+    permission_classes = [IsAuthenticated]
+
+    def get(self, request):
+        tenant = getattr(request.user, "tenant", None)
+        if not tenant:
+            return Response({"error": "no_tenant"}, status=status.HTTP_404_NOT_FOUND)
+        try:
+            profile = FuelProfile.objects.get(tenant=tenant)
+        except FuelProfile.DoesNotExist:
+            return Response({"error": "no_profile"}, status=status.HTTP_404_NOT_FOUND)
+        return Response(FuelProfileSerializer(profile, context={"tenant": tenant, "rehydrate": True}).data)
+
+    def patch(self, request):
+        tenant = getattr(request.user, "tenant", None)
+        if not tenant:
+            return Response({"error": "no_tenant"}, status=status.HTTP_404_NOT_FOUND)
+        try:
+            profile = FuelProfile.objects.get(tenant=tenant)
+        except FuelProfile.DoesNotExist:
+            return Response({"error": "no_profile"}, status=status.HTTP_404_NOT_FOUND)
+        serializer = FuelProfileSerializer(
+            profile,
+            data=request.data,
+            partial=True,
+            context={"tenant": tenant, "rehydrate": True},
+        )
+        serializer.is_valid(raise_exception=True)
+        serializer.save()
+        return Response(serializer.data)
+
+
+class WorkoutListView(APIView):
+    """GET: list workouts. POST: create workout."""
+
+    permission_classes = [IsAuthenticated]
+
+    @tenant_cache(ttl=30, tag="fuel")
+    def get(self, request):
+        tenant = getattr(request.user, "tenant", None)
+        if not tenant:
+            return Response({"error": "no_tenant"}, status=status.HTTP_404_NOT_FOUND)
+        # select_related("plan") avoids N+1 on WorkoutSerializer.plan_id/plan_name.
+        qs = Workout.objects.filter(tenant=tenant).select_related("plan")
+
+        # Optional filters
+        cat = request.query_params.get("category")
+        if cat and cat in WorkoutCategory.values:
+            qs = qs.filter(category=cat)
+        status_filter = request.query_params.get("status")
+        if status_filter and status_filter in WorkoutStatus.values:
+            qs = qs.filter(status=status_filter)
+        date_from = request.query_params.get("date_from")
+        date_to = request.query_params.get("date_to")
+        window = request.query_params.get("window")
+        if window and not (date_from or date_to):
+            from datetime import timedelta
+
+            unit = window[-1].lower()
+            magnitude = _safe_int(window[:-1], 0)
+            days = magnitude * (7 if unit == "w" else 1)
+            if days > 0:
+                # Anchor the rolling window on the tenant's local "today", not
+                # the server's UTC date — otherwise a late-evening workout in a
+                # tz ahead of UTC (e.g. JST) can fall outside [today, today+N]
+                # and vanish from the Schedule while still showing on the
+                # Calendar's fixed month grid.
+                today = today_in_tenant_tz(tenant)
+                date_from = today.isoformat()
+                date_to = (today + timedelta(days=days)).isoformat()
+        if date_from:
+            qs = qs.filter(date__gte=date_from)
+        if date_to:
+            qs = qs.filter(date__lte=date_to)
+
+        limit = min(_safe_int(request.query_params.get("limit"), 100), 500)
+        qs = qs.order_by("-date", "-id")[:limit]
+        serializer = WorkoutSerializer(qs, many=True, context={"tenant": tenant, "rehydrate": True})
+        return Response(serializer.data)
+
+    def post(self, request):
+        tenant = getattr(request.user, "tenant", None)
+        if not tenant:
+            return Response({"error": "no_tenant"}, status=status.HTTP_404_NOT_FOUND)
+        serializer = WorkoutSerializer(
+            data=request.data,
+            context={"tenant": tenant, "rehydrate": True},
+        )
+        serializer.is_valid(raise_exception=True)
+        workout = serializer.save()
+        detect_prs(tenant, workout)
+        # Fire only when the client EXPLICITLY logged a finished workout — not when a
+        # caller omits status and lands on the model's DONE default (scripts, backfills,
+        # a future "quick add planned" that forgets the field). Both real clients (iOS
+        # logWorkout, web new-workout-dialog) always send an explicit status.
+        from .congrats import maybe_congratulate_workout
+
+        explicitly_done = (
+            str(request.data.get("status", "")) == WorkoutStatus.DONE and workout.status == WorkoutStatus.DONE
+        )
+        maybe_congratulate_workout(tenant, workout, transitioned_to_done=explicitly_done)
+        return Response(serializer.data, status=status.HTTP_201_CREATED)
+
+
+class WorkoutDetailView(APIView):
+    """GET/PATCH/DELETE a single workout."""
+
+    permission_classes = [IsAuthenticated]
+
+    def _get_workout(self, request, workout_id):
+        tenant = getattr(request.user, "tenant", None)
+        if not tenant:
+            return None, Response({"error": "no_tenant"}, status=status.HTTP_404_NOT_FOUND)
+        try:
+            workout = Workout.objects.get(id=workout_id, tenant=tenant)
+        except Workout.DoesNotExist:
+            return None, Response({"error": "not_found"}, status=status.HTTP_404_NOT_FOUND)
+        return workout, None
+
+    def get(self, request, workout_id):
+        workout, err = self._get_workout(request, workout_id)
+        if err:
+            return err
+        return Response(WorkoutSerializer(workout, context={"tenant": workout.tenant, "rehydrate": True}).data)
+
+    def patch(self, request, workout_id):
+        from django.db import transaction
+        from django.utils import timezone
+
+        workout, err = self._get_workout(request, workout_id)
+        if err:
+            return err
+        was_done = workout.status == "done"
+        serializer = WorkoutSerializer(
+            workout,
+            data=request.data,
+            partial=True,
+            context={"tenant": workout.tenant, "rehydrate": True},
+        )
+        serializer.is_valid(raise_exception=True)
+        original_date = workout.date
+        with transaction.atomic():
+            updated = serializer.save()
+            if updated.date != original_date:
+                PersonalRecord.objects.filter(workout_id=updated.id).update(date=updated.date)
+        detect_prs(workout.tenant, updated)
+        # Phase 7 — stamp last_edited_by_user_at when a user PATCH lands on
+        # a `done` workout more than 24h after creation, so the drawer can
+        # surface a small "Edited <relative>" footnote. Skip the stamp when
+        # the user is the one transitioning the workout into done in this
+        # same request (the initial completion isn't a post-completion edit).
+        is_post_completion_edit = (
+            was_done
+            and updated.status == "done"
+            and updated.created_at is not None
+            and (timezone.now() - updated.created_at).total_seconds() > 24 * 3600
+        )
+        if is_post_completion_edit:
+            updated.last_edited_by_user_at = timezone.now()
+            updated.save(update_fields=["last_edited_by_user_at"])
+        from .congrats import maybe_congratulate_workout
+
+        maybe_congratulate_workout(
+            workout.tenant,
+            updated,
+            transitioned_to_done=(not was_done and updated.status == WorkoutStatus.DONE),
+        )
+        return Response(WorkoutSerializer(updated, context={"tenant": updated.tenant, "rehydrate": True}).data)
+
+    def delete(self, request, workout_id):
+        workout, err = self._get_workout(request, workout_id)
+        if err:
+            return err
+        workout.delete()
+        return Response(status=status.HTTP_204_NO_CONTENT)
+
+
+class WorkoutEditLockView(APIView):
+    """POST/DELETE the per-workout edit lock.
+
+    The browser POSTs when it enters edit mode and again every ~half the
+    TTL while the drawer stays open (heartbeat). The runtime ``PATCH``
+    paths refuse to mutate a workout whose ``edit_lock_until`` is in the
+    future — see :class:`apps.fuel.runtime_views.RuntimeWorkoutDetailView`.
+
+    DELETE is the explicit release on close/save. Cookies and reconnects
+    can still wedge the lock — it self-expires after
+    :setting:`FUEL_EDIT_LOCK_TTL_SECONDS` so a stranded lock can't block
+    assistant writes indefinitely.
+    """
+
+    permission_classes = [IsAuthenticated]
+
+    def _get_workout(self, request, workout_id):
+        tenant = getattr(request.user, "tenant", None)
+        if not tenant:
+            return None, Response({"error": "no_tenant"}, status=status.HTTP_404_NOT_FOUND)
+        try:
+            workout = Workout.objects.get(id=workout_id, tenant=tenant)
+        except Workout.DoesNotExist:
+            return None, Response({"error": "not_found"}, status=status.HTTP_404_NOT_FOUND)
+        return workout, None
+
+    def post(self, request, workout_id):
+        from django.conf import settings as django_settings
+        from django.utils import timezone
+
+        workout, err = self._get_workout(request, workout_id)
+        if err:
+            return err
+        ttl = int(getattr(django_settings, "FUEL_EDIT_LOCK_TTL_SECONDS", 60))
+        workout.edit_lock_until = timezone.now() + timedelta(seconds=ttl)
+        workout.edit_lock_owner = "user"
+        workout.save(update_fields=["edit_lock_until", "edit_lock_owner", "updated_at"])
+        return Response(
+            {
+                "workout_id": str(workout.id),
+                "edit_lock_until": workout.edit_lock_until.isoformat(),
+                "edit_lock_owner": workout.edit_lock_owner,
+                "ttl_seconds": ttl,
+                "version": workout.version,
+            }
+        )
+
+    def delete(self, request, workout_id):
+        workout, err = self._get_workout(request, workout_id)
+        if err:
+            return err
+        if workout.edit_lock_until is None and not workout.edit_lock_owner:
+            # Already released — return 204 either way for idempotency.
+            return Response(status=status.HTTP_204_NO_CONTENT)
+        workout.edit_lock_until = None
+        workout.edit_lock_owner = ""
+        workout.save(update_fields=["edit_lock_until", "edit_lock_owner", "updated_at"])
+        return Response(status=status.HTTP_204_NO_CONTENT)
+
+
+class FuelVersionView(APIView):
+    """GET: the tenant's monotonic Fuel write counter.
+
+    Cheap endpoint the frontend polls so a workout-detail drawer can show
+    a "Updated by your assistant — refresh?" pill when the counter bumps
+    while the drawer is open. The counter is bumped by post_save /
+    post_delete signals on Workout + WorkoutPlan (see
+    ``apps.fuel.signals``).
+    """
+
+    permission_classes = [IsAuthenticated]
+
+    def get(self, request):
+        tenant = getattr(request.user, "tenant", None)
+        if not tenant:
+            return Response({"error": "no_tenant"}, status=status.HTTP_404_NOT_FOUND)
+        return Response({"fuel_version": tenant.fuel_version})
+
+
+# ── Shared payload builders ──────────────────────────────────────────────
+# Composed by BOTH the dedicated endpoints and the Fuel overview aggregate so
+# their shapes cannot drift. Build the overview from these, never by
+# re-implementing the serializers.
+
+# Recent-workouts cap for the overview aggregate. The Fuel list view only
+# renders "Recent workouts"; full unbounded history stays on the paginated
+# /fuel/workouts/ endpoint. Bump here (one place) if product wants more.
+OVERVIEW_WORKOUT_LIMIT = 30
+
+
+def _recent_workouts_payload(tenant, limit=OVERVIEW_WORKOUT_LIMIT):
+    """Serialize a tenant's most-recent workouts (newest first), bounded.
+
+    Byte-identical to ``GET /fuel/workouts/?limit=<limit>`` with no filters:
+    same ``WorkoutSerializer``, same ``-date, -id`` ordering.
+    ``select_related('plan')`` avoids N+1 on ``plan_id`` / ``plan_name``.
+    """
+    qs = Workout.objects.filter(tenant=tenant).select_related("plan").order_by("-date", "-id")[:limit]
+    return WorkoutSerializer(qs, many=True, context={"tenant": tenant, "rehydrate": True}).data
+
+
+def _calendar_month_payload(tenant, year, month):
+    """Workout stubs grouped by date for one month.
+
+    Shared by :class:`WorkoutCalendarView` and :class:`FuelOverviewView` so the
+    ``[{"date", "workouts": [...]}]`` shape stays identical across both. Caller
+    is responsible for validating ``year`` / ``month``.
+    """
+    _, days_in_month = calendar.monthrange(year, month)
+    date_from = f"{year}-{month:02d}-01"
+    date_to = f"{year}-{month:02d}-{days_in_month:02d}"
+
+    workouts = Workout.objects.filter(tenant=tenant, date__gte=date_from, date__lte=date_to).order_by(
+        "date", "created_at"
+    )
+
+    by_date = defaultdict(list)
+    for w in workouts:
+        by_date[str(w.date)].append(WorkoutStubSerializer(w, context={"tenant": tenant, "rehydrate": True}).data)
+
+    entries = [{"date": d, "workouts": ws} for d, ws in sorted(by_date.items())]
+
+    # Programmed rest days as day-level flags — a date an active plan covers but
+    # trains no session on, and that carries NO real row (the real row wins).
+    # Day-level ``rest: true`` only; no synthetic workout stubs. Existing
+    # workout-day entries are left byte-identical (no ``rest`` key added). One
+    # extra active-plans query via rest_dates_for_window.
+    real_dates = set(by_date.keys())
+    rest_dates = rest_dates_for_window(tenant, date_cls(year, month, 1), date_cls(year, month, days_in_month))
+    for rd in rest_dates:
+        if str(rd) in real_dates:
+            continue
+        entries.append({"date": str(rd), "rest": True, "workouts": []})
+
+    entries.sort(key=lambda e: e["date"])
+    return entries
+
+
+class WorkoutCalendarView(APIView):
+    """GET: workout stubs grouped by date for a given month."""
+
+    permission_classes = [IsAuthenticated]
+
+    @tenant_cache(ttl=60, tag="fuel")
+    def get(self, request):
+        tenant = getattr(request.user, "tenant", None)
+        if not tenant:
+            return Response({"error": "no_tenant"}, status=status.HTTP_404_NOT_FOUND)
+
+        try:
+            year = int(request.query_params["year"])
+            month = int(request.query_params["month"])
+            if not (1 <= month <= 12) or not (1900 <= year <= 2100):
+                raise ValueError("out of range")
+        except (KeyError, ValueError, TypeError):
+            return Response(
+                {"error": "year (1900-2100) and month (1-12) query params required"},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        return Response(_calendar_month_payload(tenant, year, month))
+
+
+class FuelOverviewView(APIView):
+    """GET: the full first-paint payload for the Fuel tab in one round trip.
+
+    Backend-for-frontend aggregate that composes the three source serializers
+    — profile, recent workouts, current-month calendar — into a single
+    screen-shaped response so a cold tab open is one request instead of three:
+
+        {"profile": {...} | {"error": "no_profile"},
+         "workouts": [ ...recent N workout rows... ],
+         "calendar": [ {"date": "YYYY-MM-DD", "workouts": [...]} ]}
+
+    The dedicated ``/fuel/profile/``, ``/fuel/workouts/``, and
+    ``/fuel/calendar/`` endpoints are unchanged and still serve Telegram, web,
+    full history, and month paging.
+
+    ``ETag`` / ``If-None-Match`` → ``304`` is handled for every 200 GET by
+    :class:`config.cache_middleware.ETagMiddleware`, so a repeat load with an
+    unchanged dataset is a near-free 304 the client's stale-while-revalidate
+    refresh can short-circuit on.
+    """
+
+    permission_classes = [IsAuthenticated]
+
+    @tenant_cache(ttl=30, tag="fuel")
+    def get(self, request):
+        tenant = getattr(request.user, "tenant", None)
+        if not tenant:
+            return Response({"error": "no_tenant"}, status=status.HTTP_404_NOT_FOUND)
+
+        # Profile — 200 with {"error": "no_profile"} (never 404), so the whole
+        # aggregate still earns an ETag and the client parses it exactly like
+        # /fuel/profile/'s no_profile body. Same serializer as the endpoint.
+        try:
+            profile = FuelProfile.objects.get(tenant=tenant)
+            profile_payload = FuelProfileSerializer(
+                profile,
+                context={"tenant": tenant, "rehydrate": True},
+            ).data
+        except FuelProfile.DoesNotExist:
+            profile_payload = {"error": "no_profile"}
+
+        # Calendar month — default to the tenant's local current month when
+        # omitted. Lenient on malformed/out-of-range params: a first-paint
+        # endpoint shouldn't 400 over a calendar arg, so we fall back to the
+        # current month. (/fuel/calendar/ keeps the strict 400 for paging.)
+        today = today_in_tenant_tz(tenant)
+        year = _safe_int(request.query_params.get("year"), today.year)
+        month = _safe_int(request.query_params.get("month"), today.month)
+        if not (1 <= month <= 12) or not (1900 <= year <= 2100):
+            year, month = today.year, today.month
+
+        return Response(
+            {
+                "profile": profile_payload,
+                "workouts": _recent_workouts_payload(tenant),
+                "calendar": _calendar_month_payload(tenant, year, month),
+            }
+        )
+
+
+class FuelMealsTodayView(APIView):
+    """GET: today's linked Sautai meals, degraded to an empty list on failure."""
+
+    permission_classes = [IsAuthenticated]
+
+    @tenant_cache(ttl=_SAUTAI_MEALS_CACHE_SECONDS, tag="fuel-meals")
+    def get(self, request):
+        tenant = getattr(request.user, "tenant", None)
+        if not tenant:
+            return Response({"error": "no_tenant"}, status=status.HTTP_404_NOT_FOUND)
+
+        # The Fuel surface is linked-account only. sautai_identity's email
+        # fallback remains valid for assistant plan generation, but must not
+        # auto-create or reveal a meal surface for an unlinked console user.
+        identity, integration = sautai_client.sautai_identity(tenant)
+        if integration is None or not integration.sautai_user_id:
+            return Response({"meals": [], "linked": False})
+
+        today = tenant_today(tenant)
+        week_start = today - timedelta(days=today.weekday())
+        try:
+            result = sautai_client.fetch_sautai_current_plan(
+                identity=identity,
+                week_start_iso=week_start.isoformat(),
+                timeout_seconds=_SAUTAI_MEALS_TIMEOUT_SECONDS,
+            )
+        except Exception:
+            # Partner failures are expected degradation. Do not include the
+            # exception or response content: either may contain user content.
+            _logger.warning("fuel meals: Sautai read failed for tenant %s", str(tenant.id)[:8])
+            return Response({"meals": [], "linked": True})
+
+        if not isinstance(result, dict) or result.get("outcome") != "ok":
+            return Response({"meals": [], "linked": True})
+        return Response({"meals": _today_meals_from_sautai_plan(result.get("plan"), today), "linked": True})
+
+
+class WorkoutProgressView(APIView):
+    """GET: aggregated progress data for a given category."""
+
+    permission_classes = [IsAuthenticated]
+
+    @tenant_cache(ttl=120, tag="fuel")
+    def get(self, request):
+        tenant = getattr(request.user, "tenant", None)
+        if not tenant:
+            return Response({"error": "no_tenant"}, status=status.HTTP_404_NOT_FOUND)
+
+        cat = request.query_params.get("category", "strength")
+        if cat not in WorkoutCategory.values:
+            return Response({"error": "invalid category"}, status=status.HTTP_400_BAD_REQUEST)
+
+        base_qs = Workout.objects.filter(tenant=tenant, category=cat, status="done")
+
+        if cat in ("strength", "calisthenics"):
+            # Only load fields needed for detail_json parsing, cap to 365 days
+            workouts = list(base_qs.only("date", "detail_json").order_by("date")[:365])
+            data = (
+                aggregate_strength_progress(workouts)
+                if cat == "strength"
+                else aggregate_calisthenics_progress(workouts)
+            )
+        elif cat == "cardio":
+            workouts = list(base_qs.only("date", "detail_json").order_by("date")[:365])
+            data = aggregate_cardio_progress(workouts)
+        elif cat == "hiit":
+            workouts = list(base_qs.only("date", "duration_minutes", "detail_json").order_by("date")[:365])
+            data = aggregate_hiit_progress(workouts)
+        else:
+            # mobility, sport, other — simple count + recent list
+            total = base_qs.count()
+            total_min = base_qs.aggregate(total=Sum("duration_minutes"))["total"] or 0
+            sessions = list(
+                base_qs.only("date", "activity", "duration_minutes")
+                .order_by("-date")[:50]
+                .values("date", "activity", "duration_minutes")
+            )
+            data = {
+                "session_count": total,
+                "total_minutes": total_min,
+                "sessions": [
+                    {"date": str(s["date"]), "activity": s["activity"], "duration_minutes": s["duration_minutes"]}
+                    for s in sessions
+                ],
+            }
+
+        return Response({"category": cat, "progress": data})
+
+
+class WorkoutCountView(APIView):
+    """GET: count workouts matching filters (lightweight alternative to listing)."""
+
+    permission_classes = [IsAuthenticated]
+
+    def get(self, request):
+        tenant = getattr(request.user, "tenant", None)
+        if not tenant:
+            return Response({"error": "no_tenant"}, status=status.HTTP_404_NOT_FOUND)
+        qs = Workout.objects.filter(tenant=tenant)
+
+        cat = request.query_params.get("category")
+        if cat and cat in WorkoutCategory.values:
+            qs = qs.filter(category=cat)
+        status_filter = request.query_params.get("status")
+        if status_filter and status_filter in WorkoutStatus.values:
+            qs = qs.filter(status=status_filter)
+        date_from = request.query_params.get("date_from")
+        date_to = request.query_params.get("date_to")
+        if date_from:
+            qs = qs.filter(date__gte=date_from)
+        if date_to:
+            qs = qs.filter(date__lte=date_to)
+
+        return Response({"count": qs.count()})
+
+
+class BodyWeightListView(APIView):
+    """GET: list entries. POST: create or upsert by date."""
+
+    permission_classes = [IsAuthenticated]
+
+    def get(self, request):
+        tenant = getattr(request.user, "tenant", None)
+        if not tenant:
+            return Response({"error": "no_tenant"}, status=status.HTTP_404_NOT_FOUND)
+        limit = min(_safe_int(request.query_params.get("limit"), 90), 365)
+        entries = BodyWeightLog.objects.filter(tenant=tenant)[:limit]
+        return Response(BodyWeightLogSerializer(entries, many=True).data)
+
+    def post(self, request):
+        tenant = getattr(request.user, "tenant", None)
+        if not tenant:
+            return Response({"error": "no_tenant"}, status=status.HTTP_404_NOT_FOUND)
+
+        date = request.data.get("date")
+        weight_kg = request.data.get("weight_kg")
+        if not date or weight_kg is None:
+            return Response(
+                {"error": "date and weight_kg required"},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        entry, created = BodyWeightLog.objects.update_or_create(
+            tenant=tenant,
+            date=date,
+            defaults={"weight_kg": weight_kg},
+        )
+        return Response(
+            BodyWeightLogSerializer(entry).data,
+            status=status.HTTP_201_CREATED if created else status.HTTP_200_OK,
+        )
+
+
+class BodyWeightDetailView(APIView):
+    """PATCH/DELETE a single body-weight entry."""
+
+    permission_classes = [IsAuthenticated]
+
+    def patch(self, request, entry_id):
+        tenant = getattr(request.user, "tenant", None)
+        if not tenant:
+            return Response({"error": "no_tenant"}, status=status.HTTP_404_NOT_FOUND)
+        try:
+            entry = BodyWeightLog.objects.get(id=entry_id, tenant=tenant)
+        except BodyWeightLog.DoesNotExist:
+            return Response({"error": "not_found"}, status=status.HTTP_404_NOT_FOUND)
+        serializer = BodyWeightLogSerializer(entry, data=request.data, partial=True, context={"tenant": tenant})
+        serializer.is_valid(raise_exception=True)
+        # (tenant, date) is unique. If the user is moving an entry onto a
+        # date already occupied by another row, surface a 409 with a clean
+        # message instead of an opaque 500 from the integrity error.
+        new_date = serializer.validated_data.get("date")
+        if new_date and new_date != entry.date:
+            if BodyWeightLog.objects.filter(tenant=tenant, date=new_date).exclude(id=entry.id).exists():
+                return Response(
+                    {"error": "date_conflict", "detail": f"An entry already exists for {new_date}."},
+                    status=status.HTTP_409_CONFLICT,
+                )
+        serializer.save()
+        return Response(serializer.data)
+
+    def delete(self, request, entry_id):
+        tenant = getattr(request.user, "tenant", None)
+        if not tenant:
+            return Response({"error": "no_tenant"}, status=status.HTTP_404_NOT_FOUND)
+        try:
+            entry = BodyWeightLog.objects.get(id=entry_id, tenant=tenant)
+        except BodyWeightLog.DoesNotExist:
+            return Response({"error": "not_found"}, status=status.HTTP_404_NOT_FOUND)
+        entry.delete()
+        return Response(status=status.HTTP_204_NO_CONTENT)
+
+
+# ═════════════════════════════════════════════════════════════════════
+# Workout Templates (PR 4)
+# ═════════════════════════════════════════════════════════════════════
+
+
+class WorkoutTemplateListView(APIView):
+    """GET: list templates. POST: create template."""
+
+    permission_classes = [IsAuthenticated]
+
+    def get(self, request):
+        tenant = getattr(request.user, "tenant", None)
+        if not tenant:
+            return Response({"error": "no_tenant"}, status=status.HTTP_404_NOT_FOUND)
+        cat = request.query_params.get("category")
+        qs = WorkoutTemplate.objects.filter(tenant=tenant)
+        if cat and cat in WorkoutCategory.values:
+            qs = qs.filter(category=cat)
+        return Response(WorkoutTemplateSerializer(qs, many=True, context={"tenant": tenant, "rehydrate": True}).data)
+
+    def post(self, request):
+        tenant = getattr(request.user, "tenant", None)
+        if not tenant:
+            return Response({"error": "no_tenant"}, status=status.HTTP_404_NOT_FOUND)
+        serializer = WorkoutTemplateSerializer(
+            data=request.data,
+            context={"tenant": tenant, "rehydrate": True},
+        )
+        serializer.is_valid(raise_exception=True)
+        serializer.save()
+        return Response(serializer.data, status=status.HTTP_201_CREATED)
+
+
+class WorkoutTemplateDetailView(APIView):
+    """GET/PATCH/DELETE a single template."""
+
+    permission_classes = [IsAuthenticated]
+
+    def _get(self, request, template_id):
+        tenant = getattr(request.user, "tenant", None)
+        if not tenant:
+            return None, Response({"error": "no_tenant"}, status=status.HTTP_404_NOT_FOUND)
+        try:
+            tmpl = WorkoutTemplate.objects.get(id=template_id, tenant=tenant)
+        except WorkoutTemplate.DoesNotExist:
+            return None, Response({"error": "not_found"}, status=status.HTTP_404_NOT_FOUND)
+        return tmpl, None
+
+    def get(self, request, template_id):
+        tmpl, err = self._get(request, template_id)
+        if err:
+            return err
+        return Response(WorkoutTemplateSerializer(tmpl, context={"tenant": tmpl.tenant, "rehydrate": True}).data)
+
+    def patch(self, request, template_id):
+        tmpl, err = self._get(request, template_id)
+        if err:
+            return err
+        serializer = WorkoutTemplateSerializer(
+            tmpl,
+            data=request.data,
+            partial=True,
+            context={"tenant": tmpl.tenant, "rehydrate": True},
+        )
+        serializer.is_valid(raise_exception=True)
+        serializer.save()
+        return Response(serializer.data)
+
+    def delete(self, request, template_id):
+        tmpl, err = self._get(request, template_id)
+        if err:
+            return err
+        tmpl.delete()
+        return Response(status=status.HTTP_204_NO_CONTENT)
+
+
+class WorkoutDuplicateView(APIView):
+    """POST: create a new workout pre-filled from an existing one."""
+
+    permission_classes = [IsAuthenticated]
+
+    def post(self, request, workout_id):
+        tenant = getattr(request.user, "tenant", None)
+        if not tenant:
+            return Response({"error": "no_tenant"}, status=status.HTTP_404_NOT_FOUND)
+        try:
+            source = Workout.objects.get(id=workout_id, tenant=tenant)
+        except Workout.DoesNotExist:
+            return Response({"error": "not_found"}, status=status.HTTP_404_NOT_FOUND)
+
+        source_receipts = source.pii_receipts if isinstance(source.pii_receipts, dict) else {}
+        copied_receipts = {
+            field: source_receipts[field] for field in ("activity", "detail_json") if field in source_receipts
+        }
+        new_workout = Workout.objects.create(
+            tenant=tenant,
+            date=today_in_tenant_tz(tenant),
+            status="planned",
+            category=source.category,
+            activity=source.activity,
+            duration_minutes=source.duration_minutes,
+            detail_json=source.detail_json,
+            pii_receipts=copied_receipts,
+        )
+        return Response(
+            WorkoutSerializer(new_workout, context={"tenant": tenant, "rehydrate": True}).data,
+            status=status.HTTP_201_CREATED,
+        )
+
+
+class WorkoutSkipView(APIView):
+    """POST: mark a planned workout as skipped, with an optional reason.
+
+    Soft-state — preserves the row for adherence math; distinct from DELETE
+    (which removes the session entirely, e.g. for an accidental add).
+    """
+
+    permission_classes = [IsAuthenticated]
+
+    def post(self, request, workout_id):
+        tenant = getattr(request.user, "tenant", None)
+        if not tenant:
+            return Response({"error": "no_tenant"}, status=status.HTTP_404_NOT_FOUND)
+        try:
+            workout = Workout.objects.get(id=workout_id, tenant=tenant)
+        except Workout.DoesNotExist:
+            return Response({"error": "not_found"}, status=status.HTTP_404_NOT_FOUND)
+        reason = (request.data.get("reason") or "")[:128]
+        from apps.pii.store_authoring import author_store_fields
+
+        authored, receipts = author_store_fields(
+            tenant,
+            {"skip_reason": reason},
+            model_label="fuel.Workout",
+            seam="fuel.owner.workout.skip",
+            writer="owner",
+            receipts=workout.pii_receipts,
+        )
+        workout.status = WorkoutStatus.SKIPPED
+        workout.skip_reason = authored["skip_reason"]
+        workout.pii_receipts = receipts
+        workout.save(update_fields=["status", "skip_reason", "pii_receipts", "updated_at"])
+        return Response(WorkoutSerializer(workout, context={"tenant": tenant, "rehydrate": True}).data)
+
+
+class WorkoutCompleteView(APIView):
+    """POST: mark a workout as completed, optionally with notes/RPE/duration."""
+
+    permission_classes = [IsAuthenticated]
+
+    def post(self, request, workout_id):
+        tenant = getattr(request.user, "tenant", None)
+        if not tenant:
+            return Response({"error": "no_tenant"}, status=status.HTTP_404_NOT_FOUND)
+        try:
+            workout = Workout.objects.get(id=workout_id, tenant=tenant)
+        except Workout.DoesNotExist:
+            return Response({"error": "not_found"}, status=status.HTTP_404_NOT_FOUND)
+        workout.status = WorkoutStatus.DONE
+        if "notes" in request.data:
+            from apps.pii.store_authoring import author_store_fields
+
+            authored, receipts = author_store_fields(
+                tenant,
+                {"notes": request.data["notes"] or ""},
+                model_label="fuel.Workout",
+                seam="fuel.owner.workout.complete",
+                writer="owner",
+                receipts=workout.pii_receipts,
+            )
+            workout.notes = authored["notes"]
+            workout.pii_receipts = receipts
+        if "rpe" in request.data and request.data["rpe"] is not None:
+            try:
+                rpe = int(request.data["rpe"])
+                if 1 <= rpe <= 10:
+                    workout.rpe = rpe
+            except (TypeError, ValueError):
+                pass
+        if "duration_minutes" in request.data and request.data["duration_minutes"] is not None:
+            try:
+                workout.duration_minutes = int(request.data["duration_minutes"])
+            except (TypeError, ValueError):
+                pass
+        workout.save()
+        detect_prs(tenant, workout)
+        # No prior-state check here — this endpoint is an explicit "complete" action.
+        # The durable congratulated_at stamp is what prevents a repeat POST from
+        # re-firing, so pass transitioned_to_done=True and let layer 1 dedup.
+        from .congrats import maybe_congratulate_workout
+
+        maybe_congratulate_workout(tenant, workout, transitioned_to_done=True)
+        return Response(WorkoutSerializer(workout, context={"tenant": tenant, "rehydrate": True}).data)
+
+
+class WorkoutSwapView(APIView):
+    """POST: swap the scheduled_at + date of two workouts atomically.
+
+    Body: {"a": <uuid>, "b": <uuid>}.
+    Used by drag-one-onto-another in the week strip.
+    """
+
+    permission_classes = [IsAuthenticated]
+
+    def post(self, request):
+        from django.db import transaction
+
+        tenant = getattr(request.user, "tenant", None)
+        if not tenant:
+            return Response({"error": "no_tenant"}, status=status.HTTP_404_NOT_FOUND)
+        a_id = request.data.get("a")
+        b_id = request.data.get("b")
+        if not a_id or not b_id or a_id == b_id:
+            return Response(
+                {"error": "must provide distinct 'a' and 'b' workout ids"},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        try:
+            a = Workout.objects.get(id=a_id, tenant=tenant)
+            b = Workout.objects.get(id=b_id, tenant=tenant)
+        except Workout.DoesNotExist:
+            return Response({"error": "not_found"}, status=status.HTTP_404_NOT_FOUND)
+
+        with transaction.atomic():
+            a.scheduled_at, b.scheduled_at = b.scheduled_at, a.scheduled_at
+            a.window_start_at, b.window_start_at = b.window_start_at, a.window_start_at
+            a.window_end_at, b.window_end_at = b.window_end_at, a.window_end_at
+            a.date, b.date = b.date, a.date
+            a.save(update_fields=["scheduled_at", "window_start_at", "window_end_at", "date", "updated_at"])
+            b.save(update_fields=["scheduled_at", "window_start_at", "window_end_at", "date", "updated_at"])
+            PersonalRecord.objects.filter(workout_id=a.id).update(date=a.date)
+            PersonalRecord.objects.filter(workout_id=b.id).update(date=b.date)
+
+        return Response(
+            {
+                "a": WorkoutSerializer(a, context={"tenant": tenant, "rehydrate": True}).data,
+                "b": WorkoutSerializer(b, context={"tenant": tenant, "rehydrate": True}).data,
+            },
+        )
+
+
+# ═════════════════════════════════════════════════════════════════════
+# Weekly Volume Summary (PR 5)
+# ═════════════════════════════════════════════════════════════════════
+
+
+class WeeklyVolumeSummaryView(APIView):
+    """GET: weekly workout volume summary."""
+
+    permission_classes = [IsAuthenticated]
+
+    @tenant_cache(ttl=120, tag="fuel")
+    def get(self, request):
+        from datetime import timedelta
+
+        tenant = getattr(request.user, "tenant", None)
+        if not tenant:
+            return Response({"error": "no_tenant"}, status=status.HTTP_404_NOT_FOUND)
+
+        week_start_str = request.query_params.get("week_start")
+        if week_start_str:
+            try:
+                week_start = date_cls.fromisoformat(week_start_str)
+            except ValueError:
+                return Response({"error": "invalid week_start"}, status=status.HTTP_400_BAD_REQUEST)
+        else:
+            today = date_cls.today()
+            week_start = today - timedelta(days=today.weekday())  # Monday
+
+        week_end = week_start + timedelta(days=6)
+
+        by_category = list(
+            Workout.objects.filter(
+                tenant=tenant,
+                status="done",
+                date__gte=week_start,
+                date__lte=week_end,
+            )
+            .values("category")
+            .annotate(count=Count("id"), total_minutes=Sum("duration_minutes"))
+            .order_by("category")
+        )
+
+        total_sessions = sum(c["count"] for c in by_category)
+        total_minutes = sum(c["total_minutes"] or 0 for c in by_category)
+
+        return Response(
+            {
+                "week_start": str(week_start),
+                "week_end": str(week_end),
+                "by_category": by_category,
+                "totals": {"sessions": total_sessions, "minutes": total_minutes},
+            }
+        )
+
+
+# ═════════════════════════════════════════════════════════════════════
+# PR History + Goals (PR 6)
+# ═════════════════════════════════════════════════════════════════════
+
+
+class PRFeedView(APIView):
+    """GET: recent personal records."""
+
+    permission_classes = [IsAuthenticated]
+
+    @tenant_cache(ttl=120, tag="fuel")
+    def get(self, request):
+        tenant = getattr(request.user, "tenant", None)
+        if not tenant:
+            return Response({"error": "no_tenant"}, status=status.HTTP_404_NOT_FOUND)
+        limit = min(_safe_int(request.query_params.get("limit"), 20), 100)
+        prs = (
+            PersonalRecord.objects.filter(tenant=tenant)
+            .select_related("workout")
+            .order_by("-date", "-created_at")[:limit]
+        )
+        return Response(PersonalRecordSerializer(prs, many=True).data)
+
+
+class FuelGoalListView(APIView):
+    """GET: list goals. POST: create goal."""
+
+    permission_classes = [IsAuthenticated]
+
+    def get(self, request):
+        tenant = getattr(request.user, "tenant", None)
+        if not tenant:
+            return Response({"error": "no_tenant"}, status=status.HTTP_404_NOT_FOUND)
+        goals = FuelGoal.objects.filter(tenant=tenant)
+        return Response(FuelGoalSerializer(goals, many=True).data)
+
+    def post(self, request):
+        tenant = getattr(request.user, "tenant", None)
+        if not tenant:
+            return Response({"error": "no_tenant"}, status=status.HTTP_404_NOT_FOUND)
+        serializer = FuelGoalSerializer(data=request.data, context={"tenant": tenant})
+        serializer.is_valid(raise_exception=True)
+        serializer.save()
+        return Response(serializer.data, status=status.HTTP_201_CREATED)
+
+
+class FuelGoalDetailView(APIView):
+    """PATCH/DELETE a single goal."""
+
+    permission_classes = [IsAuthenticated]
+
+    def patch(self, request, goal_id):
+        tenant = getattr(request.user, "tenant", None)
+        if not tenant:
+            return Response({"error": "no_tenant"}, status=status.HTTP_404_NOT_FOUND)
+        try:
+            goal = FuelGoal.objects.get(id=goal_id, tenant=tenant)
+        except FuelGoal.DoesNotExist:
+            return Response({"error": "not_found"}, status=status.HTTP_404_NOT_FOUND)
+        serializer = FuelGoalSerializer(goal, data=request.data, partial=True)
+        serializer.is_valid(raise_exception=True)
+        serializer.save()
+        return Response(serializer.data)
+
+    def delete(self, request, goal_id):
+        tenant = getattr(request.user, "tenant", None)
+        if not tenant:
+            return Response({"error": "no_tenant"}, status=status.HTTP_404_NOT_FOUND)
+        try:
+            goal = FuelGoal.objects.get(id=goal_id, tenant=tenant)
+        except FuelGoal.DoesNotExist:
+            return Response({"error": "not_found"}, status=status.HTTP_404_NOT_FOUND)
+        goal.delete()
+        return Response(status=status.HTTP_204_NO_CONTENT)
+
+
+# ═════════════════════════════════════════════════════════════════════
+# Resting Heart Rate (PR 7)
+# ═════════════════════════════════════════════════════════════════════
+
+
+class RestingHRListView(APIView):
+    """GET: list entries. POST: create or upsert by date."""
+
+    permission_classes = [IsAuthenticated]
+
+    def get(self, request):
+        tenant = getattr(request.user, "tenant", None)
+        if not tenant:
+            return Response({"error": "no_tenant"}, status=status.HTTP_404_NOT_FOUND)
+        limit = min(_safe_int(request.query_params.get("limit"), 90), 365)
+        entries = RestingHeartRateLog.objects.filter(tenant=tenant)[:limit]
+        return Response(RestingHeartRateLogSerializer(entries, many=True).data)
+
+    def post(self, request):
+        tenant = getattr(request.user, "tenant", None)
+        if not tenant:
+            return Response({"error": "no_tenant"}, status=status.HTTP_404_NOT_FOUND)
+
+        entry_date = request.data.get("date")
+        bpm_raw = request.data.get("bpm")
+        if not entry_date or bpm_raw is None:
+            return Response({"error": "date and bpm required"}, status=status.HTTP_400_BAD_REQUEST)
+
+        bpm = _safe_int(bpm_raw, None)
+        if bpm is None or not (20 <= bpm <= 250):
+            return Response(
+                {"error": "bpm must be an integer between 20 and 250"},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        try:
+            date_cls.fromisoformat(str(entry_date))
+        except (ValueError, TypeError):
+            return Response({"error": "date must be YYYY-MM-DD format"}, status=status.HTTP_400_BAD_REQUEST)
+
+        entry, created = RestingHeartRateLog.objects.update_or_create(
+            tenant=tenant,
+            date=entry_date,
+            defaults={"bpm": bpm},
+        )
+        return Response(
+            RestingHeartRateLogSerializer(entry).data,
+            status=status.HTTP_201_CREATED if created else status.HTTP_200_OK,
+        )
+
+
+class RestingHRDetailView(APIView):
+    """PATCH/DELETE a single resting HR entry."""
+
+    permission_classes = [IsAuthenticated]
+
+    def patch(self, request, entry_id):
+        tenant = getattr(request.user, "tenant", None)
+        if not tenant:
+            return Response({"error": "no_tenant"}, status=status.HTTP_404_NOT_FOUND)
+        try:
+            entry = RestingHeartRateLog.objects.get(id=entry_id, tenant=tenant)
+        except RestingHeartRateLog.DoesNotExist:
+            return Response({"error": "not_found"}, status=status.HTTP_404_NOT_FOUND)
+        serializer = RestingHeartRateLogSerializer(entry, data=request.data, partial=True, context={"tenant": tenant})
+        serializer.is_valid(raise_exception=True)
+        # (tenant, date) is unique. If the user is moving an entry onto a
+        # date already occupied by another row, surface a 409 with a clean
+        # message instead of an opaque 500 from the integrity error.
+        new_date = serializer.validated_data.get("date")
+        if new_date and new_date != entry.date:
+            if RestingHeartRateLog.objects.filter(tenant=tenant, date=new_date).exclude(id=entry.id).exists():
+                return Response(
+                    {"error": "date_conflict", "detail": f"An entry already exists for {new_date}."},
+                    status=status.HTTP_409_CONFLICT,
+                )
+        serializer.save()
+        return Response(serializer.data)
+
+    def delete(self, request, entry_id):
+        tenant = getattr(request.user, "tenant", None)
+        if not tenant:
+            return Response({"error": "no_tenant"}, status=status.HTTP_404_NOT_FOUND)
+        try:
+            entry = RestingHeartRateLog.objects.get(id=entry_id, tenant=tenant)
+        except RestingHeartRateLog.DoesNotExist:
+            return Response({"error": "not_found"}, status=status.HTTP_404_NOT_FOUND)
+        entry.delete()
+        return Response(status=status.HTTP_204_NO_CONTENT)
+
+
+# ═════════════════════════════════════════════════════════════════════
+# Sleep Tracking
+# ═════════════════════════════════════════════════════════════════════
+
+
+class SleepListView(APIView):
+    """GET: list entries. POST: create or upsert by date."""
+
+    permission_classes = [IsAuthenticated]
+
+    def get(self, request):
+        tenant = getattr(request.user, "tenant", None)
+        if not tenant:
+            return Response({"error": "no_tenant"}, status=status.HTTP_404_NOT_FOUND)
+        limit = min(_safe_int(request.query_params.get("limit"), 90), 365)
+        entries = SleepLog.objects.filter(tenant=tenant)[:limit]
+        return Response(SleepLogSerializer(entries, many=True, context={"tenant": tenant, "rehydrate": True}).data)
+
+    def post(self, request):
+        tenant = getattr(request.user, "tenant", None)
+        if not tenant:
+            return Response({"error": "no_tenant"}, status=status.HTTP_404_NOT_FOUND)
+
+        entry_date = request.data.get("date")
+        duration_raw = request.data.get("duration_hours")
+        if not entry_date or duration_raw is None:
+            return Response({"error": "date and duration_hours required"}, status=status.HTTP_400_BAD_REQUEST)
+
+        try:
+            date_cls.fromisoformat(str(entry_date))
+        except (ValueError, TypeError):
+            return Response({"error": "date must be YYYY-MM-DD format"}, status=status.HTTP_400_BAD_REQUEST)
+
+        try:
+            from decimal import Decimal, InvalidOperation
+
+            duration = Decimal(str(duration_raw))
+        except (InvalidOperation, ValueError, TypeError):
+            return Response({"error": "duration_hours must be a number"}, status=status.HTTP_400_BAD_REQUEST)
+
+        if duration < 0 or duration > 24:
+            return Response({"error": "duration_hours must be between 0 and 24"}, status=status.HTTP_400_BAD_REQUEST)
+
+        quality = None
+        quality_raw = request.data.get("quality")
+        if quality_raw is not None:
+            quality = _safe_int(quality_raw, None)
+            if quality is not None and not (1 <= quality <= 5):
+                quality = None
+
+        from apps.pii.store_authoring import author_store_fields
+
+        authored, receipts = author_store_fields(
+            tenant,
+            {"notes": str(request.data.get("notes", "")).strip()},
+            model_label="fuel.SleepLog",
+            seam="fuel.owner.sleep.upsert",
+            writer="owner",
+        )
+        entry, created = SleepLog.objects.update_or_create(
+            tenant=tenant,
+            date=entry_date,
+            defaults={
+                "duration_hours": duration,
+                "quality": quality,
+                "notes": authored["notes"],
+                "pii_receipts": receipts,
+            },
+        )
+        return Response(
+            SleepLogSerializer(entry, context={"tenant": tenant, "rehydrate": True}).data,
+            status=status.HTTP_201_CREATED if created else status.HTTP_200_OK,
+        )
+
+
+class SleepDetailView(APIView):
+    """PATCH/DELETE a single sleep entry."""
+
+    permission_classes = [IsAuthenticated]
+
+    def patch(self, request, entry_id):
+        tenant = getattr(request.user, "tenant", None)
+        if not tenant:
+            return Response({"error": "no_tenant"}, status=status.HTTP_404_NOT_FOUND)
+        try:
+            entry = SleepLog.objects.get(id=entry_id, tenant=tenant)
+        except SleepLog.DoesNotExist:
+            return Response({"error": "not_found"}, status=status.HTTP_404_NOT_FOUND)
+        serializer = SleepLogSerializer(
+            entry,
+            data=request.data,
+            partial=True,
+            context={"tenant": tenant, "rehydrate": True},
+        )
+        serializer.is_valid(raise_exception=True)
+        # (tenant, date) is unique. If the user is moving an entry onto a
+        # date already occupied by another row, surface a 409 with a clean
+        # message instead of an opaque 500 from the integrity error.
+        new_date = serializer.validated_data.get("date")
+        if new_date and new_date != entry.date:
+            if SleepLog.objects.filter(tenant=tenant, date=new_date).exclude(id=entry.id).exists():
+                return Response(
+                    {"error": "date_conflict", "detail": f"An entry already exists for {new_date}."},
+                    status=status.HTTP_409_CONFLICT,
+                )
+        serializer.save()
+        return Response(serializer.data)
+
+    def delete(self, request, entry_id):
+        tenant = getattr(request.user, "tenant", None)
+        if not tenant:
+            return Response({"error": "no_tenant"}, status=status.HTTP_404_NOT_FOUND)
+        try:
+            entry = SleepLog.objects.get(id=entry_id, tenant=tenant)
+        except SleepLog.DoesNotExist:
+            return Response({"error": "not_found"}, status=status.HTTP_404_NOT_FOUND)
+        entry.delete()
+        return Response(status=status.HTTP_204_NO_CONTENT)
+
+
+# ── Workout Plans ────────────────────────────────────────────────────
+
+
+class WorkoutPlanListView(APIView):
+    """GET: list plans. POST: create plan."""
+
+    permission_classes = [IsAuthenticated]
+
+    def get(self, request):
+        tenant = getattr(request.user, "tenant", None)
+        if not tenant:
+            return Response({"error": "no_tenant"}, status=status.HTTP_404_NOT_FOUND)
+
+        qs = WorkoutPlan.objects.filter(tenant=tenant)
+        status_filter = request.query_params.get("status")
+        if status_filter:
+            qs = qs.filter(status=status_filter)
+
+        # Compute the tenant-local today once and thread it into every
+        # serializer so the derived program-progress fields don't fire a
+        # per-plan tenant lookup (N+1) resolving "today".
+        today = today_in_tenant_tz(tenant)
+        result = []
+        for plan in qs.order_by("-created_at")[:20]:
+            data = WorkoutPlanSerializer(
+                plan,
+                context={"today": today, "tenant": tenant, "rehydrate": True},
+            ).data
+            data["workout_count"] = Workout.objects.filter(plan=plan).count()
+            data["completed_count"] = Workout.objects.filter(plan=plan, status=WorkoutStatus.DONE).count()
+            result.append(data)
+
+        return Response(result)
+
+    def post(self, request):
+        from django.db import transaction
+
+        from .runtime_views import (
+            _author_plan_expansion_inputs,
+            _expand_plan_workouts,
+            _validate_normalize_schedule,
+        )
+
+        tenant = getattr(request.user, "tenant", None)
+        if not tenant:
+            return Response({"error": "no_tenant"}, status=status.HTTP_404_NOT_FOUND)
+        serializer = WorkoutPlanSerializer(
+            data=request.data,
+            context={"tenant": tenant, "rehydrate": True},
+        )
+        serializer.is_valid(raise_exception=True)
+
+        # Validate + normalise schedule_json before persisting anything so a
+        # non-dict day value is rejected with 400 instead of raising AttributeError
+        # inside _expand_plan_workouts (mirrors the runtime path's pre-persist gate).
+        raw_schedule = serializer.validated_data.get("schedule_json") or {}
+        if raw_schedule:
+            normalized_schedule, sched_err = _validate_normalize_schedule(raw_schedule)
+            if sched_err is not None:
+                return sched_err
+            serializer.validated_data["schedule_json"] = normalized_schedule
+
+        # Idempotency: a double-submit with the same name + start_date returns
+        # the existing active plan rather than duplicating it and its calendar.
+        start_date = serializer.validated_data.get("start_date")
+        name = serializer.validated_data.get("name", "")
+        if start_date and name:
+            from apps.journal.lifecycle_views import _search_variants
+
+            name_query = Q()
+            for variant in _search_variants(tenant, name):
+                name_query |= Q(name=variant)  # guard: encrypted-predicate
+            existing = WorkoutPlan.objects.filter(
+                name_query,
+                tenant=tenant,
+                start_date=start_date,
+                status=PlanStatus.ACTIVE,
+            ).first()
+            if existing is not None:
+                data = WorkoutPlanSerializer(
+                    existing,
+                    context={"today": today_in_tenant_tz(tenant), "tenant": tenant, "rehydrate": True},
+                ).data
+                data["workout_count"] = Workout.objects.filter(plan=existing).count()
+                data["deduped"] = True
+                return Response(data, status=status.HTTP_200_OK)
+
+        from apps.pii.store_authoring import author_store_fields
+
+        authored_plan, plan_receipts = author_store_fields(
+            tenant,
+            serializer.validated_data,
+            model_label="fuel.WorkoutPlan",
+            seam="fuel.fuel.WorkoutPlan.create",
+            writer="owner",
+        )
+        serializer.validated_data.clear()
+        serializer.validated_data.update(authored_plan)
+        serializer.validated_data["pii_receipts"] = plan_receipts
+        serializer.context["pii_preauthored"] = True
+        authored_workouts = _author_plan_expansion_inputs(
+            tenant,
+            authored_plan.get("schedule_json") or {},
+            authored_plan.get("weeks") or 0,
+            writer="owner",
+        )
+
+        # Wrap the plan row + calendar expansion in one transaction so a
+        # mid-loop failure in _expand_plan_workouts rolls back the plan row too.
+        try:
+            with transaction.atomic():
+                plan = serializer.save()
+                if plan.schedule_json and plan.start_date and plan.weeks:
+                    _expand_plan_workouts(
+                        plan,
+                        tenant,
+                        plan.schedule_json,
+                        plan.start_date,
+                        plan.weeks,
+                        authored_workouts=authored_workouts,
+                    )
+        except Exception as exc:
+            return Response(
+                {"error": "create_failed", "detail": str(exc)},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        data = WorkoutPlanSerializer(
+            plan,
+            context={"today": today_in_tenant_tz(tenant), "tenant": tenant, "rehydrate": True},
+        ).data
+        data["workout_count"] = Workout.objects.filter(plan=plan).count()
+        return Response(data, status=status.HTTP_201_CREATED)
+
+
+class WorkoutPlanDetailView(APIView):
+    """GET/PATCH/DELETE a single workout plan."""
+
+    permission_classes = [IsAuthenticated]
+
+    def get(self, request, plan_id):
+        tenant = getattr(request.user, "tenant", None)
+        if not tenant:
+            return Response({"error": "no_tenant"}, status=status.HTTP_404_NOT_FOUND)
+        try:
+            plan = WorkoutPlan.objects.get(id=plan_id, tenant=tenant)
+        except WorkoutPlan.DoesNotExist:
+            return Response({"error": "not_found"}, status=status.HTTP_404_NOT_FOUND)
+        data = WorkoutPlanSerializer(
+            plan,
+            context={"today": today_in_tenant_tz(tenant), "tenant": tenant, "rehydrate": True},
+        ).data
+        data["workout_count"] = Workout.objects.filter(plan=plan).count()
+        data["completed_count"] = Workout.objects.filter(plan=plan, status=WorkoutStatus.DONE).count()
+        return Response(data)
+
+    def patch(self, request, plan_id):
+        from django.db import transaction
+
+        from .runtime_views import (
+            _author_plan_expansion_inputs,
+            _expand_plan_workouts,
+            _validate_normalize_schedule,
+        )
+
+        tenant = getattr(request.user, "tenant", None)
+        if not tenant:
+            return Response({"error": "no_tenant"}, status=status.HTTP_404_NOT_FOUND)
+        try:
+            plan = WorkoutPlan.objects.get(id=plan_id, tenant=tenant)
+        except WorkoutPlan.DoesNotExist:
+            return Response({"error": "not_found"}, status=status.HTTP_404_NOT_FOUND)
+
+        old_schedule = plan.schedule_json
+        old_weeks = plan.weeks
+
+        serializer = WorkoutPlanSerializer(
+            plan,
+            data=request.data,
+            partial=True,
+            context={"tenant": tenant, "rehydrate": True},
+        )
+        serializer.is_valid(raise_exception=True)
+
+        # Validate + normalise any incoming schedule_json before saving so a
+        # malformed day value is rejected with 400 rather than raising AttributeError
+        # inside _expand_plan_workouts (mirrors the runtime regen path).
+        raw_schedule = serializer.validated_data.get("schedule_json")
+        if raw_schedule:
+            # STRICT here (require_detail=True), unlike the runtime PATCH. This
+            # endpoint is wholesale schedule replacement: the normalized schedule
+            # (where the validator injects detail_json={} for omitted days) is
+            # saved as-is and the regen below deletes all future planned workouts
+            # and re-expands straight from it — there is no strip-injected-key
+            # loop and no reconciler to honor "omitted = leave the existing
+            # prescription alone". Lenient validation would let an ordinary PATCH
+            # that omits detail on a strength day silently blank prescriptions
+            # across the whole remaining calendar. An incomplete strength day
+            # must be rejected, not silently blanked; partial-edit semantics live
+            # on the runtime PATCH + reconcile path. Status/notes-only PATCHes
+            # never enter this branch (gated on `if raw_schedule`), so legacy
+            # plans with empty stored details are not retro-wedged.
+            normalized_schedule, sched_err = _validate_normalize_schedule(raw_schedule)
+            if sched_err is not None:
+                return sched_err
+            serializer.validated_data["schedule_json"] = normalized_schedule
+
+        from apps.pii.store_authoring import author_store_fields
+
+        authored_plan, plan_receipts = author_store_fields(
+            tenant,
+            serializer.validated_data,
+            model_label="fuel.WorkoutPlan",
+            seam="fuel.fuel.WorkoutPlan.update",
+            writer="owner",
+            receipts=plan.pii_receipts,
+        )
+        prospective_schedule = authored_plan.get("schedule_json", plan.schedule_json)
+        prospective_weeks = authored_plan.get("weeks", plan.weeks)
+        authored_workouts = None
+        if prospective_schedule != old_schedule or prospective_weeks != old_weeks:
+            today = today_in_tenant_tz(tenant)
+            elapsed_days = (today - plan.start_date).days
+            elapsed_weeks = max(0, elapsed_days // 7)
+            remaining_weeks = max(0, prospective_weeks - elapsed_weeks)
+            if remaining_weeks > 0:
+                authored_workouts = _author_plan_expansion_inputs(
+                    tenant,
+                    prospective_schedule,
+                    remaining_weeks,
+                    writer="owner",
+                )
+        serializer.validated_data.clear()
+        serializer.validated_data.update(authored_plan)
+        serializer.validated_data["pii_receipts"] = plan_receipts
+        serializer.context["pii_preauthored"] = True
+
+        # Wrap the save + calendar regen in one transaction so a mid-loop failure
+        # in _expand_plan_workouts rolls back the plan update and the partial deletes.
+        try:
+            with transaction.atomic():
+                plan = serializer.save()
+
+                # Regenerate planned workouts if schedule or weeks changed
+                if plan.schedule_json != old_schedule or plan.weeks != old_weeks:
+                    today = today_in_tenant_tz(tenant)
+                    Workout.objects.filter(plan=plan, status=WorkoutStatus.PLANNED, date__gte=today).delete()
+                    elapsed_days = (today - plan.start_date).days
+                    elapsed_weeks = max(0, elapsed_days // 7)
+                    remaining_weeks = max(0, plan.weeks - elapsed_weeks)
+                    if remaining_weeks > 0:
+                        regen_start = max(today, plan.start_date)
+                        _expand_plan_workouts(
+                            plan,
+                            tenant,
+                            plan.schedule_json,
+                            regen_start,
+                            remaining_weeks,
+                            authored_workouts=authored_workouts,
+                        )
+        except Exception as exc:
+            return Response(
+                {"error": "regen_failed", "detail": str(exc)},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        data = WorkoutPlanSerializer(
+            plan,
+            context={"today": today_in_tenant_tz(tenant), "tenant": tenant, "rehydrate": True},
+        ).data
+        data["workout_count"] = Workout.objects.filter(plan=plan).count()
+        data["completed_count"] = Workout.objects.filter(plan=plan, status=WorkoutStatus.DONE).count()
+        return Response(data)
+
+    def delete(self, request, plan_id):
+        tenant = getattr(request.user, "tenant", None)
+        if not tenant:
+            return Response({"error": "no_tenant"}, status=status.HTTP_404_NOT_FOUND)
+        try:
+            plan = WorkoutPlan.objects.get(id=plan_id, tenant=tenant)
+        except WorkoutPlan.DoesNotExist:
+            return Response({"error": "not_found"}, status=status.HTTP_404_NOT_FOUND)
+        # Delete planned workouts, preserve completed ones
+        Workout.objects.filter(plan=plan, status=WorkoutStatus.PLANNED).delete()
+        Workout.objects.filter(plan=plan).exclude(status=WorkoutStatus.PLANNED).update(plan=None)
+        plan.delete()
+        return Response(status=status.HTTP_204_NO_CONTENT)
+
+
+# ── HealthKit sync (iOS) ────────────────────────────────────────────────
+
+
+class HealthKitSyncHourThrottle(SimpleRateThrottle):
+    """Per-user rate limit for the HealthKit batch sync endpoint."""
+
+    scope = "healthkit_sync_hour"
+    rate = "60/hour"
+
+    def get_cache_key(self, request, view):
+        if not request.user or not request.user.is_authenticated:
+            return None
+        return self.cache_format % {"scope": self.scope, "ident": str(request.user.pk)}
+
+
+class HealthKitSyncView(APIView):
+    """POST: batch-ingest Apple Health workouts + daily metrics.
+
+    Idempotent on external_id (HealthKit sample UUID); duplicates report
+    HTTP 200 with per-item status, never 4xx. Ingest logic + invariants
+    live in apps/fuel/healthkit.py; the view owns gates, caps, and the
+    signal-suppression / single-visibility-push contract.
+    """
+
+    permission_classes = [IsAuthenticated]
+    throttle_classes = [HealthKitSyncHourThrottle]
+
+    def post(self, request):
+        from apps.orchestrator.envelope_registry import suppress_refresh
+        from apps.tenants.models import Tenant
+
+        from . import healthkit
+        from .signals import _enqueue_regen, suppress_cron_regen
+
+        tenant = getattr(request.user, "tenant", None)
+        if not tenant:
+            return Response({"error": "no_tenant"}, status=status.HTTP_404_NOT_FOUND)
+        if tenant.status == Tenant.Status.SUSPENDED:
+            return Response({"error": "suspended"}, status=status.HTTP_403_FORBIDDEN)
+        if not tenant.fuel_enabled:
+            # Flips immediately via PATCH /api/v1/fuel/settings/ — no
+            # container restart needed for ingest, so iOS can offer a
+            # one-tap enable and retry right away.
+            return Response({"error": "fuel_disabled"}, status=status.HTTP_409_CONFLICT)
+
+        data = request.data if isinstance(request.data, dict) else None
+        if data is None:
+            return Response({"error": "invalid_body"}, status=status.HTTP_400_BAD_REQUEST)
+        workouts = data.get("workouts") or []
+        daily = data.get("daily_metrics") or []
+        deleted = data.get("deleted_external_ids") or []
+        device_tz = str(data.get("device_tz") or "").strip()
+        if not isinstance(workouts, list) or len(workouts) > healthkit.MAX_WORKOUTS:
+            return Response({"error": "too_many_workouts"}, status=status.HTTP_400_BAD_REQUEST)
+        if not isinstance(daily, list) or len(daily) > healthkit.MAX_DAILY:
+            return Response({"error": "too_many_daily_metrics"}, status=status.HTTP_400_BAD_REQUEST)
+        if not isinstance(deleted, list) or len(deleted) > healthkit.MAX_DELETED:
+            return Response({"error": "too_many_deleted_ids"}, status=status.HTTP_400_BAD_REQUEST)
+        if not workouts and not daily and not deleted and not device_tz:
+            return Response({"error": "empty_payload"}, status=status.HTTP_400_BAD_REQUEST)
+
+        with suppress_refresh(), suppress_cron_regen():
+            outcome = healthkit.ingest_healthkit_payload(tenant, data)
+
+        if outcome["wrote_any"] or outcome["situation_changed"]:
+            healthkit.push_visibility_refresh(str(tenant.id))
+        if outcome["regen_needed"]:
+            _enqueue_regen(str(tenant.id))
+
+        return Response({k: outcome[k] for k in ("results", "daily_results", "summary")})

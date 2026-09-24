@@ -1,0 +1,152 @@
+"use client";
+
+import { useState } from "react";
+
+import { BodyWeight } from "@/components/fuel/body-weight";
+import { Calendar } from "@/components/fuel/calendar";
+import { DayDrawer } from "@/components/fuel/day-drawer";
+import { History } from "@/components/fuel/history";
+import { NewWorkoutDialog } from "@/components/fuel/new-workout-dialog";
+import { OrphanDraftsBanner } from "@/components/fuel/orphan-drafts-banner";
+import { ProfileCard } from "@/components/fuel/profile-card";
+import { Progress } from "@/components/fuel/progress";
+import { RestingHeartRate } from "@/components/fuel/resting-heart-rate";
+import { ScheduleWeek } from "@/components/fuel/schedule-week";
+import { Sleep } from "@/components/fuel/sleep";
+import { TodayCheckIn } from "@/components/fuel/today-checkin";
+import { WeeklySummary } from "@/components/fuel/weekly-summary";
+import { WorkoutDetail } from "@/components/fuel/workout-detail";
+import { useMeQuery, useWorkoutCountQuery } from "@/lib/queries";
+import { shiftISODate } from "@/lib/journal-date";
+
+type Tab = "schedule" | "calendar" | "history" | "progress";
+
+export default function FuelPage() {
+  const [tab, setTab] = useState<Tab>("schedule");
+  const [dayIso, setDayIso] = useState<string | null>(null);
+  const [workoutId, setWorkoutId] = useState<string | null>(null);
+  const [newSheet, setNewSheet] = useState<{ open: boolean; date: string | null }>({ open: false, date: null });
+
+  const { data: countData } = useWorkoutCountQuery({ status: "done" });
+  const { data: me } = useMeQuery();
+  const doneCount = countData?.count ?? 0;
+  const tenantId = me?.tenant?.id ?? null;
+
+  const navigateDay = (delta: number) => {
+    if (!dayIso) return;
+    setDayIso(shiftISODate(dayIso, delta));
+  };
+
+  return (
+    <div className="mx-auto py-2 sm:py-6 overflow-x-hidden">
+      {/* Mobile: compact eyebrow + CTA on one row — saves ~140px above the fold */}
+      <div className="sm:hidden flex items-center justify-between gap-3 mb-5">
+        <span className="text-accent text-xs font-bold uppercase tracking-[0.22em]">FUEL</span>
+        <button
+          onClick={() => setNewSheet({ open: true, date: null })}
+          className="glow-purple rounded-full bg-accent text-white min-h-[44px] px-4 text-sm font-semibold hover:brightness-110 active:scale-[0.98] transition flex items-center gap-1.5 shrink-0"
+        >
+          <svg viewBox="0 0 24 24" className="h-4 w-4" fill="none" stroke="currentColor" strokeWidth="2"><path d="M12 5v14M5 12h14" /></svg>
+          Log workout
+        </button>
+      </div>
+
+      {/* sm+: full lyrical hero */}
+      <div className="hidden sm:flex sm:flex-row sm:items-center sm:justify-between gap-4 mb-8">
+        <div className="min-w-0">
+          <span className="text-accent text-[10px] font-bold uppercase tracking-[0.2em] mb-1 block">FUEL</span>
+          <h1 className="text-4xl md:text-5xl font-semibold italic leading-tight">
+            Every session,<br />
+            <span className="text-ink-muted">on the calendar.</span>
+          </h1>
+          <p className="mt-3 text-sm text-ink-muted max-w-[560px]">
+            Click a day to open it. Plan ahead, log what you did, and edit anything after the fact.
+            Pick a category for the logger shape — the activity name is yours to write.
+          </p>
+        </div>
+        <button
+          onClick={() => setNewSheet({ open: true, date: null })}
+          className="self-start sm:self-auto glow-purple rounded-full bg-accent text-white min-h-[44px] px-5 py-2.5 text-sm font-semibold hover:brightness-110 active:scale-[0.98] transition flex items-center gap-1.5 shrink-0"
+        >
+          <svg viewBox="0 0 24 24" className="h-4 w-4" fill="none" stroke="currentColor" strokeWidth="2"><path d="M12 5v14M5 12h14" /></svg>
+          Log workout
+        </button>
+      </div>
+
+      <div className="mb-4">
+        <OrphanDraftsBanner tenantId={tenantId} />
+      </div>
+
+      <TodayCheckIn />
+
+      <ProfileCard />
+      <WeeklySummary />
+
+      {/* Tabs */}
+      <div className="flex items-stretch border-b border-border mb-6">
+        {([
+          { id: "schedule" as Tab, label: "Schedule" },
+          { id: "calendar" as Tab, label: "Calendar" },
+          { id: "history" as Tab, label: "History", count: doneCount },
+          { id: "progress" as Tab, label: "Progress" },
+        ]).map((t) => {
+          const on = tab === t.id;
+          return (
+            <button
+              key={t.id}
+              onClick={() => setTab(t.id)}
+              className={`relative flex-1 sm:flex-none min-h-[44px] px-1.5 sm:px-4 py-3 text-sm whitespace-nowrap transition ${on ? "text-ink" : "text-ink-muted hover:text-ink"}`}
+            >
+              {t.label}
+              {t.count != null && (
+                <span className={`ml-2 hidden sm:inline font-mono text-[10px] ${on ? "text-ink-muted" : "text-ink-faint"}`}>{t.count}</span>
+              )}
+              {on && <span className="absolute left-1.5 right-1.5 sm:left-3 sm:right-3 bottom-0 h-[1.5px] bg-ink rounded-full" />}
+            </button>
+          );
+        })}
+      </div>
+
+      {/* Tab content */}
+      {tab === "schedule" && (
+        <ScheduleWeek
+          onAddSession={(iso) => setNewSheet({ open: true, date: iso })}
+          onOpenWorkout={(id) => setWorkoutId(id)}
+        />
+      )}
+      {tab === "calendar" && <Calendar onSelectDay={setDayIso} />}
+      {tab === "history" && <History onOpenWorkout={setWorkoutId} />}
+      {tab === "progress" && (
+        <div className="space-y-8">
+          <Progress />
+          <BodyWeight />
+          <Sleep />
+          <RestingHeartRate />
+        </div>
+      )}
+
+      {/* Overlays */}
+      {dayIso && (
+        <DayDrawer
+          iso={dayIso}
+          onClose={() => setDayIso(null)}
+          onNavigate={navigateDay}
+          onAddWorkout={(iso) => setNewSheet({ open: true, date: iso })}
+          onOpenWorkout={(id) => setWorkoutId(id)}
+        />
+      )}
+
+      <WorkoutDetail
+        workoutId={workoutId}
+        onClose={() => setWorkoutId(null)}
+      />
+
+      <NewWorkoutDialog
+        open={newSheet.open}
+        presetDate={newSheet.date}
+        onClose={() => setNewSheet({ open: false, date: null })}
+        onCreated={(id) => setWorkoutId(id)}
+      />
+    </div>
+  );
+}

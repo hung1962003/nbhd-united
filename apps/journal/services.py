@@ -1,0 +1,589 @@
+"""Journal-domain helper services for templates and note persistence."""
+
+from __future__ import annotations
+
+import re
+from copy import deepcopy
+from datetime import date
+
+from django.core.exceptions import ValidationError
+from django.utils import timezone as tz
+
+from .md_utils import format_author_suffix
+from .models import DailyNote, Document, NoteTemplate
+from .templates_md import GOALS_TEMPLATE
+
+
+def _get_persona_name(tenant) -> str:
+    """Get the persona display name for a tenant, defaulting to 'Neighbor'."""
+    from apps.orchestrator.personas import get_persona
+
+    persona_key = (tenant.user.preferences or {}).get("agent_persona", "neighbor")
+    return get_persona(persona_key)["identity"]["name"]
+
+
+DEFAULT_TEMPLATE_SLUG = "default"
+DEFAULT_TEMPLATE_NAME = "Default"
+
+DEFAULT_TEMPLATE_SECTIONS: list[dict[str, str]] = [
+    {
+        "slug": "morning-report",
+        "title": "Morning Report",
+        "content": ("### Overnight Summary\n- \n\n### Calendar Today\n- \n\n### Reminders & Follow-ups\n- \n"),
+        "source": "agent",
+    },
+    {
+        "slug": "weather",
+        "title": "Weather",
+        "content": ("**Today:** \n**Tomorrow:** \n"),
+        "source": "agent",
+    },
+    {
+        "slug": "news",
+        "title": "News & Interests",
+        "content": ("### Headlines\n- \n\n### Topics You Follow\n- \n"),
+        "source": "agent",
+    },
+    {
+        "slug": "focus",
+        "title": "Today's Focus",
+        "content": ("### Top 3 Priorities\n1. \n2. \n3. \n\n### Quick Wins\n- \n"),
+        "source": "agent",
+    },
+    {
+        "slug": "energy-mood",
+        "title": "Energy & Mood",
+        "content": "- ?\n",
+        "source": "shared",
+    },
+]
+
+# Old default slug sets — used to detect unmodified templates during seeding.
+# Evening-check-in was removed from templates (created on-demand by evening cron).
+_OLD_DEFAULT_SLUGS = {"morning-report", "log", "evening-check-in"}
+
+_ENTRY_SECTION_HEADER_RE = re.compile(r"^\d{1,2}:\d{2}\b")
+_LEGACY_ENTRY_HEADER_RE = re.compile(r"^##\s+\d{1,2}:\d{2}\b")
+_MARKDOWN_SECTION_BOUNDARY_RE = re.compile(r"(?:^|\n)(## |### \d{1,2}:\d{2}\b)")
+
+
+def markdown_has_section(md: str, heading: str) -> bool:
+    """Return whether ``md`` contains the exact ``## <heading>`` line."""
+    marker = f"## {heading}"
+    return re.search(r"(?m)^" + re.escape(marker) + r"[ \t]*$", md or "") is not None
+
+
+def upsert_markdown_section(md: str, heading: str, body: str) -> str:
+    """Replace a ``##`` section body without consuming later journal entries."""
+    md = md or ""
+    body = (body or "").strip()
+    marker = f"## {heading}"
+    head_match = re.search(r"(?m)^" + re.escape(marker) + r"[ \t]*$", md)
+    if head_match is None:
+        return md.rstrip() + f"\n\n{marker}\n{body}\n"
+
+    heading_end = md.find("\n", head_match.end())
+    if heading_end == -1:
+        heading_end = len(md)
+    else:
+        heading_end += 1
+
+    boundary_match = _MARKDOWN_SECTION_BOUNDARY_RE.search(md[heading_end:])
+    if boundary_match is None:
+        return md[:heading_end] + body + "\n"
+
+    boundary = heading_end + boundary_match.start(1)
+    if boundary_match.start(1) > 0:
+        boundary -= 1
+    return md[:heading_end] + body + "\n" + md[boundary:]
+
+
+def resolve_daily_section_heading(*, tenant, markdown: str, section_slug: str) -> str:
+    """Choose a template-aware heading while honoring legacy derived headings."""
+    derived_heading = section_slug.replace("-", " ").title()
+
+    canonical_heading = None
+    template = get_default_template(tenant=tenant)
+    section_sources = [
+        getattr(template, "sections", None) or [],
+        DEFAULT_TEMPLATE_SECTIONS,
+    ]
+    for sections in section_sources:
+        for section in sections:
+            if not isinstance(section, dict):
+                continue
+            if str(section.get("slug") or "").strip() != section_slug:
+                continue
+            title = str(section.get("title") or "").strip()
+            if title:
+                canonical_heading = title
+                break
+        if canonical_heading is not None:
+            break
+
+    if canonical_heading is None:
+        return derived_heading
+    if markdown_has_section(markdown, canonical_heading):
+        return canonical_heading
+    if markdown_has_section(markdown, derived_heading):
+        return derived_heading
+    return canonical_heading
+
+
+def _validate_template_sections(sections: list[dict], /) -> list[dict[str, str]]:
+    if not isinstance(sections, list):
+        raise ValidationError("sections must be an array.")
+    if len(sections) == 0:
+        raise ValidationError("sections cannot be empty.")
+
+    seen_slugs: set[str] = set()
+    normalised: list[dict[str, str]] = []
+    for index, section in enumerate(sections):
+        if not isinstance(section, dict):
+            raise ValidationError(f"section index={index} must be an object")
+
+        slug = str(section.get("slug") or "").strip()
+        title = str(section.get("title") or "").strip()
+        content = str(section.get("content") or "").strip()
+        source = str(section.get("source") or "shared").strip()
+
+        if not slug:
+            raise ValidationError(f"section index={index} is missing slug")
+        if not title:
+            raise ValidationError(f"section index={index} is missing title")
+        if slug in seen_slugs:
+            raise ValidationError(f"duplicate section slug: {slug}")
+        if source not in {choice[0] for choice in NoteTemplate.Source.choices}:
+            raise ValidationError(f"section index={index} has invalid source: {source}")
+
+        seen_slugs.add(slug)
+        normalised.append(
+            {
+                "slug": slug,
+                "title": title,
+                "content": content,
+                "source": source,
+            }
+        )
+
+    return normalised
+
+
+def _default_template_payload() -> list[dict[str, str]]:
+    return deepcopy(DEFAULT_TEMPLATE_SECTIONS)
+
+
+def seed_default_templates_for_tenant(*, tenant, dry_run: bool = False):
+    """Ensure the tenant has a default note template."""
+    template_defaults = {
+        "name": DEFAULT_TEMPLATE_NAME,
+        "sections": _default_template_payload(),
+        "is_default": True,
+        "source": NoteTemplate.Source.SHARED,
+    }
+
+    if dry_run:
+        return {
+            "created": not NoteTemplate.objects.filter(tenant=tenant, slug=DEFAULT_TEMPLATE_SLUG).exists(),
+            "template": None,
+        }
+
+    template, created = NoteTemplate.objects.get_or_create(
+        tenant=tenant,
+        slug=DEFAULT_TEMPLATE_SLUG,
+        defaults=template_defaults,
+    )
+
+    if not created:
+        template.is_default = True
+        # Only overwrite sections if they still match the old 3-section defaults.
+        existing_slugs = {s.get("slug") for s in (template.sections or [])}
+        if existing_slugs == _OLD_DEFAULT_SLUGS:
+            template.sections = template_defaults["sections"]
+        template.source = NoteTemplate.Source.SHARED
+        template.save(update_fields=["is_default", "sections", "source"])
+
+    return {"created": created, "template": template}
+
+
+STARTER_DOCUMENT_TEMPLATES = [
+    {
+        "kind": "tasks",
+        "slug": "tasks",
+        "title": "Tasks",
+        "markdown": """# Tasks\n\n## What to work on\n- [ ] Add one tiny task\n- [ ] Add another tiny task\n- [ ] Keep going\n\nWhen you finish one, check it off and add a new one.\n""",
+    },
+    {
+        "kind": "goal",
+        "slug": "goals",
+        "title": "Goals",
+        "markdown": "# Goals\n\n## Active\n\n(No goals yet — your agent will suggest them as you chat.)\n\n## Completed\n",
+    },
+    {
+        "kind": "ideas",
+        "slug": "ideas",
+        "title": "Ideas",
+        "markdown": """# Ideas\n\n## Brainstorming\n- A thought to try\n- Another half-formed idea\n\nEverything is welcome here. No idea is too small.\n""",
+    },
+    {
+        "kind": "memory",
+        "slug": "memory",
+        "title": "Memory",
+        "markdown": """# Memory\n\nThis document is your long-term memory about you.\nUse it to record preferences, recurring details, and lessons for your helper to remember.\n\n- What makes you feel supported\n- Things you care about\n- Decisions and context you'd like to keep forever\n""",
+    },
+]
+
+# Any new goals template variant must be added here; untracked template drift
+# is what allowed pristine scaffold content to leak into user-facing contexts.
+_PRISTINE_GOALS_SCAFFOLDS = frozenset(
+    {
+        next(spec["markdown"] for spec in STARTER_DOCUMENT_TEMPLATES if spec["slug"] == "goals").strip(),
+        GOALS_TEMPLATE.strip(),
+    }
+)
+
+
+def is_pristine_goals_scaffold(markdown: str) -> bool:
+    """Return whether markdown exactly matches a known goals scaffold."""
+    return markdown.strip() in _PRISTINE_GOALS_SCAFFOLDS
+
+
+def seed_default_documents_for_tenant(*, tenant, dry_run: bool = False):
+    """Seed starter documents for PKM sections if they do not already exist."""
+    if dry_run:
+        return {
+            "created": {
+                spec["slug"]: not Document.objects.filter(
+                    tenant=tenant,
+                    kind=spec["kind"],
+                    slug=spec["slug"],
+                ).exists()
+                for spec in STARTER_DOCUMENT_TEMPLATES
+            },
+            "documents": {},
+        }
+
+    documents = {}
+    created = {}
+    for spec in STARTER_DOCUMENT_TEMPLATES:
+        doc, doc_created = Document.objects.get_or_create(
+            tenant=tenant,
+            kind=spec["kind"],
+            slug=spec["slug"],
+            defaults={
+                "title": spec["title"],
+                "markdown": spec["markdown"],
+            },
+        )
+        created[spec["slug"]] = doc_created
+        documents[spec["slug"]] = doc
+
+    return {
+        "created": created,
+        "documents": documents,
+    }
+
+
+def get_default_template(*, tenant):
+    template = NoteTemplate.objects.filter(tenant=tenant, is_default=True).order_by("-updated_at").first()
+    if template is not None:
+        return template
+    template = NoteTemplate.objects.filter(tenant=tenant).order_by("-created_at").first()
+    if template is not None:
+        return template
+    return None
+
+
+def ensure_daily_note_template(*, tenant, note):
+    template = get_default_template(tenant=tenant)
+    if template is None:
+        seeded = seed_default_templates_for_tenant(tenant=tenant)
+        template = seeded["template"]
+    if note.template_id != getattr(template, "id", None):
+        note.template = template
+        note.save(update_fields=["template"])
+    return template
+
+
+def parse_daily_sections(markdown: str | None) -> list[dict[str, str]]:
+    if not markdown:
+        return []
+
+    lines = markdown.splitlines()
+    sections: list[dict[str, str]] = []
+    current_title: str | None = None
+    current_slug: str | None = None
+    current_lines: list[str] = []
+    current_is_entry = False
+
+    def _flush() -> None:
+        nonlocal sections, current_title, current_slug, current_lines
+        if current_title is None:
+            return
+        sections.append(
+            {
+                "title": current_title,
+                "slug": current_slug or "section",
+                "content": "\n".join(current_lines).strip(),
+            }
+        )
+
+    for raw in lines:
+        line = raw.strip()
+        if line.startswith("# ") and not line.startswith("## "):
+            continue
+        if line.startswith("## "):
+            _flush()
+            current_title = line[3:].strip()
+            if not current_title:
+                current_title = "Section"
+            if _ENTRY_SECTION_HEADER_RE.match(current_title):
+                current_title = None
+                current_lines = []
+                current_is_entry = True
+                continue
+            if not current_title:
+                current_slug = "section"
+            else:
+                current_slug = current_title.lower().replace(" ", "-")
+            current_lines = []
+            current_is_entry = False
+            continue
+        if current_title is not None and not current_is_entry:
+            current_lines.append(raw)
+
+    _flush()
+    return [section for section in sections if section["title"] or section["content"]]
+
+
+def materialize_sections_markdown(*, note_date: date, sections: list[dict], template_name: str | None = None):
+    heading_prefix = f"# {note_date}"
+    if template_name:
+        heading_prefix = f"# {note_date} ({template_name})"
+
+    lines = [heading_prefix]
+    for section in sections:
+        title = section.get("title") or section.get("slug") or "Section"
+        content = section.get("content", "")
+        lines.append("")
+        lines.append(f"## {title}")
+        if content:
+            lines.append(content)
+
+    return "\n".join(lines) + "\n"
+
+
+def get_or_seed_note_template(
+    *, tenant, date_value: date, markdown: str | None = None
+) -> tuple[NoteTemplate, list[dict]]:
+    """Load template for a tenant's daily note and initialise sections from markdown if available."""
+    template = get_default_template(tenant=tenant)
+    if template is None:
+        template = seed_default_templates_for_tenant(tenant=tenant)["template"]
+
+    source_sections = parse_daily_sections(markdown or "")
+    if source_sections:
+        return template, source_sections
+
+    # Preserve legacy notes that still contain entry-style headers (e.g. ## 09:00 — MJ)
+    # by seeding a sectionized payload from template defaults with legacy content
+    # stored in the "log" section.
+    markdown_value = (markdown or "").strip()
+    if markdown_value:
+        default_sections = deepcopy(template.sections)
+        has_legacy_entries = any(_LEGACY_ENTRY_HEADER_RE.match(line.strip()) for line in markdown_value.splitlines())
+        if has_legacy_entries:
+            for section in default_sections:
+                if section.get("slug") == "log":
+                    existing_content = section.get("content", "")
+                    merged_content = []
+                    if markdown_value:
+                        merged_content.append(markdown_value)
+                    if existing_content:
+                        merged_content.append(existing_content)
+                    section["content"] = "\n\n".join(merged_content)
+                    break
+            return template, default_sections
+    return template, deepcopy(template.sections)
+
+
+def set_daily_note_section(
+    *,
+    note: DailyNote,
+    section_slug: str,
+    content: str,
+    writer: str,
+    seam: str = "journal.daily_note.section.owner",
+) -> tuple[DailyNote, list[dict[str, str]]]:
+    """Update a single section's content in the rendered note."""
+    template, sections = get_or_seed_note_template(
+        tenant=note.tenant,
+        date_value=note.date,
+        markdown=note.markdown,
+    )
+
+    section_slug = section_slug.strip()
+    updated = False
+    for section in sections:
+        if section["slug"] == section_slug:
+            section["content"] = content.strip()
+            updated = True
+            break
+
+    if not updated:
+        # Auto-create the section at the end of the note.
+        new_section = {
+            "slug": section_slug,
+            "title": section_slug.replace("-", " ").title(),
+            "content": content.strip(),
+        }
+        sections.append(new_section)
+
+    note = set_daily_note_sections(
+        note=note,
+        sections=sections,
+        template=template,
+        writer=writer,
+        seam=seam,
+    )
+    return note, sections
+
+
+def set_daily_note_sections(
+    *,
+    note: DailyNote,
+    sections: list[dict],
+    writer: str,
+    template: NoteTemplate | None = None,
+    seam: str = "journal.daily_note.sections.owner",
+) -> DailyNote:
+    if not sections:
+        raise ValidationError("sections cannot be empty.")
+
+    if template is not None:
+        note.template = template
+
+    section_payload: list[dict[str, str]] = []
+    for section in sections:
+        slug = str(section.get("slug") or "").strip()
+        title = str(section.get("title") or "").strip()
+        content = str(section.get("content") or "").strip()
+        if not slug:
+            raise ValidationError("section slug is required")
+        if not title:
+            raise ValidationError("section title is required")
+        section_payload.append(
+            {
+                "slug": slug,
+                "title": title,
+                "content": content,
+            }
+        )
+
+    markdown = materialize_sections_markdown(
+        note_date=note.date,
+        sections=section_payload,
+        template_name=template.name if template is not None else None,
+    )
+    from apps.pii.authoring import author_text
+
+    authored = author_text(
+        note.tenant,
+        markdown,
+        seam=seam,
+        writer=writer,
+        field="markdown",
+        model_label="journal.DailyNote",
+        flag_off_legacy_redaction=False,
+    )
+    note.markdown = authored.text
+    note.pii_receipts = {**(note.pii_receipts or {}), "markdown": authored.receipt}
+    note.save(update_fields=["markdown", "template", "pii_receipts", "updated_at"])
+    return note
+
+
+def append_log_to_note(
+    *,
+    note: DailyNote,
+    content: str,
+    author: str = "agent",
+    time_str: str | None = None,
+) -> DailyNote:
+    """Append a timestamped log entry to the daily note.
+
+    If the note has a section with slug 'log', appends within it.
+    Otherwise appends to the tail of the markdown document.
+    """
+    if not time_str:
+        time_str = tz.now().strftime("%H:%M")
+
+    author_label = _get_persona_name(note.tenant) if author == "agent" else note.tenant.user.display_name
+    entry_block = f"\n\n### {time_str}{format_author_suffix(author_label)}\n{content.strip()}\n"
+
+    # Check if there is a log section we can append within.
+    _, sections = get_or_seed_note_template(
+        tenant=note.tenant,
+        date_value=note.date,
+        markdown=note.markdown,
+    )
+    log_section = next((s for s in sections if s.get("slug") == "log"), None)
+
+    if log_section is not None:
+        log_section["content"] = (log_section.get("content") or "").rstrip() + entry_block
+        note = set_daily_note_sections(
+            note=note,
+            sections=sections,
+            template=note.template,
+            writer="runtime" if author == "agent" else "owner",
+            seam="journal.daily_note.append.runtime" if author == "agent" else "journal.daily_note.append.owner",
+        )
+    else:
+        # Append to the document tail.
+        markdown = (note.markdown or "").rstrip() + entry_block
+        from apps.pii.authoring import author_text
+
+        authored = author_text(
+            note.tenant,
+            markdown,
+            seam="journal.daily_note.append.runtime" if author == "agent" else "journal.daily_note.append.owner",
+            writer="runtime" if author == "agent" else "owner",
+            field="markdown",
+            model_label="journal.DailyNote",
+            flag_off_legacy_redaction=False,
+        )
+        note.markdown = authored.text
+        note.pii_receipts = {**(note.pii_receipts or {}), "markdown": authored.receipt}
+        note.save(update_fields=["markdown", "pii_receipts", "updated_at"])
+
+    return note
+
+
+def upsert_default_daily_note(*, tenant, note_date: date) -> DailyNote:
+    note, _ = DailyNote.objects.get_or_create(tenant=tenant, date=note_date)
+    if note.template_id is None:
+        template = get_default_template(tenant=tenant)
+        if template is None:
+            template = seed_default_templates_for_tenant(tenant=tenant)["template"]
+        note.template = template
+        if not note.markdown:
+            markdown = materialize_sections_markdown(
+                note_date=note.date,
+                sections=_default_template_payload(),
+                template_name=template.name if template is not None else None,
+            )
+            from apps.pii.authoring import author_text
+
+            authored = author_text(
+                tenant,
+                markdown,
+                seam="journal.daily_note.default_body.background",
+                writer="background",
+                field="markdown",
+                model_label="journal.DailyNote",
+            )
+            note.markdown = authored.text
+            note.pii_receipts = {"markdown": authored.receipt}
+            note.save(update_fields=["template", "markdown", "pii_receipts", "updated_at"])
+        else:
+            note.save(update_fields=["template", "updated_at"])
+    return note

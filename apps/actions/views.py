@@ -1,0 +1,416 @@
+"""Action gating API endpoints.
+
+Container → Django endpoints for the confirmation flow:
+- POST /api/v1/internal/runtime/<tenant_id>/gate/request — create a pending action
+- GET  /api/v1/internal/runtime/<tenant_id>/gate/<action_id>/poll — poll for result
+- POST /api/v1/gate/<action_id>/respond — callback from button press (internal)
+"""
+
+from __future__ import annotations
+
+import logging
+from uuid import UUID
+
+from django.db import transaction
+from django.utils import timezone
+from rest_framework import status
+from rest_framework.permissions import AllowAny
+from rest_framework.response import Response
+from rest_framework.views import APIView
+
+from apps.integrations.internal_auth import (
+    InternalAuthError,
+    validate_internal_runtime_request,
+)
+from apps.router.document_write_guard import record_runtime_write_activity
+from apps.tenants.models import Tenant
+
+from .models import (
+    ActionAuditLog,
+    ActionStatus,
+    ActionType,
+    GatePreference,
+    PendingAction,
+)
+
+logger = logging.getLogger(__name__)
+
+
+def _get_tenant_or_error(tenant_id: str):
+    """Resolve tenant by UUID, return (tenant, None) or (None, Response)."""
+    try:
+        tenant = Tenant.objects.get(id=tenant_id)
+        return tenant, None
+    except Tenant.DoesNotExist:
+        return None, Response({"error": "Tenant not found"}, status=status.HTTP_404_NOT_FOUND)
+
+
+def _validate_internal_auth(request, tenant_id: str):
+    """Validate internal runtime auth headers. Returns error Response or None."""
+    try:
+        validate_internal_runtime_request(
+            provided_key=request.headers.get("X-Internal-Key", ""),
+            provided_tenant_id=request.headers.get("X-Tenant-Id", str(tenant_id)),
+            expected_tenant_id=str(tenant_id),
+        )
+        return None
+    except InternalAuthError as e:
+        return Response({"error": str(e)}, status=status.HTTP_403_FORBIDDEN)
+
+
+def _should_auto_approve(tenant: Tenant, action_type: str) -> bool:
+    """Check if this action type should be auto-approved for this tenant."""
+    # Master switch off = auto-approve everything (user acknowledged risk)
+    if not tenant.gate_all_actions and tenant.gate_acknowledged_risk:
+        return True
+
+    # Check per-action-type preference
+    try:
+        pref = GatePreference.objects.get(tenant=tenant, action_type=action_type)
+        return not pref.require_confirmation
+    except GatePreference.DoesNotExist:
+        # Default: require confirmation
+        return False
+
+
+def _is_starter_tier(tenant: Tenant) -> bool:
+    """Check if tenant is on Starter tier (restricted from destructive actions)."""
+    return getattr(tenant, "model_tier", "") == "starter"
+
+
+# This message is relayed by the assistant into whatever channel the user is
+# chatting on — including the iOS app, where App Review Guideline 3.1.1 forbids
+# directing users to an external purchase ("steering"). The gate endpoint can't
+# know the channel, so the copy must be store-safe everywhere: explain the
+# restriction, no upgrade pitch, no billing URL.
+STARTER_BLOCKED_MESSAGE = (
+    "🔒 Destructive actions are not available on the Starter plan.\n\n"
+    "Your agent tried to perform an irreversible action, but this is "
+    "restricted on the Starter plan. Some AI models are more vulnerable "
+    "to prompt injection — where unexpected input tricks the agent into "
+    "doing something you didn't ask for.\n\n"
+    "📖 Learn more about prompt injection:\n"
+    "   https://genai.owasp.org/llmrisk/llm01-prompt-injection/"
+)
+
+
+class GateRequestView(APIView):
+    """POST /api/v1/internal/runtime/<tenant_id>/gate/request
+
+    Called by the agent container to request approval for a destructive action.
+    """
+
+    permission_classes = [AllowAny]
+
+    def post(self, request, tenant_id: UUID):
+        auth_error = _validate_internal_auth(request, str(tenant_id))
+        if auth_error:
+            return auth_error
+
+        tenant, err = _get_tenant_or_error(str(tenant_id))
+        if err:
+            return err
+
+        action_type = request.data.get("action_type", "")
+        payload = request.data.get("payload", {})
+        display_summary = request.data.get("display_summary", "")
+
+        # Validate action_type
+        valid_types = [choice[0] for choice in ActionType.choices]
+        if action_type not in valid_types:
+            return Response(
+                {"error": f"Invalid action_type. Must be one of: {valid_types}"},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        if not display_summary:
+            return Response(
+                {"error": "display_summary is required"},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        # Starter tier: block entirely
+        if _is_starter_tier(tenant):
+            return Response(
+                {
+                    "status": "blocked",
+                    "tier": "starter",
+                    "message": STARTER_BLOCKED_MESSAGE,
+                },
+                status=status.HTTP_403_FORBIDDEN,
+            )
+
+        record_runtime_write_activity(tenant)
+
+        from apps.pii.store_authoring import author_store_fields
+
+        authored, receipts = author_store_fields(
+            tenant,
+            {"action_payload": payload, "display_summary": display_summary},
+            model_label="actions.PendingAction",
+            seam="actions.runtime.gate_request",
+            writer="runtime",
+        )
+        stored_payload = authored["action_payload"]
+        stored_summary = authored["display_summary"]
+
+        # Check if auto-approve is enabled for this action type
+        if _should_auto_approve(tenant, action_type):
+            # Log the auto-approval
+            ActionAuditLog.objects.create(
+                tenant=tenant,
+                action_type=action_type,
+                action_payload=stored_payload,
+                display_summary=stored_summary,
+                pii_receipts=receipts,
+                result=ActionStatus.APPROVED,
+                responded_at=timezone.now(),
+            )
+            return Response(
+                {
+                    "action_id": None,
+                    "status": "approved",
+                    "auto_approved": True,
+                },
+                status=status.HTTP_200_OK,
+            )
+
+        # Create pending action
+        action = PendingAction.objects.create(
+            tenant=tenant,
+            action_type=action_type,
+            action_payload=stored_payload,
+            display_summary=stored_summary,
+            pii_receipts=receipts,
+        )
+
+        # Send confirmation message via user's platform.
+        # delivered=False means no Telegram/LINE channel exists (iOS-only user);
+        # in that case we immediately mark the action EXPIRED and return a clear
+        # "undeliverable" response so the container can surface a real error to
+        # the user instead of polling for 5 minutes only to get "expired".
+        from .messaging import send_gate_confirmation
+
+        delivered = send_gate_confirmation(tenant, action)
+
+        if not delivered:
+            action.status = ActionStatus.EXPIRED
+            action.save(update_fields=["status"])
+            ActionAuditLog.objects.create(
+                tenant=tenant,
+                action_type=action_type,
+                action_payload=action.action_payload,
+                display_summary=action.display_summary,
+                pii_receipts=action.pii_receipts,
+                result=ActionStatus.EXPIRED,
+            )
+            logger.warning(
+                "Gate request undeliverable (no channel): %s | %s",
+                tenant.id,
+                action_type,
+            )
+            return Response(
+                {
+                    "action_id": str(action.id),
+                    "status": "undeliverable",
+                    "reason": "no_channel",
+                    "message": (
+                        "This action requires confirmation via Telegram or LINE, "
+                        "but no messaging channel is linked to your account. "
+                        "Please connect Telegram or LINE to perform this action."
+                    ),
+                },
+                status=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            )
+
+        logger.info(
+            "Gate request created: %s | %s | %s",
+            tenant.id,
+            action_type,
+            stored_summary[:60],
+        )
+
+        return Response(
+            {
+                "action_id": str(action.id),
+                "status": "pending",
+                "expires_at": action.expires_at.isoformat(),
+            },
+            status=status.HTTP_202_ACCEPTED,
+        )
+
+
+class GatePollView(APIView):
+    """GET /api/v1/internal/runtime/<tenant_id>/gate/<action_id>/poll
+
+    Called by the agent container to check if the user has responded.
+    """
+
+    permission_classes = [AllowAny]
+
+    def get(self, request, tenant_id: UUID, action_id: int):
+        auth_error = _validate_internal_auth(request, str(tenant_id))
+        if auth_error:
+            return auth_error
+
+        try:
+            action = PendingAction.objects.get(id=action_id, tenant_id=tenant_id)
+        except PendingAction.DoesNotExist:
+            return Response(
+                {"error": "Action not found"},
+                status=status.HTTP_404_NOT_FOUND,
+            )
+
+        # Check for expiry — use conditional UPDATE so we don't clobber a
+        # concurrent APPROVED/DENIED write from the user's button tap.
+        if action.is_expired:
+            updated = PendingAction.objects.filter(
+                id=action.id,
+                status=ActionStatus.PENDING,
+            ).update(status=ActionStatus.EXPIRED)
+            if updated:
+                action.status = ActionStatus.EXPIRED
+                # Log it
+                ActionAuditLog.objects.create(
+                    tenant_id=tenant_id,
+                    action_type=action.action_type,
+                    action_payload=action.action_payload,
+                    display_summary=action.display_summary,
+                    pii_receipts=action.pii_receipts,
+                    result=ActionStatus.EXPIRED,
+                )
+                # Clear the stale Approve/Deny buttons on the platform confirmation
+                # message, exactly as the user-response paths do. Without this the
+                # buttons linger indefinitely on timeout-expiry and a later tap is a
+                # confusing no-op (GateRespondView returns 410). Never let a
+                # messaging hiccup break the poll response the container needs.
+                try:
+                    from .messaging import update_gate_message
+
+                    update_gate_message(action)
+                except Exception:
+                    logger.warning("Failed to refresh gate message on expiry for action %s", action.id, exc_info=True)
+            else:
+                # Another writer already resolved the row; re-read so the
+                # response below reflects the actual final status.
+                action.refresh_from_db(fields=["status"])
+
+        return Response(
+            {
+                "action_id": action.id,
+                "status": action.status,
+            },
+            status=status.HTTP_200_OK,
+        )
+
+
+class GateRespondView(APIView):
+    """POST /api/v1/gate/<action_id>/respond
+
+    Called internally by the button callback handler (Telegram/LINE).
+    Uses deploy-secret auth since it's triggered by the Django poller itself.
+    """
+
+    permission_classes = [AllowAny]
+
+    def post(self, request, action_id: int):
+        from django.conf import settings as django_settings
+
+        # Auth: deploy-secret (this is called by Django's own poller)
+        deploy_secret = getattr(django_settings, "DEPLOY_SECRET", None)
+        if not deploy_secret:
+            return Response(
+                {"error": "Server not configured for gate responses"},
+                status=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            )
+        provided = request.headers.get("X-Deploy-Secret", "")
+        if provided != deploy_secret:
+            return Response(
+                {"error": "Unauthorized"},
+                status=status.HTTP_403_FORBIDDEN,
+            )
+
+        response_action = request.data.get("action", "")
+        if response_action not in ("approve", "deny"):
+            return Response(
+                {"error": "action must be 'approve' or 'deny'"},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        # Wrap the read-check-write in a single atomic block so select_for_update
+        # holds the row lock from fetch through final save, preventing the sweep
+        # from clobbering an in-flight Approve and vice-versa.
+        with transaction.atomic():
+            try:
+                action = PendingAction.objects.select_for_update().get(id=action_id)
+            except PendingAction.DoesNotExist:
+                return Response(
+                    {"error": "Action not found"},
+                    status=status.HTTP_404_NOT_FOUND,
+                )
+
+            if action.status != ActionStatus.PENDING:
+                return Response(
+                    {
+                        "error": f"Action already resolved: {action.status}",
+                        "status": action.status,
+                    },
+                    status=status.HTTP_409_CONFLICT,
+                )
+
+            # Check expiry — re-evaluated under the row lock so the sweep cannot
+            # write EXPIRED between our status==PENDING check and our own write.
+            if action.is_expired:
+                action.status = ActionStatus.EXPIRED
+                action.save(update_fields=["status"])
+                ActionAuditLog.objects.create(
+                    tenant=action.tenant,
+                    action_type=action.action_type,
+                    action_payload=action.action_payload,
+                    display_summary=action.display_summary,
+                    pii_receipts=action.pii_receipts,
+                    result=ActionStatus.EXPIRED,
+                )
+                return Response(
+                    {"error": "Action expired", "status": "expired"},
+                    status=status.HTTP_410_GONE,
+                )
+
+            # Apply response (still under the row lock)
+            now = timezone.now()
+            if response_action == "approve":
+                action.status = ActionStatus.APPROVED
+            else:
+                action.status = ActionStatus.DENIED
+            action.responded_at = now
+            action.save(update_fields=["status", "responded_at"])
+
+            # Audit log
+            ActionAuditLog.objects.create(
+                tenant=action.tenant,
+                action_type=action.action_type,
+                action_payload=action.action_payload,
+                display_summary=action.display_summary,
+                pii_receipts=action.pii_receipts,
+                result=action.status,
+                responded_at=now,
+            )
+
+        logger.info(
+            "Gate response: %s | %s | %s | %s",
+            action.tenant_id,
+            action.action_type,
+            action.status,
+            action.display_summary[:60],
+        )
+
+        # Edit the confirmation message to show result (outside the atomic block
+        # so a messaging hiccup cannot roll back the committed status change).
+        from .messaging import update_gate_message
+
+        update_gate_message(action)
+
+        return Response(
+            {"status": action.status},
+            status=status.HTTP_200_OK,
+        )

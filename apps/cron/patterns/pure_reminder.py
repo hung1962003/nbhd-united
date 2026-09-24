@@ -1,0 +1,136 @@
+"""`pure_reminder` pattern: send a fixed text at the scheduled time.
+
+The simplest pattern. The agent's role at fire time is reduced to
+"call ``nbhd_send_to_user`` with this exact text and stop." No state
+claims, no fact lookups, no derivation. The verbatim-echo invariant is
+enforced by ``validate_outbound_message`` and by the agent turn's
+``toolsAllow`` being a single-tool allowlist.
+
+There is no native "no-LLM cron" mode in OC 2026.5.7 (confirmed in dist
+inspection). To minimise cost we pin the cheap NON-BYO worker model
+(DeepSeek V4 Flash — see ``_CRON_MODEL``) + ``lightContext: true`` + a
+tightly-bounded ``toolsAllow`` — that's the lowest-cost agent turn the
+runtime supports.
+"""
+
+from __future__ import annotations
+
+from typing import Any
+
+from pydantic import Field
+
+from apps.billing.constants import DEEPSEEK_FLASH_MODEL
+
+from . import register_handler
+from .base import PatternHandler, PatternPayload
+
+# Typed-cron patterns fire a platform-initiated agent turn — pin the cheap
+# NON-BYO worker model (DeepSeek V4 Flash), the same model the heartbeat and the
+# TIER_TASK_DEFAULTS routine crons use. Flash is a member of every tier's
+# agents.defaults.models allowlist (config_generator: HEARTBEAT_MODEL /
+# TIER_MODEL_CONFIGS), so OpenClaw's cron preflight accepts it for starter,
+# higher tiers, and BYO alike. Pin the full "openrouter/…" id (not a bare alias):
+# it's the value the working platform crons already pin and the one that
+# round-trips through preflight, which openrouter-prefixes bare payload models.
+# The old hardcoded "haiku-4.5" sat in no non-BYO allowlist, so preflight
+# rejected the fire-turn before nbhd_send_to_user and no delivery happened.
+_CRON_MODEL = DEEPSEEK_FLASH_MODEL
+
+
+class PureReminderPayload(PatternPayload):
+    """Schema for a pure-reminder cron's typed_payload."""
+
+    text: str = Field(
+        ...,
+        min_length=1,
+        max_length=2000,
+        description="The exact reminder text to send to the user, verbatim.",
+    )
+
+
+_TURN_TIMEOUT_SECONDS = 30
+
+
+class PureReminderHandler(PatternHandler):
+    pattern = "pure_reminder"
+    payload_schema = PureReminderPayload
+
+    def build_oc_data(
+        self,
+        payload: PureReminderPayload,
+        *,
+        tenant: Any,
+        name: str,
+        schedule: dict[str, Any],
+    ) -> dict[str, Any]:
+        text = payload.text.strip()
+
+        # ``message`` is what the agent reads as its prompt at fire time.
+        # The verbatim instruction is constructive (do this) AND prohibitive
+        # (don't do anything else). The toolsAllow + finalize hook make the
+        # prohibition structural; the prose makes it obvious to the model.
+        message = (
+            "You are firing a scheduled reminder. Call `nbhd_send_to_user` "
+            "exactly once with the verbatim text below — no additions, no "
+            "paraphrasing, no narration, no follow-up message. After the "
+            "tool call completes, stop.\n\n"
+            f"VERBATIM TEXT TO SEND:\n{text}"
+        )
+
+        return {
+            "name": name,
+            "schedule": schedule,
+            "sessionTarget": "isolated",
+            "wakeMode": "next-heartbeat",
+            "payload": {
+                "kind": "agentTurn",
+                "message": message,
+                "model": _CRON_MODEL,
+                "lightContext": True,
+                "toolsAllow": self.get_tools_allow(payload),
+                "timeoutSeconds": _TURN_TIMEOUT_SECONDS,
+            },
+            "delivery": {"mode": "none"},
+            "enabled": True,
+        }
+
+    def get_tools_allow(self, payload: PureReminderPayload) -> list[str]:
+        return ["nbhd_send_to_user"]
+
+    def get_outbound_contract(
+        self,
+        payload: PureReminderPayload,
+        *,
+        name: str,
+    ) -> dict[str, Any]:
+        text = payload.text.strip()
+        return {
+            "check": {"kind": "contains", "text": text},
+            "on_fail": {"action": "rewrite", "content": text},
+        }
+
+    def validate_outbound_message(
+        self,
+        content: str,
+        payload: PureReminderPayload,
+    ) -> tuple[bool, str | None]:
+        expected = payload.text.strip()
+        actual = (content or "").strip()
+        if not expected:
+            # Empty expected text — vacuously pass; payload validation would
+            # have rejected this at construction time anyway.
+            return True, None
+        if expected == actual:
+            return True, None
+        # Allow the model a tiny degree of slack: the expected text appears
+        # verbatim somewhere in the output (e.g. wrapped in quotes). This
+        # tolerance is intentionally narrow — we accept exact-match-or-
+        # substring, not paraphrase.
+        if expected in actual:
+            return True, None
+        return False, (
+            f"Outbound message must contain the verbatim reminder text. Expected: {expected!r}. Got: {actual[:200]!r}"
+        )
+
+
+register_handler(PureReminderHandler())

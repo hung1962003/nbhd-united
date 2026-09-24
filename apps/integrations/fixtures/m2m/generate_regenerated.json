@@ -1,0 +1,17 @@
+{
+  "body": {
+    "job_id": "00000000-0000-0000-0000-000000000090",
+    "regeneration": {
+      "mode": "fill_gaps_and_replace_listed_slots",
+      "replace_slots": [
+        {
+          "day": "Monday",
+          "meal_type": "Dinner"
+        }
+      ],
+      "requested": true
+    },
+    "status_url": "http://testserver/api/m2m/generation-jobs/00000000-0000-0000-0000-000000000090/"
+  },
+  "status_code": 202
+}

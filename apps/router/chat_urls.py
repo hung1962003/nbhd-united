@@ -1,0 +1,52 @@
+"""URL routes for the rich-client (iOS/web) chat ingress.
+
+Mounted at ``/api/v1/chat/`` (see ``config/urls.py``).
+"""
+
+from django.urls import path
+
+from apps.router.chat_views import (
+    ChatContextView,
+    ChatLocalTurnView,
+    ChatMessageDetailView,
+    ChatMessageView,
+    ChatReadView,
+    ChatThreadDetailView,
+    ChatThreadListView,
+    ChatThreadMessagesView,
+    ChatThreadSetMainView,
+    TranscriptionVocabView,
+)
+
+urlpatterns = [
+    path("messages/", ChatMessageView.as_view(), name="chat-message-create"),
+    path("read/", ChatReadView.as_view(), name="chat-read"),
+    path("context/", ChatContextView.as_view(), name="chat-context"),
+    path("turns/", ChatLocalTurnView.as_view(), name="chat-local-turn"),
+    path(
+        "transcription-vocab/",
+        TranscriptionVocabView.as_view(),
+        name="chat-transcription-vocab",
+    ),
+    path(
+        "messages/<str:client_msg_id>/",
+        ChatMessageDetailView.as_view(),
+        name="chat-message-detail",
+    ),
+    path("threads/", ChatThreadListView.as_view(), name="chat-thread-list"),
+    path(
+        "threads/<uuid:thread_id>/",
+        ChatThreadDetailView.as_view(),
+        name="chat-thread-detail",
+    ),
+    path(
+        "threads/<uuid:thread_id>/set-main/",
+        ChatThreadSetMainView.as_view(),
+        name="chat-thread-set-main",
+    ),
+    path(
+        "threads/<uuid:thread_id>/messages/",
+        ChatThreadMessagesView.as_view(),
+        name="chat-thread-messages",
+    ),
+]

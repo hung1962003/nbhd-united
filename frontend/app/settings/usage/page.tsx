@@ -1,0 +1,351 @@
+"use client";
+
+import Link from "next/link";
+import { useState } from "react";
+import { PlatformShareInfo } from "@/components/platform-share-info";
+import { SectionCard } from "@/components/section-card";
+import { SectionCardSkeleton, StatCardSkeleton } from "@/components/skeleton";
+import { StatCard } from "@/components/stat-card";
+import { useTenantQuery, useTransparencyQuery, useUsageHistoryQuery, useUsageSummaryQuery } from "@/lib/queries";
+
+const USAGE_HISTORY_PREVIEW = 5;
+
+export default function SettingsUsagePage() {
+  const { data: tenant, isLoading } = useTenantQuery();
+  const { data: usageData, isLoading: usageLoading } = useUsageHistoryQuery();
+  const { data: usageSummary, isLoading: summaryLoading } = useUsageSummaryQuery();
+  const { data: transparency, isLoading: transparencyLoading } = useTransparencyQuery();
+
+  const budgetUsage = usageSummary?.budget;
+  const costUsed = budgetUsage?.tenant_cost_used ?? Number(tenant?.estimated_cost_this_month ?? 0);
+  const costBudget = budgetUsage?.tenant_cost_budget ?? 0;
+  const budgetPct = costBudget > 0 ? Math.min(100, Math.round((costUsed / costBudget) * 100)) : 0;
+  const isOverQuota = costUsed >= costBudget && costBudget > 0;
+  const costRemaining = Math.max(0, costBudget - costUsed);
+  const modelBreakdown = usageSummary?.by_model ?? [];
+
+  // "True monthly cost" = AI usage + fully-loaded infrastructure — a separate
+  // figure from the AI-usage allowance that drives the budget bar above.
+  const aiUsageCost = usageSummary?.total_cost ?? Number(tenant?.estimated_cost_this_month ?? 0);
+  const llmCost = usageSummary?.llm_cost ?? aiUsageCost;
+  const infraCost = usageSummary?.infra_cost ?? 0;
+  const trueMonthlyCost = usageSummary?.true_total_cost ?? llmCost + infraCost;
+  const infraIsActual = usageSummary?.infra_source === "azure";
+
+  const [showAllUsage, setShowAllUsage] = useState(false);
+
+  const aiActualCost = transparency?.your_actual_cost ?? 0;
+  const platformCost = transparency?.platform_infra ?? 0;
+  const donationAmount = transparency?.donation_amount ?? 0;
+
+  const splitTotal = Math.max(aiActualCost + platformCost + donationAmount, 0.01);
+  const aiPercent = Math.min(100, (aiActualCost / splitTotal) * 100);
+  const donationPercent = (donationAmount / splitTotal) * 100;
+  const platformPercent = 100 - aiPercent - donationPercent;
+
+  if (isLoading || summaryLoading || transparencyLoading) {
+    return (
+      <div className="space-y-4">
+        <SectionCard title="Usage" subtitle="Monthly cost and message burn for your tenant runtime">
+          <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-4">
+            <StatCardSkeleton />
+            <StatCardSkeleton />
+            <StatCardSkeleton />
+            <StatCardSkeleton />
+          </div>
+        </SectionCard>
+      </div>
+    );
+  }
+
+  return (
+    <div className="space-y-4">
+      <SectionCard title="Usage" subtitle="Monthly token and message burn for your tenant runtime">
+        {tenant ? (
+          <div className="space-y-4">
+            <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-4">
+              <StatCard label="Messages Today" value={tenant.messages_today.toLocaleString()} />
+              <StatCard label="Messages This Month" value={tenant.messages_this_month.toLocaleString()} />
+              <StatCard
+                label="AI Usage This Month"
+                value={`$${aiUsageCost.toFixed(2)}`}
+                tone="signal"
+                hint="Counts toward your monthly allowance"
+              />
+              <article className="glass-card rounded-xl border-t-2 border-accent/30 p-5 transition-transform duration-300 hover:scale-[1.02] hover:shadow-[0_0_20px_rgba(124,107,240,0.1)]">
+                <div className="flex items-center justify-between gap-2">
+                  <p className="text-xs font-medium uppercase tracking-[0.12em] text-ink-faint">True Monthly Cost</p>
+                  <div className="flex items-center gap-1">
+                    {infraCost > 0 &&
+                      (infraIsActual ? (
+                        <span className="rounded bg-emerald-500/10 px-1.5 py-0.5 text-[10px] font-medium text-emerald-700 dark:text-emerald-400">
+                          actual
+                        </span>
+                      ) : (
+                        <span className="rounded bg-amber-500/10 px-1.5 py-0.5 text-[10px] font-medium text-amber-700 dark:text-amber-400">
+                          estimate
+                        </span>
+                      ))}
+                    <PlatformShareInfo amount={usageSummary?.infra_breakdown?.platform_share} variant="icon" />
+                  </div>
+                </div>
+                <p className="mt-2 font-headline text-2xl font-bold text-ink">${trueMonthlyCost.toFixed(2)}</p>
+                <p className="mt-2 text-xs text-ink-muted">
+                  AI ${llmCost.toFixed(2)} + infrastructure ${infraCost.toFixed(2)}
+                </p>
+              </article>
+            </div>
+            {isOverQuota && (
+              <div className="rounded-panel border border-signal/30 bg-signal-faint p-4 text-sm text-ink">
+                <p className="font-medium">Monthly quota reached.</p>
+                <p className="mt-2 text-ink-muted">
+                  You&apos;ve used your full monthly budget. Upgrade your plan or wait until next month.
+                </p>
+                <Link href="/settings/billing" className="mt-3 inline-flex underline">
+                  Go to Billing
+                </Link>
+              </div>
+            )}
+
+            <article className="rounded-panel border border-border bg-surface-elevated p-4">
+              <div className="flex items-center justify-between gap-2 text-sm">
+                <p className="font-medium">AI usage allowance</p>
+                <p className="font-mono text-xs tracking-[0.1em] text-ink-muted">
+                  ${costUsed.toFixed(2)} / ${costBudget.toFixed(2)}
+                </p>
+              </div>
+
+              <div className="mt-3 h-3 overflow-hidden rounded-full bg-border">
+                <div
+                  className="h-full rounded-full bg-gradient-to-r from-accent to-signal"
+                  style={{ width: `${budgetPct}%` }}
+                />
+              </div>
+              <p className="mt-2 text-xs text-ink-muted">
+                {budgetPct}% of your monthly AI usage allowance used.{" "}
+                {costRemaining > 0
+                  ? `$${costRemaining.toFixed(2)} remaining this month.`
+                  : "Nothing remaining this month."}
+              </p>
+            </article>
+          </div>
+        ) : (
+          <p className="text-sm text-ink-muted">No usage data available yet.</p>
+        )}
+      </SectionCard>
+
+      <SectionCard title="Usage by Model" subtitle="Model-level usage this month">
+        {modelBreakdown.length > 0 ? (
+          <div className="overflow-x-auto">
+            <table className="w-full text-sm">
+              <thead>
+                <tr className="border-b border-border">
+                  <th className="pb-2 pr-4 text-left font-mono text-[11px] uppercase tracking-[0.14em] text-ink-muted">Model</th>
+                  <th className="pb-2 pr-4 text-right font-mono text-[11px] uppercase tracking-[0.14em] text-ink-muted">Inputs</th>
+                  <th className="pb-2 pr-4 text-right font-mono text-[11px] uppercase tracking-[0.14em] text-ink-muted">Outputs</th>
+                  <th className="pb-2 pr-4 text-right font-mono text-[11px] uppercase tracking-[0.14em] text-ink-muted">Calls</th>
+                  <th className="pb-2 text-right font-mono text-[11px] uppercase tracking-[0.14em] text-ink-muted">Cost</th>
+                </tr>
+              </thead>
+              <tbody>
+                {modelBreakdown.map((entry) => (
+                  <tr key={entry.model} className="border-b border-border">
+                    <td className="py-2 pr-4 text-ink-muted">
+                      {entry.display_name || entry.model}
+                    </td>
+                    <td className="py-2 pr-4 text-right text-ink-muted">{entry.input_tokens.toLocaleString()}</td>
+                    <td className="py-2 pr-4 text-right text-ink-muted">{entry.output_tokens.toLocaleString()}</td>
+                    <td className="py-2 pr-4 text-right text-ink-muted">{entry.count}</td>
+                    <td className="py-2 text-right text-ink-muted">${entry.cost.toFixed(4)}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        ) : (
+          <p className="text-sm text-ink-muted">No usage by model yet.</p>
+        )}
+      </SectionCard>
+
+      <SectionCard title="Usage History" subtitle="Recent API usage records">
+        {usageLoading ? (
+          <SectionCardSkeleton lines={5} />
+        ) : usageData?.results && usageData.results.length > 0 ? (
+          <div>
+            <div className="overflow-x-auto">
+              <table className="w-full text-sm">
+                <thead>
+                  <tr className="border-b border-border">
+                    <th className="pb-2 pr-4 text-left font-mono text-[11px] uppercase tracking-[0.14em] text-ink-muted">Date</th>
+                    <th className="pb-2 pr-4 text-left font-mono text-[11px] uppercase tracking-[0.14em] text-ink-muted">Event Type</th>
+                    <th className="pb-2 pr-4 text-left font-mono text-[11px] uppercase tracking-[0.14em] text-ink-muted">Model</th>
+                    <th className="pb-2 pr-4 text-right font-mono text-[11px] uppercase tracking-[0.14em] text-ink-muted">Tokens</th>
+                    <th className="pb-2 text-right font-mono text-[11px] uppercase tracking-[0.14em] text-ink-muted">Cost</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {(showAllUsage ? usageData.results : usageData.results.slice(0, USAGE_HISTORY_PREVIEW)).map((record) => (
+                    <tr key={record.id} className="border-b border-border">
+                      <td className="py-2 pr-4 text-ink-muted">
+                        {new Date(record.created_at).toLocaleDateString()}
+                      </td>
+                      <td className="py-2 pr-4 text-ink-muted">{record.event_type}</td>
+                      <td className="py-2 pr-4 text-ink-muted">{record.model_used || "-"}</td>
+                      <td className="py-2 pr-4 text-right font-mono text-ink-muted">
+                        {(record.input_tokens + record.output_tokens).toLocaleString()}
+                      </td>
+                      <td className="py-2 text-right font-mono text-ink-muted">
+                        ${Number(record.cost_estimate).toFixed(4)}
+                      </td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+            {usageData.results.length > USAGE_HISTORY_PREVIEW && (
+              <button
+                type="button"
+                onClick={() => setShowAllUsage((prev) => !prev)}
+                className="mt-3 text-sm text-accent hover:underline"
+              >
+                {showAllUsage
+                  ? "Show less"
+                  : `Show all ${usageData.results.length} records`}
+              </button>
+            )}
+          </div>
+        ) : (
+          <p className="text-sm text-ink-muted">No usage records yet.</p>
+        )}
+      </SectionCard>
+
+      <SectionCard title="Where Your Money Goes" subtitle="Actual costs behind your service">
+        <div className="space-y-4">
+          <div className="grid gap-3 md:grid-cols-3">
+            <StatCard label="AI Model Usage" value={`$${aiActualCost.toFixed(2)}`} tone="accent" hint="Actual cost this month" />
+            <StatCard
+              label="Platform Infrastructure"
+              value={`$${platformCost.toFixed(2)}`}
+              hint="Monthly estimate"
+            />
+            <StatCard
+              label="Community Impact"
+              value={`$${donationAmount.toFixed(2)}`}
+              tone="signal"
+              hint={donationAmount > 0 ? "Funded from your subscription" : "—"}
+            />
+          </div>
+
+          <article className="rounded-panel border border-border bg-surface-elevated p-4">
+            <div className="flex flex-wrap items-center justify-between gap-2">
+              <p className="font-medium">Monthly cost split</p>
+              <p className="text-xs font-mono text-ink-muted">
+                {transparency?.period.start} → {transparency?.period.end}
+              </p>
+            </div>
+
+            <div className="mt-3 flex h-3 overflow-hidden rounded-full border border-border bg-border">
+              <div className="h-full rounded-l-full bg-accent" style={{ width: `${aiPercent}%` }} />
+              <div
+                className={`h-full bg-slate-400 ${donationAmount <= 0 ? "rounded-r-full" : ""}`}
+                style={{ width: `${platformPercent}%` }}
+              />
+              {donationAmount > 0 && (
+                <div
+                  className="h-full rounded-r-full bg-emerald-500"
+                  style={{ width: `${donationPercent}%` }}
+                />
+              )}
+            </div>
+
+            <div className="mt-3 grid gap-2 sm:grid-cols-3 text-xs text-ink-muted">
+              <div className="flex items-center justify-between rounded-panel border border-accent/25 bg-accent/8 p-2">
+                <div className="flex items-center gap-2">
+                  <span className="h-2 w-2 rounded-full bg-accent" />
+                  <span>AI Model Usage</span>
+                </div>
+                <span className="font-mono">${aiActualCost.toFixed(2)}</span>
+              </div>
+              <div className="flex items-center justify-between rounded-panel border border-slate-400/25 bg-slate-400/8 p-2">
+                <div className="flex items-center gap-2">
+                  <span className="h-2 w-2 rounded-full bg-slate-400" />
+                  <span>Platform Infrastructure</span>
+                </div>
+                <span className="font-mono">${platformCost.toFixed(2)}</span>
+              </div>
+              <div className="flex items-center justify-between rounded-panel border border-emerald-500/25 bg-emerald-500/8 p-2">
+                <div className="flex items-center gap-2">
+                  <span className="h-2 w-2 rounded-full bg-emerald-500" />
+                  <span>Community Impact</span>
+                </div>
+                <span className="font-mono">${donationAmount.toFixed(2)}</span>
+              </div>
+            </div>
+
+            {transparency ? (
+              <>
+                <p className="mt-3 text-sm leading-relaxed text-ink-muted">{transparency.explanation}</p>
+
+                <p className="mt-2 text-xs text-ink-muted">
+                  Infrastructure{" "}
+                  {transparency.infra_breakdown.source === "azure" ? (
+                    <span className="rounded bg-emerald-500/10 px-1 py-0.5 text-emerald-700 dark:text-emerald-400">actual</span>
+                  ) : (
+                    <span className="rounded bg-amber-500/10 px-1 py-0.5 text-amber-700 dark:text-amber-400">estimate</span>
+                  )}
+                  : container ${transparency.infra_breakdown.container.toFixed(2)} •
+                  database ${transparency.infra_breakdown.database_share.toFixed(2)} •
+                  storage ${transparency.infra_breakdown.storage_share.toFixed(2)} •
+                  platform share ${transparency.infra_breakdown.platform_share.toFixed(2)}
+                  <PlatformShareInfo amount={transparency.infra_breakdown.platform_share} variant="inline" />
+                  {" • total "}
+                  ${transparency.infra_breakdown.total.toFixed(2)}
+                </p>
+
+                <details className="mt-4 rounded-panel border border-border bg-surface p-3">
+                  <summary className="cursor-pointer select-none text-sm font-medium text-ink">Model pricing</summary>
+                  <div className="mt-3 overflow-x-auto">
+                    <table className="w-full text-xs">
+                      <thead>
+                        <tr className="border-b border-border text-left text-ink-muted">
+                          <th className="pb-2 pr-4 font-mono uppercase tracking-[0.14em]">Model</th>
+                          <th className="pb-2 pr-4 font-mono uppercase tracking-[0.14em]">Input / 1M</th>
+                          <th className="pb-2 font-mono uppercase tracking-[0.14em]">Output / 1M</th>
+                        </tr>
+                      </thead>
+                      <tbody>
+                        {transparency.model_rates.map((rate) => (
+                          <tr key={rate.model} className="border-b border-border/60">
+                            <td className="py-2 pr-4 text-ink">{rate.display_name}</td>
+                            <td className="py-2 pr-4 font-mono text-ink-muted">${rate.input_per_million.toFixed(2)}</td>
+                            <td className="py-2 font-mono text-ink-muted">${rate.output_per_million.toFixed(2)}</td>
+                          </tr>
+                        ))}
+                      </tbody>
+                    </table>
+                  </div>
+                </details>
+              </>
+            ) : (
+              <p className="mt-3 text-sm text-ink-muted">Transparency data unavailable.</p>
+            )}
+          </article>
+
+          <article className="rounded-panel border border-emerald-500/25 bg-emerald-500/5 p-4">
+            <p className="font-medium">Community giving</p>
+            <p className="mt-1 text-sm text-ink-muted">
+              A portion of NBHD United&apos;s proceeds supports local food initiatives.
+            </p>
+            {donationAmount > 0 && (
+              <p className="mt-3 text-sm text-ink-muted">
+                This month,{" "}
+                <span className="font-mono text-emerald-700 dark:text-emerald-400">${donationAmount.toFixed(2)}</span>{" "}
+                of your subscription is earmarked for the local food initiatives NBHD United supports.
+              </p>
+            )}
+          </article>
+        </div>
+      </SectionCard>
+    </div>
+  );
+}

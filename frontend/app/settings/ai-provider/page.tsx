@@ -1,0 +1,295 @@
+"use client";
+
+import clsx from "clsx";
+import { useMemo, useState } from "react";
+
+import { BYOProviderCard } from "@/components/byo/byo-provider-card";
+import { ConnectAnthropicModal } from "@/components/byo/connect-anthropic-modal";
+import { DisconnectModal } from "@/components/byo/disconnect-modal";
+import { IntelligenceMeter } from "@/components/intelligence-meter";
+import { SectionCard } from "@/components/section-card";
+import { SectionCardSkeleton } from "@/components/skeleton";
+import { ACTIVE_MODELS, DEFAULT_MODEL, MODELS, type ModelUI } from "@/lib/models";
+import {
+  useByoCredentialsQuery,
+  usePreferredModelMutation,
+  useTaskModelPreferencesMutation,
+  useTenantQuery,
+} from "@/lib/queries";
+import type { BYOCredential } from "@/lib/types";
+
+const SCHEDULED_TASKS = [
+  { slug: "morning_briefing", label: "Morning Briefing" },
+  { slug: "evening_checkin", label: "Evening Check-in" },
+  { slug: "week_review", label: "Week Ahead Review" },
+  { slug: "background_tasks", label: "Background Tasks" },
+  { slug: "heartbeat", label: "Heartbeat Check-in" },
+] as const;
+
+type OpenModal = null | "connect-anthropic" | "disconnect-anthropic";
+
+function findCred(
+  creds: BYOCredential[] | undefined,
+  provider: "anthropic" | "openai",
+): BYOCredential | undefined {
+  return creds?.find((c) => c.provider === provider);
+}
+
+function isModelAvailable(
+  model: ModelUI,
+  anthropicCred: BYOCredential | undefined,
+): boolean {
+  if (!model.requires) return true;
+  if (model.requires === "byo-anthropic") {
+    return Boolean(
+      anthropicCred && (anthropicCred.status === "verified" || anthropicCred.status === "pending"),
+    );
+  }
+  // future: byo-openai
+  return false;
+}
+
+export default function AIProviderPage() {
+  const { data: tenant, isLoading: tenantLoading } = useTenantQuery();
+  const byoEnabled = Boolean(tenant?.byo_models_enabled);
+  const { data: byoCreds } = useByoCredentialsQuery();
+  const preferredModelMutation = usePreferredModelMutation();
+  const taskModelMutation = useTaskModelPreferencesMutation();
+
+  const [openModal, setOpenModal] = useState<OpenModal>(null);
+
+  const anthropicCred = useMemo(() => findCred(byoCreds, "anthropic"), [byoCreds]);
+  const openaiCred = useMemo(() => findCred(byoCreds, "openai"), [byoCreds]);
+
+  const offer = tenant?.free_model_offer;
+  const offerActive = Boolean(offer?.active);
+
+  // The model actually in effect — the rolling free-offer default included.
+  // Prefer the server-computed `effective_model` so the Active badge lands on
+  // the real model when the user hasn't explicitly picked one.
+  const activeModel = tenant?.effective_model || tenant?.preferred_model || DEFAULT_MODEL;
+  // The model the running container is actually serving (stamped after a
+  // successful apply by apply_single_tenant_config_task). When it diverges from
+  // `activeModel`, a picker change is in flight — render the "Switching…" badge
+  // instead of "Active" so the UI stops lying. Falls back to activeModel for
+  // rolling-default tenants (preferred_model "", so applied_model is "" too).
+  const appliedModel = tenant?.applied_model || activeModel;
+
+  // Limited-time promo cards only render while the server reports the offer live.
+  const visibleModels = useMemo(
+    () => MODELS.filter((m) => !m.limitedTimeOffer || offerActive),
+    [offerActive],
+  );
+
+  const fallbackModelName = useMemo(() => {
+    const m = ACTIVE_MODELS.find((x) => x.model_id === DEFAULT_MODEL);
+    return m?.name ?? "DeepSeek V4 Pro";
+  }, []);
+
+  const handleSelectModel = async (model: ModelUI) => {
+    if (model.comingSoon || preferredModelMutation.isPending) return;
+    if (!isModelAvailable(model, anthropicCred)) {
+      // Model gated on BYO Anthropic — open the connect modal instead.
+      if (model.requires === "byo-anthropic") setOpenModal("connect-anthropic");
+      return;
+    }
+    await preferredModelMutation.mutateAsync(model.model_id);
+  };
+
+  if (tenantLoading) {
+    return (
+      <div className="space-y-4">
+        <SectionCardSkeleton lines={5} />
+      </div>
+    );
+  }
+
+  return (
+    <div className="space-y-4">
+      {byoEnabled ? (
+        <SectionCard
+          title="Use your own subscription"
+          subtitle="Connect your Anthropic or OpenAI account. Inference routes through your account — billed via the provider's pay-as-you-go credits (Claude.ai extra usage / OpenAI Codex), not your platform plan."
+        >
+          <div className="grid gap-3 sm:grid-cols-2 sm:gap-4">
+            <BYOProviderCard
+              provider="anthropic"
+              cred={anthropicCred}
+              onConnect={() => setOpenModal("connect-anthropic")}
+              onDisconnect={() => setOpenModal("disconnect-anthropic")}
+            />
+            <BYOProviderCard
+              provider="openai"
+              cred={openaiCred}
+              onConnect={() => {
+                /* OpenAI not yet supported */
+              }}
+              onDisconnect={() => {
+                /* unreachable */
+              }}
+              disabled
+            />
+          </div>
+        </SectionCard>
+      ) : null}
+
+      <SectionCard title="AI Provider" subtitle="Choose your default model">
+        <div className="space-y-4">
+          {offerActive && offer ? (
+            <div className="rounded-panel border-2 border-accent bg-accent/5 p-4">
+              <p className="text-sm font-medium text-ink">
+                ✨ Limited-time: {offer.display_name} is free right now
+              </p>
+              <p className="mt-1 text-xs text-ink-muted">
+                It&apos;s set as your default while the offer lasts. If it becomes unavailable, your
+                assistant switches back to {offer.fallback_display_name} automatically — nothing for
+                you to do. You can pick any model below at any time.
+              </p>
+            </div>
+          ) : null}
+          <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-3">
+            {visibleModels.map((model) => {
+              const available = isModelAvailable(model, anthropicCred);
+              const isSelected = activeModel === model.model_id;
+              const isApplied = appliedModel === model.model_id;
+              const isPending = isSelected && !isApplied && available && !model.comingSoon;
+              const isActive = isSelected && isApplied && available && !model.comingSoon;
+              const requiresLabel =
+                model.requires === "byo-anthropic" ? "Requires Anthropic connect" : "";
+
+              return (
+                <button
+                  key={model.model_id}
+                  type="button"
+                  onClick={() => void handleSelectModel(model)}
+                  disabled={model.comingSoon || preferredModelMutation.isPending}
+                  className={clsx(
+                    "rounded-panel border-2 p-4 text-left transition",
+                    model.comingSoon
+                      ? "border-border bg-surface-elevated opacity-55 cursor-not-allowed"
+                      : !available
+                        ? "border-dashed border-border bg-surface-elevated/60 hover:border-accent/40"
+                        : isActive
+                          ? "border-accent bg-accent/5"
+                          : isPending
+                            ? "border-amber-border bg-amber-bg/50"
+                            : "border-border hover:border-accent/40",
+                    !model.comingSoon && preferredModelMutation.isPending && "opacity-60",
+                  )}
+                  aria-label={
+                    !available ? `${model.name} — connect Anthropic to enable` : model.name
+                  }
+                >
+                  <div className="flex items-center justify-between gap-2">
+                    <p className="font-medium text-ink">{model.name}</p>
+                    {model.comingSoon ? (
+                      <span className="rounded-full bg-amber-bg border border-amber-border px-2 py-0.5 text-xs font-medium text-amber-text">
+                        Coming Soon
+                      </span>
+                    ) : !available ? (
+                      <span className="rounded-full border border-border bg-surface px-2 py-0.5 text-xs font-medium text-ink-faint">
+                        Locked
+                      </span>
+                    ) : isPending ? (
+                      <span
+                        aria-live="polite"
+                        className="inline-flex items-center gap-1.5 rounded-full bg-amber-bg border border-amber-border px-2 py-0.5 text-xs font-medium text-amber-text"
+                      >
+                        <span
+                          className="h-1.5 w-1.5 rounded-full bg-amber-text animate-pulse"
+                          aria-hidden
+                        />
+                        Switching…
+                      </span>
+                    ) : isActive ? (
+                      <span className="rounded-full bg-accent/10 px-2 py-0.5 text-xs font-medium text-accent">
+                        Active
+                      </span>
+                    ) : model.free ? (
+                      <span className="rounded-full bg-accent/10 border border-accent px-2 py-0.5 text-xs font-medium text-accent">
+                        Free
+                      </span>
+                    ) : null}
+                  </div>
+                  <div className="mt-2">
+                    <IntelligenceMeter level={model.intelligence} compact />
+                  </div>
+                  <p className="mt-2 text-xs text-ink-muted">{model.tagline}</p>
+                  {model.requires === "byo-anthropic" && !available ? (
+                    <p className="mt-1 text-xs text-accent">Connect Anthropic to enable →</p>
+                  ) : model.free ? (
+                    <p className="mt-1 font-mono text-xs text-accent">Free — no token cost</p>
+                  ) : (
+                    <p className="mt-1 font-mono text-xs text-ink-muted">
+                      {model.input_rate === 0 && model.output_rate === 0
+                        ? "Pay your provider directly"
+                        : `$${model.input_rate}/1M in · $${model.output_rate}/1M out`}
+                    </p>
+                  )}
+                  {!available && requiresLabel ? (
+                    <p className="sr-only">{requiresLabel}</p>
+                  ) : null}
+                </button>
+              );
+            })}
+          </div>
+
+          <p className="text-xs text-ink-muted">
+            Tap a card to switch your default model. A lighter model stretches your monthly budget further.
+          </p>
+        </div>
+      </SectionCard>
+
+      {/* Per-Task Model Selection */}
+      <SectionCard title="Scheduled Task Models" subtitle="Choose which model runs each background task">
+        <div className="space-y-3">
+          {SCHEDULED_TASKS.map((task) => {
+            const currentPref =
+              (tenant?.task_model_preferences as Record<string, string> | undefined)?.[task.slug] || "";
+            const defaultName =
+              ACTIVE_MODELS.find((m) => m.model_id === activeModel)?.name ?? "default";
+            return (
+              <div
+                key={task.slug}
+                className="flex flex-col gap-2 rounded-panel border border-border p-3 sm:flex-row sm:items-center sm:justify-between"
+              >
+                <p className="text-sm font-medium text-ink">{task.label}</p>
+                <select
+                  value={currentPref}
+                  onChange={(e) => {
+                    void taskModelMutation.mutateAsync({ [task.slug]: e.target.value });
+                  }}
+                  disabled={taskModelMutation.isPending}
+                  className="rounded-panel border border-border bg-surface px-3 py-1.5 text-sm text-ink focus:border-accent focus:outline-none focus:ring-1 focus:ring-accent min-h-[36px]"
+                >
+                  <option value="">Use default ({defaultName})</option>
+                  {ACTIVE_MODELS.filter(
+                    (m) => isModelAvailable(m, anthropicCred) && (!m.limitedTimeOffer || offerActive),
+                  ).map((m) => (
+                    <option key={m.model_id} value={m.model_id}>
+                      {m.name}
+                    </option>
+                  ))}
+                </select>
+              </div>
+            );
+          })}
+          <p className="text-xs text-ink-muted">
+            Use a lighter model for routine tasks to stretch your budget. Changes apply within ~30 seconds.
+          </p>
+        </div>
+      </SectionCard>
+
+      <ConnectAnthropicModal
+        open={openModal === "connect-anthropic"}
+        onClose={() => setOpenModal(null)}
+      />
+      <DisconnectModal
+        open={openModal === "disconnect-anthropic"}
+        cred={anthropicCred}
+        fallbackModelName={fallbackModelName}
+        onClose={() => setOpenModal(null)}
+      />
+    </div>
+  );
+}

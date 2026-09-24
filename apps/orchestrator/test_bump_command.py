@@ -1,0 +1,164 @@
+"""Tests for bump_openclaw_version management command."""
+
+from unittest.mock import patch
+
+from django.core.management import call_command
+from django.test import TestCase
+
+from apps.orchestrator.tool_policy import OPENCLAW_CURRENT_VERSION
+from apps.tenants.models import Tenant
+from apps.tenants.services import create_tenant
+
+# Synthetic future version — clearly ahead of OPENCLAW_CURRENT_VERSION so the
+# bump command always has work to do regardless of the real fleet version.
+_BUMP_TARGET = "2026.99.0"
+_BUMP_IMAGE = "openclaw-2026.99.0"
+
+
+class BumpOpenclawVersionTest(TestCase):
+    def setUp(self):
+        self.tenant = create_tenant(
+            display_name="Bump Test",
+            telegram_chat_id=111222333,
+        )
+        self.tenant.status = Tenant.Status.ACTIVE
+        self.tenant.container_id = "oc-bump-test"
+        self.tenant.container_fqdn = "oc-bump-test.internal"
+        self.tenant.openclaw_version = OPENCLAW_CURRENT_VERSION
+        self.tenant.save()
+
+    @patch("apps.orchestrator.services.update_container_image")
+    @patch("apps.orchestrator.services.update_tenant_config")
+    @patch("apps.orchestrator.services.download_config_from_file_share", return_value=None)
+    @patch("apps.orchestrator.services.upload_config_to_file_share")
+    def test_bump_single_tenant_updates_version_config_image(self, mock_upload, mock_download, mock_config, mock_image):
+        call_command(
+            "bump_openclaw_version",
+            oc_version=_BUMP_TARGET,
+            tenant=str(self.tenant.id),
+            image_tag=_BUMP_IMAGE,
+        )
+        self.tenant.refresh_from_db()
+        self.assertEqual(self.tenant.openclaw_version, _BUMP_TARGET)
+        self.assertEqual(self.tenant.container_image_tag, _BUMP_IMAGE)
+        mock_config.assert_called_once_with(str(self.tenant.id))
+        mock_image.assert_called_once()
+
+    @patch("apps.orchestrator.services.update_container_image")
+    @patch("apps.orchestrator.services.update_tenant_config")
+    @patch("apps.orchestrator.services.download_config_from_file_share", return_value=None)
+    @patch("apps.orchestrator.services.upload_config_to_file_share")
+    def test_bump_all_skips_already_bumped(self, mock_upload, mock_download, mock_config, mock_image):
+        self.tenant.openclaw_version = _BUMP_TARGET
+        self.tenant.save()
+
+        call_command(
+            "bump_openclaw_version",
+            oc_version=_BUMP_TARGET,
+            all=True,
+            image_tag=_BUMP_IMAGE,
+        )
+        mock_config.assert_not_called()
+        mock_image.assert_not_called()
+
+    @patch("apps.orchestrator.services.update_container_image")
+    @patch("apps.orchestrator.services.update_tenant_config")
+    @patch("apps.orchestrator.services.download_config_from_file_share", return_value=None)
+    @patch("apps.orchestrator.services.upload_config_to_file_share")
+    def test_bump_rolls_back_on_config_failure(self, mock_upload, mock_download, mock_config, mock_image):
+        mock_config.side_effect = Exception("config push failed")
+
+        call_command(
+            "bump_openclaw_version",
+            oc_version=_BUMP_TARGET,
+            tenant=str(self.tenant.id),
+            image_tag=_BUMP_IMAGE,
+        )
+
+        self.tenant.refresh_from_db()
+        self.assertEqual(self.tenant.openclaw_version, OPENCLAW_CURRENT_VERSION)
+
+    @patch("apps.orchestrator.services.update_container_image")
+    @patch("apps.orchestrator.services.update_tenant_config")
+    @patch("apps.orchestrator.services.download_config_from_file_share", return_value=None)
+    @patch("apps.orchestrator.services.upload_config_to_file_share")
+    def test_bump_rolls_back_on_image_failure(self, mock_upload, mock_download, mock_config, mock_image):
+        mock_image.side_effect = Exception("image deploy failed")
+
+        call_command(
+            "bump_openclaw_version",
+            oc_version=_BUMP_TARGET,
+            tenant=str(self.tenant.id),
+            image_tag=_BUMP_IMAGE,
+        )
+
+        self.tenant.refresh_from_db()
+        self.assertEqual(self.tenant.openclaw_version, OPENCLAW_CURRENT_VERSION)
+
+    @patch("apps.orchestrator.services.update_container_image")
+    @patch("apps.orchestrator.services.update_tenant_config")
+    @patch("apps.orchestrator.services.download_config_from_file_share", return_value=None)
+    @patch("apps.orchestrator.services.upload_config_to_file_share")
+    def test_dry_run_changes_nothing(self, mock_upload, mock_download, mock_config, mock_image):
+        call_command(
+            "bump_openclaw_version",
+            oc_version=_BUMP_TARGET,
+            tenant=str(self.tenant.id),
+            image_tag=_BUMP_IMAGE,
+            dry_run=True,
+        )
+        self.tenant.refresh_from_db()
+        self.assertEqual(self.tenant.openclaw_version, OPENCLAW_CURRENT_VERSION)
+        mock_config.assert_not_called()
+        mock_image.assert_not_called()
+
+    @patch("apps.orchestrator.services.update_container_image")
+    @patch("apps.orchestrator.services.update_tenant_config")
+    @patch("apps.orchestrator.services.download_config_from_file_share", return_value=None)
+    @patch("apps.orchestrator.services.upload_config_to_file_share")
+    def test_bump_skips_inactive_tenants(self, mock_upload, mock_download, mock_config, mock_image):
+        self.tenant.status = Tenant.Status.SUSPENDED
+        self.tenant.save()
+
+        call_command(
+            "bump_openclaw_version",
+            oc_version=_BUMP_TARGET,
+            tenant=str(self.tenant.id),
+            image_tag=_BUMP_IMAGE,
+        )
+        self.tenant.refresh_from_db()
+        self.assertEqual(self.tenant.openclaw_version, OPENCLAW_CURRENT_VERSION)
+        mock_config.assert_not_called()
+
+    @patch("apps.orchestrator.services.update_container_image")
+    @patch("apps.orchestrator.services.update_tenant_config")
+    @patch("apps.orchestrator.services.download_config_from_file_share", return_value=None)
+    @patch("apps.orchestrator.services.upload_config_to_file_share")
+    def test_bump_wakes_and_bumps_hibernated_tenants(self, mock_upload, mock_download, mock_config, mock_image):
+        """Hibernated tenants must NOT be skipped — they're the ones the
+        auto-rollout misses, and pushing a new image in single-revision mode
+        wakes them onto the new image. Regression guard for the silent-fleet-
+        rollout-failure mode discovered 2026-04-26.
+        """
+        from django.utils import timezone
+
+        self.tenant.hibernated_at = timezone.now()
+        self.tenant.container_image_tag = "old-sha"
+        self.tenant.save(update_fields=["hibernated_at", "container_image_tag"])
+
+        call_command(
+            "bump_openclaw_version",
+            oc_version=_BUMP_TARGET,
+            tenant=str(self.tenant.id),
+            image_tag=_BUMP_IMAGE,
+        )
+
+        self.tenant.refresh_from_db()
+        self.assertEqual(self.tenant.openclaw_version, _BUMP_TARGET)
+        self.assertEqual(self.tenant.container_image_tag, _BUMP_IMAGE)
+        self.assertIsNone(
+            self.tenant.hibernated_at,
+            "hibernated_at must be cleared after waking via image push",
+        )
+        mock_config.assert_called_once_with(str(self.tenant.id))
+        mock_image.assert_called_once()

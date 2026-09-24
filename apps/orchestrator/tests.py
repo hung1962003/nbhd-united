@@ -1,0 +1,2082 @@
+"""Tests for orchestrator app."""
+
+import json
+import os
+from datetime import UTC
+from unittest.mock import patch
+
+from django.test import TestCase, override_settings
+
+from apps.tenants.models import Tenant
+from apps.tenants.services import create_tenant
+
+from .config_generator import (
+    _build_heartbeat_cron,
+    _heartbeat_cron_expr,
+    build_cron_seed_jobs,
+    config_to_json,
+    generate_openclaw_config,
+)
+from .config_validator import validate_openclaw_config
+from .fuel_cron import derive_fuel_cron_jobs
+from .services import (
+    deprovision_tenant,
+    provision_tenant,
+    restore_user_cron_jobs,
+    update_tenant_config,
+)
+
+
+class ConfigGeneratorTest(TestCase):
+    def setUp(self):
+        self.tenant = create_tenant(
+            display_name="Config Test",
+            telegram_chat_id=999888777,
+        )
+
+    def test_generates_valid_config(self):
+        config = generate_openclaw_config(self.tenant)
+        self.assertIn("gateway", config)
+        self.assertIn("channels", config)
+        self.assertIn("agents", config)
+        self.assertEqual(config["gateway"]["mode"], "local")
+
+    def test_gateway_defaults_use_supported_bind_mode(self):
+        config = generate_openclaw_config(self.tenant)
+        self.assertEqual(config["gateway"]["bind"], "loopback")
+        # Auth is intentionally present — token from env var for Django→OC calls
+        self.assertEqual(config["gateway"]["auth"]["mode"], "token")
+
+    def test_telegram_channel_enabled_for_central_poller(self):
+        """Telegram channel enabled — capabilities auto-detected by OpenClaw."""
+        config = generate_openclaw_config(self.tenant)
+        self.assertIn("telegram", config["channels"])
+        self.assertNotIn("capabilities", config["channels"]["telegram"])
+
+    def test_starter_tier_model(self):
+        self.tenant.model_tier = "starter"
+        config = generate_openclaw_config(self.tenant)
+        self.assertIn("deepseek", config["agents"]["defaults"]["model"]["primary"].lower())
+
+    def test_starter_tier_uses_openrouter(self):
+        self.tenant.model_tier = "starter"
+        config = generate_openclaw_config(self.tenant)
+        primary = config["agents"]["defaults"]["model"]["primary"]
+        self.assertTrue(primary.startswith("openrouter/"))
+        # >= 2026.4.15 injects explicit OpenRouter base URL override
+        providers = config.get("models", {}).get("providers", {})
+        self.assertEqual(
+            providers.get("openrouter", {}).get("baseUrl"),
+            "https://openrouter.ai/api/v1",
+        )
+
+    def test_starter_tier_has_active_models(self):
+        self.tenant.model_tier = "starter"
+        config = generate_openclaw_config(self.tenant)
+        models = config["agents"]["defaults"]["models"]
+        aliases = sorted(v.get("alias") for v in models.values())
+        self.assertEqual(aliases, ["deepseek", "deepseek-flash", "gemma"])
+
+    def test_deepseek_flash_snapshot_and_legacy_rates(self):
+        from apps.billing.constants import (
+            DEEPSEEK_FLASH_LEGACY_MODEL,
+            DEEPSEEK_FLASH_MODEL,
+            MODEL_RATES,
+            canonical_model_id,
+        )
+
+        expected_rates = (
+            (DEEPSEEK_FLASH_MODEL, 0.09, 0.18),
+            (DEEPSEEK_FLASH_LEGACY_MODEL, 0.065, 0.26),
+        )
+        for model_id, input_rate, output_rate in expected_rates:
+            rate = MODEL_RATES[canonical_model_id(model_id)]
+            self.assertEqual(rate["input"], input_rate)
+            self.assertEqual(rate["output"], output_rate)
+
+    def test_audio_model_defaults_to_whisper(self):
+        self.tenant.model_tier = "starter"
+        config = generate_openclaw_config(self.tenant)
+        audio = config["tools"]["media"]["audio"]
+        self.assertTrue(audio["enabled"])
+        models = audio["models"]
+        self.assertEqual(len(models), 1)
+        self.assertEqual(
+            models[0],
+            {"provider": "openai", "model": "gpt-4o-mini-transcribe"},
+        )
+
+    def test_plugin_wiring_enabled_when_plugin_id_configured(self):
+        with override_settings(
+            OPENCLAW_GOOGLE_PLUGIN_ID="nbhd-google-tools",
+            OPENCLAW_JOURNAL_PLUGIN_ID="nbhd-journal-tools",
+            OPENCLAW_USAGE_PLUGIN_ID="",
+            OPENCLAW_SETTINGS_PLUGIN_ID="",
+            OPENCLAW_ROUTING_CONTEXT_PLUGIN_ID="",
+            OPENCLAW_DOC_TAINT_GUARD_PLUGIN_ID="",
+            # experimental_typed_crons now defaults True (the base AGENTS.md tells every
+            # tenant it can set reminders, so every tenant must actually have the tools),
+            # which loads nbhd-automation-tools on a bare tenant. These cases assert the
+            # ID-driven WIRING mechanism, so blank this ID too — otherwise there is no
+            # zero-plugin baseline left to assert against.
+            OPENCLAW_AUTOMATION_PLUGIN_ID="",
+        ):
+            config = generate_openclaw_config(self.tenant)
+
+        self.assertEqual(
+            sorted(config["plugins"]["allow"]),
+            ["document-extract", "nbhd-google-tools", "nbhd-journal-tools"],
+        )
+        self.assertEqual(config["plugins"]["entries"]["document-extract"], {"enabled": True})
+        self.assertTrue(config["plugins"]["entries"]["nbhd-google-tools"]["enabled"])
+        self.assertTrue(config["plugins"]["entries"]["nbhd-journal-tools"]["enabled"])
+        paths = config["plugins"]["load"]["paths"]
+        self.assertIn("/opt/nbhd/plugins/nbhd-google-tools", paths)
+        self.assertIn("/opt/nbhd/plugins/nbhd-journal-tools", paths)
+        self.assertIn("group:plugins", config["tools"]["allow"])
+
+    def test_plugin_wiring_omitted_when_no_plugins_configured(self):
+        with override_settings(
+            OPENCLAW_GOOGLE_PLUGIN_ID="",
+            OPENCLAW_JOURNAL_PLUGIN_ID="",
+            OPENCLAW_USAGE_PLUGIN_ID="",
+            OPENCLAW_SETTINGS_PLUGIN_ID="",
+            OPENCLAW_ROUTING_CONTEXT_PLUGIN_ID="",
+            OPENCLAW_DOC_TAINT_GUARD_PLUGIN_ID="",
+            # experimental_typed_crons now defaults True (the base AGENTS.md tells every
+            # tenant it can set reminders, so every tenant must actually have the tools),
+            # which loads nbhd-automation-tools on a bare tenant. These cases assert the
+            # ID-driven WIRING mechanism, so blank this ID too — otherwise there is no
+            # zero-plugin baseline left to assert against.
+            OPENCLAW_AUTOMATION_PLUGIN_ID="",
+        ):
+            config = generate_openclaw_config(self.tenant)
+
+        self.assertNotIn("plugins", config)
+        # group:plugins is in the base tool policy (tool_policy.py), not added by plugin wiring
+        self.assertIn("group:plugins", config["tools"]["allow"])
+
+    def test_single_plugin_wired_when_only_one_configured(self):
+        with override_settings(
+            OPENCLAW_GOOGLE_PLUGIN_ID="nbhd-google-tools",
+            OPENCLAW_JOURNAL_PLUGIN_ID="",
+            OPENCLAW_USAGE_PLUGIN_ID="",
+            OPENCLAW_SETTINGS_PLUGIN_ID="",
+            OPENCLAW_ROUTING_CONTEXT_PLUGIN_ID="",
+            OPENCLAW_DOC_TAINT_GUARD_PLUGIN_ID="",
+            # experimental_typed_crons now defaults True (the base AGENTS.md tells every
+            # tenant it can set reminders, so every tenant must actually have the tools),
+            # which loads nbhd-automation-tools on a bare tenant. These cases assert the
+            # ID-driven WIRING mechanism, so blank this ID too — otherwise there is no
+            # zero-plugin baseline left to assert against.
+            OPENCLAW_AUTOMATION_PLUGIN_ID="",
+        ):
+            config = generate_openclaw_config(self.tenant)
+
+        self.assertEqual(config["plugins"]["allow"], ["nbhd-google-tools", "document-extract"])
+        self.assertNotIn("nbhd-journal-tools", config["plugins"]["entries"])
+
+    def test_doc_taint_guard_plugin_ships_by_default(self):
+        # The real regression test: with NO override at all, nbhd-doc-taint-guard
+        # ships fleet-wide (docs/upload-security-threat-model.md P0-1/P0-2/P1-2)
+        # — the pdf/image tools it guards are fleet-wide, so this guard must be
+        # too, independent of any per-tenant flag. Mirrors how the other
+        # unconditional plugins (routing-context, cron-enforcement) are proven:
+        # the isolation tests above disable it to test wiring of OTHER plugins
+        # in isolation; this test proves the guard itself is on by default.
+        config = generate_openclaw_config(self.tenant)
+        self.assertIn("nbhd-doc-taint-guard", config["plugins"]["allow"])
+        self.assertEqual(
+            config["plugins"]["entries"]["nbhd-doc-taint-guard"],
+            {"enabled": True, "config": {"mode": "log_only"}},
+        )
+        self.assertIn("/opt/nbhd/plugins/nbhd-doc-taint-guard", config["plugins"]["load"]["paths"])
+
+    def test_tools_policy_uses_allow_and_deny_lists(self):
+        self.tenant.model_tier = "starter"
+        config = generate_openclaw_config(self.tenant)
+        tools = config["tools"]
+        self.assertIn("allow", tools)
+        self.assertIn("deny", tools)
+        self.assertIn("gateway", tools["deny"])
+        self.assertNotIn("group:automation", tools["deny"])
+        self.assertNotIn("group:ui", tools["allow"])
+
+    def test_memorysearch_default_disabled_for_tenants_without_flag(self):
+        """The PR #525 SQLite-on-SMB corruption guarantees memory-core stays
+        off by default. Phase 3 unwinds that ban behind a per-tenant
+        ``experimental_memory_core_enabled`` flag, so default tenants
+        (everyone without the flag set) continue to see:
+
+        - ``agents.defaults.memorySearch.enabled = False``
+
+        Tool deny is no longer the guard — the 2026.5.7 policy allows
+        ``memory_search`` / ``memory_get`` because the SQLite index now
+        lives on an ``index-cache`` EmptyDir mount (see
+        ``azure_client._ensure_index_cache_in_template``). With the flag
+        off, the gateway has the tools available but ``memorySearch.enabled
+        = False`` makes them no-ops; with the flag on, the tools call
+        into the safe-storage SQLite.
+
+        See ``apps/orchestrator/test_memory_core_ephemeral.py`` for the
+        flag-on path coverage.
+        """
+        # Default tenant: no flag → memory search disabled.
+        self.assertFalse(self.tenant.experimental_memory_core_enabled)
+        config = generate_openclaw_config(self.tenant)
+        memory_search_block = config["agents"]["defaults"]["memorySearch"]
+        self.assertFalse(memory_search_block["enabled"])
+
+    def test_channels_have_no_explicit_capabilities(self):
+        """Capabilities are auto-detected by OpenClaw — not set in config."""
+        config = generate_openclaw_config(self.tenant)
+        for channel_config in config["channels"].values():
+            self.assertNotIn("capabilities", channel_config)
+
+    def test_only_linked_channels_enabled(self):
+        """Only channels the tenant has linked should appear in config."""
+        # Tenant has telegram_chat_id set, not line_user_id
+        config = generate_openclaw_config(self.tenant)
+        self.assertIn("telegram", config["channels"])
+        self.assertNotIn("line", config["channels"])
+
+    def test_chat_completions_endpoint_enabled(self):
+        """Gateway exposes /v1/chat/completions for central poller forwarding."""
+        config = generate_openclaw_config(self.tenant)
+        endpoints = config["gateway"]["http"]["endpoints"]
+        self.assertTrue(endpoints["chatCompletions"]["enabled"])
+
+    def test_heartbeat_cron_uses_delivery_none(self):
+        """Heartbeat cron uses delivery.mode='none' — sends via plugin, not built-in messaging."""
+        from .config_generator import build_cron_seed_jobs
+
+        self.tenant.heartbeat_enabled = True
+        self.tenant.heartbeat_start_hour = 8
+        self.tenant.heartbeat_window_hours = 6
+        jobs = build_cron_seed_jobs(self.tenant)
+        hb = next((j for j in jobs if j["name"] == "Heartbeat Check-in"), None)
+        self.assertIsNotNone(hb, "Heartbeat cron job should be generated when enabled")
+        self.assertEqual(hb["delivery"]["mode"], "none")
+
+    def test_silent_cron_jobs_use_delivery_none(self):
+        """Background-only cron jobs should use delivery.mode='none'."""
+        from .config_generator import build_cron_seed_jobs
+
+        jobs = build_cron_seed_jobs(self.tenant)
+        for job in jobs:
+            if job["name"] in ("Week Ahead Review", "Background Tasks"):
+                self.assertEqual(
+                    job["delivery"]["mode"],
+                    "none",
+                    f"{job['name']} should use delivery.mode='none'",
+                )
+
+    def test_interactive_cron_jobs_have_delivery(self):
+        """Interactive cron jobs (main session) have delivery config."""
+        from .config_generator import build_cron_seed_jobs
+
+        jobs = build_cron_seed_jobs(self.tenant)
+        interactive = ["Morning Briefing", "Evening Check-in", "Weekly Reflection"]
+        for job in jobs:
+            if job["name"] in interactive:
+                self.assertIn("delivery", job, f"{job['name']} should have delivery config")
+
+    # ── Universal isolation cron model ───────────────────────────────
+
+    def test_all_seed_jobs_run_isolated(self):
+        """Universal isolation: every cron job has sessionTarget=isolated."""
+        from .config_generator import build_cron_seed_jobs
+
+        self.tenant.heartbeat_enabled = True
+        jobs = build_cron_seed_jobs(self.tenant)
+        for job in jobs:
+            self.assertEqual(
+                job["sessionTarget"],
+                "isolated",
+                f"{job['name']} must run isolated under universal isolation",
+            )
+            self.assertNotIn(
+                "wakeMode",
+                job,
+                f"{job['name']} should not carry wakeMode (only valid on main jobs)",
+            )
+            self.assertEqual(
+                job["payload"]["kind"],
+                "agentTurn",
+                f"{job['name']} payload kind must be agentTurn",
+            )
+            self.assertIn(
+                "message",
+                job["payload"],
+                f"{job['name']} payload must use 'message' field, not 'text'",
+            )
+
+    def test_seed_jobs_no_longer_carry_phase2_sync_block(self):
+        """Retirement guard (2026-07-11): NO seed cron prompt appends the Phase 2
+        sync block or instructs the agent to call ``nbhd_cron_phase2_summary``.
+
+        The LLM-mediated ``_phase2_sync_block`` cross-session bridge was
+        superseded by the deterministic ProactiveOutbound bridge
+        (``apps/router/proactive_context.py``). Seed prompts stopped emitting it
+        in ``config_generator._build_cron_message``. This asserts the emission
+        stays gone — including the formerly-foreground jobs that used to carry
+        it — so a re-introduction can't slip back in unnoticed.
+        """
+        from .config_generator import build_cron_seed_jobs
+
+        self.tenant.heartbeat_enabled = True
+        jobs = build_cron_seed_jobs(self.tenant)
+        # Includes the jobs that were foreground under the old two-phase model.
+        formerly_foreground = {
+            "Morning Briefing",
+            "Evening Check-in",
+            "Personal Question",
+            "Weekly Reflection",
+            "Week Ahead Review",
+            "Heartbeat Check-in",
+        }
+        seen_formerly_foreground = set()
+        for job in jobs:
+            msg = job["payload"]["message"]
+            self.assertNotIn(
+                "FINAL STEP — conditional sync",
+                msg,
+                f"{job['name']} must NOT carry the retired Phase 2 sync block",
+            )
+            self.assertNotIn(
+                "nbhd_cron_phase2_summary",
+                msg,
+                f"{job['name']} must NOT reference the retired phase 2 summary tool",
+            )
+            if job["name"] in formerly_foreground:
+                seen_formerly_foreground.add(job["name"])
+        # Sanity: we actually exercised the jobs that used to emit the block.
+        self.assertTrue(
+            seen_formerly_foreground,
+            "expected at least one formerly-foreground seed job to be present",
+        )
+
+    def test_phase2_sync_block_disambiguates_tool_from_message(self):
+        """The Phase 2 sync block must explicitly tell the agent that this is a
+        tool invocation, not a chat message. Regression guard for the cron-leak
+        incident where the model emitted ``/cron add ...`` text via
+        ``nbhd_send_to_user`` instead of invoking the sync tool.
+        """
+        from .config_generator import _phase2_sync_block
+
+        block = _phase2_sync_block("Evening Check-in")
+
+        # Tool-vs-message disambiguation must be explicit
+        self.assertIn("TOOL invocation", block)
+        self.assertIn("nbhd_send_to_user", block)
+
+        # The new contract delegates cron creation to Django; the agent only
+        # invokes nbhd_cron_phase2_summary with summary + job_name.
+        self.assertIn("nbhd_cron_phase2_summary", block)
+        self.assertIn('"Evening Check-in"', block)
+
+    def test_background_jobs_skip_phase2_sync_block(self):
+        """Background seed jobs (foreground=false) do NOT carry the Phase 2 wrapper."""
+        from .config_generator import build_cron_seed_jobs
+
+        jobs = build_cron_seed_jobs(self.tenant)
+        bg = next((j for j in jobs if j["name"] == "Background Tasks"), None)
+        self.assertIsNotNone(bg)
+        msg = bg["payload"]["message"]
+        self.assertNotIn("_sync:Background Tasks", msg)
+        self.assertNotIn("FINAL STEP — conditional sync", msg)
+
+    def test_heartbeat_prompt_intact_without_phase2_sync(self):
+        """Heartbeat keeps its own prompt (HEARTBEAT_OK path) but no longer
+        appends the retired Phase 2 sync block."""
+        from .config_generator import build_cron_seed_jobs
+
+        self.tenant.heartbeat_enabled = True
+        jobs = build_cron_seed_jobs(self.tenant)
+        hb = next((j for j in jobs if j["name"] == "Heartbeat Check-in"), None)
+        self.assertIsNotNone(hb)
+        self.assertIn("HEARTBEAT_OK", hb["payload"]["message"])
+        self.assertNotIn("nbhd_cron_phase2_summary", hb["payload"]["message"])
+        self.assertNotIn("FINAL STEP — conditional sync", hb["payload"]["message"])
+
+    # ── Config validator integration ────────────────────────────────
+
+    def test_validator_passes_for_generated_config(self):
+        """Generated config must pass validation with zero errors."""
+        config = generate_openclaw_config(self.tenant)
+        issues = validate_openclaw_config(config)
+        errors = [i for i in issues if i.severity == "error"]
+        self.assertEqual(errors, [], f"Config has validation errors: {errors}")
+
+    def test_config_round_trip_produces_valid_json(self):
+        """config_to_json(generate_openclaw_config(...)) must produce parseable JSON."""
+        config = generate_openclaw_config(self.tenant)
+        json_str = config_to_json(config)
+        parsed = json.loads(json_str)
+        self.assertEqual(parsed, config)
+
+    # ── Reddit plugin ───────────────────────────────────────────────
+
+    def test_reddit_plugin_loaded_when_integration_active(self):
+        from apps.integrations.models import Integration
+
+        Integration.objects.create(
+            tenant=self.tenant,
+            provider="reddit",
+            status=Integration.Status.ACTIVE,
+        )
+        config = generate_openclaw_config(self.tenant)
+        self.assertIn("plugins", config)
+        self.assertIn("nbhd-reddit-tools", config["plugins"]["allow"])
+        self.assertIn("nbhd-reddit-tools", config["plugins"]["entries"])
+
+    def test_reddit_plugin_not_loaded_without_integration(self):
+        with override_settings(
+            OPENCLAW_GOOGLE_PLUGIN_ID="",
+            OPENCLAW_JOURNAL_PLUGIN_ID="",
+            OPENCLAW_USAGE_PLUGIN_ID="",
+            OPENCLAW_SETTINGS_PLUGIN_ID="",
+            OPENCLAW_ROUTING_CONTEXT_PLUGIN_ID="",
+            OPENCLAW_DOC_TAINT_GUARD_PLUGIN_ID="",
+            # experimental_typed_crons now defaults True (the base AGENTS.md tells every
+            # tenant it can set reminders, so every tenant must actually have the tools),
+            # which loads nbhd-automation-tools on a bare tenant. These cases assert the
+            # ID-driven WIRING mechanism, so blank this ID too — otherwise there is no
+            # zero-plugin baseline left to assert against.
+            OPENCLAW_AUTOMATION_PLUGIN_ID="",
+        ):
+            config = generate_openclaw_config(self.tenant)
+        self.assertNotIn("plugins", config)
+
+    # ── Finance plugin ──────────────────────────────────────────────
+
+    def test_finance_plugin_loaded_when_enabled(self):
+        self.tenant.finance_enabled = True
+        self.tenant.save()
+        config = generate_openclaw_config(self.tenant)
+        self.assertIn("plugins", config)
+        self.assertIn("nbhd-finance-tools", config["plugins"]["allow"])
+
+    def test_finance_plugin_not_loaded_when_disabled(self):
+        self.tenant.finance_enabled = False
+        self.tenant.save()
+        with override_settings(
+            OPENCLAW_GOOGLE_PLUGIN_ID="",
+            OPENCLAW_JOURNAL_PLUGIN_ID="",
+            OPENCLAW_USAGE_PLUGIN_ID="",
+            OPENCLAW_SETTINGS_PLUGIN_ID="",
+            OPENCLAW_ROUTING_CONTEXT_PLUGIN_ID="",
+            OPENCLAW_DOC_TAINT_GUARD_PLUGIN_ID="",
+            # experimental_typed_crons now defaults True (the base AGENTS.md tells every
+            # tenant it can set reminders, so every tenant must actually have the tools),
+            # which loads nbhd-automation-tools on a bare tenant. These cases assert the
+            # ID-driven WIRING mechanism, so blank this ID too — otherwise there is no
+            # zero-plugin baseline left to assert against.
+            OPENCLAW_AUTOMATION_PLUGIN_ID="",
+        ):
+            config = generate_openclaw_config(self.tenant)
+        self.assertNotIn("plugins", config)
+
+    # ── sautai plugin (Phase 0) ───────────────────────────────────────
+    # 2026-07-05 incident class: an untested flag-gated plugin can be
+    # emitted into plugins.load.paths without ever being packaged/COPY'd,
+    # or (the mirror bug) COPY'd but never actually gated correctly — both
+    # are only caught by asserting BOTH directions of the flag.
+
+    def test_sautai_plugin_loaded_when_enabled(self):
+        self.tenant.sautai_enabled = True
+        self.tenant.save()
+        config = generate_openclaw_config(self.tenant)
+        self.assertIn("plugins", config)
+        self.assertIn("nbhd-sautai-tools", config["plugins"]["allow"])
+        self.assertIn("nbhd-sautai-tools", config["plugins"]["entries"])
+
+    def test_sautai_plugin_not_loaded_when_disabled(self):
+        self.tenant.sautai_enabled = False
+        self.tenant.save()
+        with override_settings(
+            OPENCLAW_GOOGLE_PLUGIN_ID="",
+            OPENCLAW_JOURNAL_PLUGIN_ID="",
+            OPENCLAW_USAGE_PLUGIN_ID="",
+            OPENCLAW_SETTINGS_PLUGIN_ID="",
+            OPENCLAW_ROUTING_CONTEXT_PLUGIN_ID="",
+            OPENCLAW_DOC_TAINT_GUARD_PLUGIN_ID="",
+            # experimental_typed_crons now defaults True (the base AGENTS.md tells every
+            # tenant it can set reminders, so every tenant must actually have the tools),
+            # which loads nbhd-automation-tools on a bare tenant. These cases assert the
+            # ID-driven WIRING mechanism, so blank this ID too — otherwise there is no
+            # zero-plugin baseline left to assert against.
+            OPENCLAW_AUTOMATION_PLUGIN_ID="",
+        ):
+            config = generate_openclaw_config(self.tenant)
+        self.assertNotIn("plugins", config)
+
+    # ── Heartbeat cron ──────────────────────────────────────────────
+
+    def test_heartbeat_cron_expr_default(self):
+        """Default: start_hour=8, window=6 -> hours 8-13."""
+        expr = _heartbeat_cron_expr(8, 6)
+        self.assertEqual(expr, "0 8,9,10,11,12,13 * * *")
+
+    def test_heartbeat_cron_expr_midnight_wrapping(self):
+        """start_hour=22, window=6 -> wraps: 22,23,0,1,2,3."""
+        expr = _heartbeat_cron_expr(22, 6)
+        self.assertEqual(expr, "0 0,1,2,3,22,23 * * *")
+
+    def test_heartbeat_cron_disabled(self):
+        self.tenant.heartbeat_enabled = False
+        self.tenant.save()
+        result = _build_heartbeat_cron(self.tenant)
+        self.assertIsNone(result)
+
+    def test_heartbeat_cron_enabled_custom_window(self):
+        self.tenant.heartbeat_enabled = True
+        self.tenant.heartbeat_start_hour = 9
+        self.tenant.heartbeat_window_hours = 4
+        self.tenant.save()
+        result = _build_heartbeat_cron(self.tenant)
+        self.assertIsNotNone(result)
+        self.assertEqual(result["name"], "Heartbeat Check-in")
+        self.assertIn("9,10,11,12", result["schedule"]["expr"])
+
+    # ── Task model preferences ──────────────────────────────────────
+
+    def test_task_model_preferences_override_cron_jobs(self):
+        # Use a model from the tier's allowlist (starter ⇒ deepseek-flash).
+        # Without the allowlist guard added 2026-05-14, ``build_cron_seed_jobs``
+        # would stamp anything the user requested, including models the
+        # OpenClaw runtime rejects at preflight.
+        from apps.billing.constants import DEEPSEEK_FLASH_MODEL
+
+        self.tenant.model_tier = "starter"
+        self.tenant.task_model_preferences = {"morning_briefing": DEEPSEEK_FLASH_MODEL}
+        self.tenant.save()
+        jobs = build_cron_seed_jobs(self.tenant)
+        morning = next(j for j in jobs if j["name"] == "Morning Briefing")
+        # User override beats the DeepSeek default.
+        self.assertEqual(morning["model"], DEEPSEEK_FLASH_MODEL)
+
+    def test_task_model_defaults_stamp_fast_worker_on_routine_crons(self):
+        """When the tenant has no `task_model_preferences` override, routine
+        crons get the small/fast worker model (DeepSeek V4 Flash) via
+        TIER_TASK_DEFAULTS, not the slow reasoning leader. Personal Question +
+        Background Tasks are now stamped too (they previously inherited the
+        reasoning chat primary).
+        """
+        from apps.billing.constants import DEEPSEEK_FLASH_MODEL
+
+        self.tenant.model_tier = "starter"
+        self.tenant.task_model_preferences = {}
+        self.tenant.save()
+        jobs = build_cron_seed_jobs(self.tenant)
+        by_name = {j["name"]: j for j in jobs}
+        for name in (
+            "Morning Briefing",
+            "Evening Check-in",
+            "Weekly Reflection",
+            "Week Ahead Review",
+            "Project Check-in",
+            "Personal Question",
+            "Background Tasks",
+        ):
+            self.assertEqual(by_name[name].get("model"), DEEPSEEK_FLASH_MODEL, name)
+
+    def test_task_model_preferences_outside_allowlist_are_dropped(self):
+        """Stale preferences pointing at models not in the tenant's tier
+        allowlist (e.g. ``anthropic-cli/...`` left over from a torn-down
+        BYO setup) must not be stamped — OpenClaw rejects them at
+        preflight and the cron silently never fires.
+
+        Canary 2026-05-14 reproduction: postgres carried three stale
+        ``anthropic-cli/claude-sonnet-4-6`` entries from a BYO setup.
+        With a ``starter`` tier (no anthropic-cli in allowlist) and no
+        active BYO credential, the prefs were dropped, the cron
+        fell back to the tier default, and Morning Briefing fired.
+        """
+        from apps.billing.constants import DEEPSEEK_FLASH_MODEL
+
+        self.tenant.model_tier = "starter"
+        self.tenant.task_model_preferences = {
+            "morning_briefing": "anthropic-cli/claude-sonnet-4-6",
+        }
+        self.tenant.save()
+        jobs = build_cron_seed_jobs(self.tenant)
+        morning = next(j for j in jobs if j["name"] == "Morning Briefing")
+        # Stale pref dropped; cron falls through to TIER_TASK_DEFAULTS
+        # (DeepSeek V4 Flash for Morning Briefing) — not silently un-stamped.
+        self.assertEqual(morning.get("model"), DEEPSEEK_FLASH_MODEL)
+
+    # ── Morning briefing prompt shape ──────────────────────────────
+
+    def _morning_briefing_prompt(self) -> str:
+        jobs = build_cron_seed_jobs(self.tenant)
+        morning = next(j for j in jobs if j["name"] == "Morning Briefing")
+        return morning["payload"]["message"]
+
+    def test_morning_briefing_prompt_uses_web_search_not_web_fetch(self):
+        """web_fetch is denied fleet-wide (tool_policy.py P0-0/P0-0b — see
+        docs/upload-security-threat-model.md). The weather step must route
+        through web_search, tell the agent NOT to use web_fetch (a denied
+        tool call would just error), and must not reference the old
+        Open-Meteo API URL at all."""
+        prompt = self._morning_briefing_prompt()
+        self.assertIn("web_search` for", prompt)
+        self.assertIn("Do NOT use web_fetch", prompt)
+        self.assertNotIn("Use the web_fetch tool", prompt)
+        self.assertNotIn("api.open-meteo.com", prompt)
+
+    def test_morning_briefing_prompt_has_right_now_and_home_base_fallback(self):
+        self.tenant.situational_context_enabled = True
+        self.tenant.save(update_fields=["situational_context_enabled"])
+        prompt = self._morning_briefing_prompt()
+        self.assertIn("## Right now", prompt)
+        self.assertIn("SNAPSHOT home base:", prompt)
+        self.assertIn('"<city> weather forecast today"', prompt)
+
+    def test_morning_briefing_prompt_uses_profile_city_for_home_base_snapshot(self):
+        self.tenant.situational_context_enabled = True
+        self.tenant.save(update_fields=["situational_context_enabled"])
+        self.tenant.user.location_city = "Osaka"
+        self.tenant.user.save()
+        prompt = self._morning_briefing_prompt()
+        self.assertIn("SNAPSHOT home base: Osaka", prompt)
+
+    def test_morning_briefing_prompt_flag_off_uses_legacy_weather_step(self):
+        from .config_generator import _build_morning_briefing_prompt
+
+        self.tenant.situational_context_enabled = False
+        self.tenant.save(update_fields=["situational_context_enabled"])
+        self.tenant.user.location_city = "Osaka"
+        self.tenant.user.save()
+
+        prompt = self._morning_briefing_prompt()
+        self.assertIn('"Osaka weather forecast today"', prompt)
+        self.assertNotIn("## Right now", prompt)
+        self.assertNotIn("SNAPSHOT", _build_morning_briefing_prompt(self.tenant))
+
+    def test_morning_briefing_prompt_degrades_gracefully_on_search_failure(self):
+        prompt = self._morning_briefing_prompt()
+        self.assertIn("Weather unavailable", prompt)
+
+    def test_morning_briefing_prompt_has_intraday_threshold_rule(self):
+        prompt = self._morning_briefing_prompt()
+        # Agent is told which intraday patterns warrant mention — no longer
+        # tied to Open-Meteo's structured hourly JSON fields (web_search
+        # doesn't return those); the rule is now best-effort over whatever
+        # structure the search results actually contain.
+        self.assertIn("temperature swing", prompt)
+        self.assertIn("thunderstorm", prompt.lower())
+        # And told NOT to enumerate stable days
+        self.assertIn("Sunny all day", prompt)
+
+    def test_morning_briefing_prompt_has_intraday_section_template(self):
+        prompt = self._morning_briefing_prompt()
+        self.assertIn("**Intraday:**", prompt)
+        # Stable-day example preserved
+        self.assertIn("**Today:**", prompt)
+        self.assertIn("**Tomorrow:**", prompt)
+
+    def test_week_ahead_prompt_uses_right_now_for_travel_evidence(self):
+        self.tenant.situational_context_enabled = True
+        self.tenant.save(update_fields=["situational_context_enabled"])
+        jobs = build_cron_seed_jobs(self.tenant)
+        week_ahead = next(j for j in jobs if j["name"] == "Week Ahead Review")
+        prompt = week_ahead["payload"]["message"]
+        self.assertIn(
+            "If `## Right now` in USER.md shows the user away from their home base",
+            prompt,
+        )
+        self.assertNotIn(
+            "If the user is traveling, skip or redirect location-based crons",
+            prompt,
+        )
+
+    def test_week_ahead_prompt_flag_off_uses_legacy_travel_line(self):
+        self.tenant.situational_context_enabled = False
+        self.tenant.save(update_fields=["situational_context_enabled"])
+        jobs = build_cron_seed_jobs(self.tenant)
+        week_ahead = next(j for j in jobs if j["name"] == "Week Ahead Review")
+        prompt = week_ahead["payload"]["message"]
+        self.assertIn(
+            "If the user is traveling, skip or redirect location-based crons",
+            prompt,
+        )
+        self.assertNotIn("## Right now", prompt)
+
+    def test_weekly_workflows_teach_iso_slug_discovery_and_rating_values(self):
+        jobs = build_cron_seed_jobs(self.tenant)
+        prompts = {
+            job["name"]: job["payload"]["message"]
+            for job in jobs
+            if job["name"] in {"Weekly Reflection", "Week Ahead Review"}
+        }
+
+        for prompt in prompts.values():
+            self.assertIn("2026-W28", prompt)
+            self.assertIn("available_slugs", prompt)
+            self.assertIn("kind='weekly' and no slug", prompt)
+        self.assertIn("`thumbs-up`, `meh`, or `thumbs-down`", prompts["Weekly Reflection"])
+
+    # ── GWS skills ──────────────────────────────────────────────────
+
+    def test_gws_skills_loaded_when_google_active(self):
+        from apps.integrations.models import Integration
+
+        Integration.objects.create(
+            tenant=self.tenant,
+            provider="google",
+            status=Integration.Status.ACTIVE,
+        )
+        config = generate_openclaw_config(self.tenant)
+        extra_dirs = config.get("skills", {}).get("load", {}).get("extraDirs", [])
+        skill_names = [d.rstrip("/").rsplit("/", 1)[-1] for d in extra_dirs]
+        self.assertIn("gws-shared", skill_names)
+        self.assertIn("gws-gmail-triage", skill_names)
+        self.assertIn("nbhd-action-gate", skill_names)
+        # Validator should pass
+        issues = validate_openclaw_config(config)
+        errors = [i for i in issues if i.severity == "error"]
+        self.assertEqual(errors, [])
+
+    def test_gws_env_vars_set_when_google_active(self):
+        from apps.integrations.models import Integration
+
+        Integration.objects.create(
+            tenant=self.tenant,
+            provider="google",
+            status=Integration.Status.ACTIVE,
+        )
+        config = generate_openclaw_config(self.tenant)
+        env = config.get("env", {})
+        self.assertIn("NBHD_TENANT_ID", env)
+        self.assertEqual(env["NBHD_TENANT_ID"], str(self.tenant.id))
+
+    def test_gws_env_vars_absent_without_google(self):
+        config = generate_openclaw_config(self.tenant)
+        env = config.get("env", {})
+        self.assertNotIn("NBHD_TENANT_ID", env)
+
+    # ── Cron seed jobs ──────────────────────────────────────────────
+
+    def test_cron_seed_jobs_count_with_heartbeat(self):
+        self.tenant.heartbeat_enabled = True
+        self.tenant.save()
+        jobs = build_cron_seed_jobs(self.tenant)
+        names = [j["name"] for j in jobs]
+        self.assertIn("Morning Briefing", names)
+        self.assertIn("Evening Check-in", names)
+        self.assertIn("Background Tasks", names)
+        self.assertIn("Heartbeat Check-in", names)
+
+    def test_cron_seed_jobs_without_heartbeat(self):
+        self.tenant.heartbeat_enabled = False
+        self.tenant.save()
+        jobs = build_cron_seed_jobs(self.tenant)
+        names = [j["name"] for j in jobs]
+        self.assertNotIn("Heartbeat Check-in", names)
+
+
+class SautaiAgentsMdGateTest(TestCase):
+    """The imperative AGENTS.md gate (personas.py) must be flag-gated too —
+    same 2026-07-05 incident class as the plugin-emission tests above,
+    applied to the OTHER half of the wiring (the prompt, not the config)."""
+
+    def setUp(self):
+        self.plain = create_tenant(display_name="Sautai Plain", telegram_chat_id=900301)
+        self.flagged = create_tenant(display_name="Sautai Flagged", telegram_chat_id=900302)
+        self.flagged.sautai_enabled = True
+        self.flagged.save(update_fields=["sautai_enabled"])
+
+    def _agents_md(self, tenant):
+        from .personas import render_workspace_files
+
+        return render_workspace_files("neighbor", tenant=tenant)["NBHD_AGENTS_MD"]
+
+    def test_gate_present_for_flagged_tenant(self):
+        # LEAN gate: names both tools and tells the model to SEARCH the catalog
+        # (the tools are toolSearch-discovered, not pre-loaded) and CALL them.
+        md = self._agents_md(self.flagged)
+        self.assertIn("nbhd_generate_meal_plan", md)
+        self.assertIn("nbhd_get_meal_plan", md)
+        self.assertIn("search the tool catalog", md)
+        self.assertIn("not pre-loaded", md)
+
+    def test_gate_absent_for_plain_tenant(self):
+        # A tenant without the flag never loads the plugin — the prompt must
+        # not name a tool that isn't there for them to find.
+        md = self._agents_md(self.plain)
+        self.assertNotIn("nbhd_generate_meal_plan", md)
+
+    def test_gate_forbids_claiming_plan_without_a_tool_result(self):
+        # The anti-confabulation half of the gate matters as much as the call-it
+        # instruction. The detailed async-latency messaging now rides the tool
+        # RESPONSES (the #1175 pattern), not this always-loaded gate.
+        md = self._agents_md(self.flagged)
+        self.assertIn("without a successful tool result", md)
+
+
+class VersionAwareConfigTest(TestCase):
+    """Config generation must respect tenant.openclaw_version."""
+
+    def setUp(self):
+        self.tenant = create_tenant(
+            display_name="Version Test",
+            telegram_chat_id=777888999,
+        )
+
+    def test_tools_default_to_current_policy(self):
+        """New tenants get the current default version (4.21 → 4.15 policy)."""
+        config = generate_openclaw_config(self.tenant)
+        allowed = config["tools"]["allow"]
+        self.assertIn("group:openclaw", allowed)
+        self.assertIn("group:plugins", allowed)
+        self.assertNotIn("group:web", allowed)
+        self.assertNotIn("group:automation", allowed)
+
+    def test_tools_use_2026_4_15_when_version_set(self):
+        self.tenant.openclaw_version = "2026.4.15"
+        self.tenant.save()
+        config = generate_openclaw_config(self.tenant)
+        allowed = config["tools"]["allow"]
+        self.assertIn("group:openclaw", allowed)
+        self.assertNotIn("group:web", allowed)
+        self.assertNotIn("group:automation", allowed)
+
+    def test_openrouter_base_url_injected_for_2026_4_15(self):
+        self.tenant.openclaw_version = "2026.4.15"
+        self.tenant.save()
+        config = generate_openclaw_config(self.tenant)
+        providers = config.get("models", {}).get("providers", {})
+        self.assertEqual(
+            providers.get("openrouter", {}).get("baseUrl"),
+            "https://openrouter.ai/api/v1",
+        )
+
+    def test_no_openrouter_override_for_2026_4_5(self):
+        self.tenant.openclaw_version = "2026.4.5"
+        self.tenant.save()
+        config = generate_openclaw_config(self.tenant)
+        providers = config.get("models", {}).get("providers", {})
+        self.assertNotIn("openrouter", providers)
+
+
+class RestoreUserCronJobsTest(TestCase):
+    """Tests for user cron job restore deduplication."""
+
+    def setUp(self):
+        self.tenant = create_tenant(
+            display_name="Restore Dedup Test",
+            telegram_chat_id=555666777,
+        )
+
+    @patch("apps.orchestrator.services.invoke_gateway_tool")
+    def test_snapshot_with_duplicates_restores_only_one_per_name(self, mock_invoke):
+        """If snapshot has 3 copies of a job, only 1 should be restored."""
+        self.tenant.cron_jobs_snapshot = {
+            "jobs": [
+                {"name": "Daily Workout Plan", "schedule": "0 6 * * *"},
+                {"name": "Daily Workout Plan", "schedule": "0 6 * * *"},
+                {"name": "Daily Workout Plan", "schedule": "0 6 * * *"},
+                {"name": "Evening Journal", "schedule": "0 21 * * *"},
+                {"name": "Evening Journal", "schedule": "0 21 * * *"},
+            ],
+            "snapshot_at": "2026-01-01T00:00:00",
+        }
+        self.tenant.save(update_fields=["cron_jobs_snapshot"])
+
+        result = restore_user_cron_jobs(self.tenant, existing_job_names=set())
+
+        self.assertEqual(result["restored"], 2)  # 1 Workout + 1 Journal
+        self.assertEqual(mock_invoke.call_count, 2)
+
+    @patch("apps.orchestrator.services.invoke_gateway_tool")
+    def test_snapshot_duplicates_skips_already_existing(self, mock_invoke):
+        """Duplicate snapshot entries for a name already on container are all skipped."""
+        self.tenant.cron_jobs_snapshot = {
+            "jobs": [
+                {"name": "Daily Workout Plan", "schedule": "0 6 * * *"},
+                {"name": "Daily Workout Plan", "schedule": "0 6 * * *"},
+            ],
+            "snapshot_at": "2026-01-01T00:00:00",
+        }
+        self.tenant.save(update_fields=["cron_jobs_snapshot"])
+
+        result = restore_user_cron_jobs(self.tenant, existing_job_names={"Daily Workout Plan"})
+
+        self.assertEqual(result["restored"], 0)
+        mock_invoke.assert_not_called()
+
+    @patch("apps.orchestrator.services.invoke_gateway_tool")
+    def test_system_jobs_in_snapshot_are_never_restored(self, mock_invoke):
+        """System job names in the snapshot should be skipped even if missing from container."""
+        self.tenant.cron_jobs_snapshot = {
+            "jobs": [
+                {"name": "Morning Briefing", "schedule": "0 7 * * *"},
+                {"name": "My Custom Job", "schedule": "0 12 * * *"},
+            ],
+            "snapshot_at": "2026-01-01T00:00:00",
+        }
+        self.tenant.save(update_fields=["cron_jobs_snapshot"])
+
+        result = restore_user_cron_jobs(self.tenant, existing_job_names=set())
+
+        self.assertEqual(result["restored"], 1)  # Only custom job
+        self.assertEqual(mock_invoke.call_count, 1)
+
+    @patch("apps.orchestrator.services.invoke_gateway_tool")
+    def test_sync_prefix_jobs_are_never_restored(self, mock_invoke):
+        """_sync:* Phase 2 crons are system-generated and should not be restored."""
+        self.tenant.cron_jobs_snapshot = {
+            "jobs": [
+                {"name": "_sync:Morning Briefing", "sessionTarget": "main", "schedule": "0 7 * * *"},
+                {"name": "_sync:Evening Check-in", "sessionTarget": "main", "schedule": "0 21 * * *"},
+                {"name": "My Custom Reminder", "schedule": "0 12 * * *"},
+            ],
+            "snapshot_at": "2026-01-01T00:00:00",
+        }
+        self.tenant.save(update_fields=["cron_jobs_snapshot"])
+
+        result = restore_user_cron_jobs(self.tenant, existing_job_names=set())
+
+        self.assertEqual(result["restored"], 1)  # Only custom reminder
+        self.assertEqual(mock_invoke.call_count, 1)
+
+    @patch("apps.orchestrator.services.invoke_gateway_tool")
+    def test_fuel_prefix_jobs_are_never_restored(self, mock_invoke):
+        """_fuel:* workout prep crons are system-generated and should not be restored."""
+        self.tenant.cron_jobs_snapshot = {
+            "jobs": [
+                {"name": "_fuel:Workout Prep", "schedule": "0 6 * * 1,3,5"},
+                {"name": "Study Reminder", "schedule": "0 18 * * *"},
+            ],
+            "snapshot_at": "2026-01-01T00:00:00",
+        }
+        self.tenant.save(update_fields=["cron_jobs_snapshot"])
+
+        result = restore_user_cron_jobs(self.tenant, existing_job_names=set())
+
+        self.assertEqual(result["restored"], 1)  # Only study reminder
+        self.assertEqual(mock_invoke.call_count, 1)
+
+
+class ImageUpdateCronRestoreTest(TestCase):
+    """Tests for cron snapshot/restore during image updates."""
+
+    def setUp(self):
+        self.tenant = create_tenant(
+            display_name="Image Update Test",
+            telegram_chat_id=444555666,
+        )
+        self.tenant.status = Tenant.Status.ACTIVE
+        self.tenant.container_id = "oc-test-container"
+        self.tenant.container_fqdn = "oc-test.internal.example.io"
+        self.tenant.save()
+
+    @patch("apps.cron.publish.publish_task")
+    @patch("apps.orchestrator.azure_client.update_container_image")
+    @patch("apps.cron.gateway_client.invoke_gateway_tool")
+    @patch("apps.orchestrator.services.update_tenant_config")
+    def test_image_update_snapshots_crons_before_restart(self, mock_cfg, mock_gw, mock_update, mock_publish):
+        """Pre-image snapshot should save cron jobs to the database."""
+        from apps.orchestrator.tasks import apply_single_tenant_image_task
+
+        mock_gw.return_value = {
+            "jobs": [
+                {"name": "Morning Briefing", "schedule": "0 7 * * *"},
+                {"name": "My Reminder", "schedule": "0 12 * * *"},
+            ]
+        }
+
+        apply_single_tenant_image_task(str(self.tenant.id), "abc123")
+
+        self.tenant.refresh_from_db()
+        snapshot = self.tenant.cron_jobs_snapshot
+        self.assertIsNotNone(snapshot)
+        self.assertEqual(len(snapshot["jobs"]), 2)
+        self.assertEqual(snapshot["trigger"], "pre-image-update")
+        self.assertEqual(snapshot["image_tag"], "abc123")
+
+    @patch("apps.cron.publish.publish_task")
+    @patch("apps.orchestrator.azure_client.update_container_image")
+    @patch("apps.cron.gateway_client.invoke_gateway_tool")
+    @patch("apps.orchestrator.services.update_tenant_config")
+    def test_image_update_schedules_restore_task(self, mock_cfg, mock_gw, mock_update, mock_publish):
+        """After image update, a delayed restore_crons_after_image_update should be queued."""
+        from apps.orchestrator.tasks import apply_single_tenant_image_task
+
+        mock_gw.return_value = {"jobs": []}
+
+        apply_single_tenant_image_task(str(self.tenant.id), "abc123")
+
+        mock_publish.assert_called_once()
+        call_args = mock_publish.call_args
+        self.assertEqual(call_args[0][0], "restore_crons_after_image_update")
+        self.assertEqual(call_args[0][1], str(self.tenant.id))
+        self.assertEqual(call_args[1]["delay_seconds"], 90)
+
+    @patch("apps.orchestrator.services.dedup_tenant_cron_jobs")
+    @patch("apps.cron.gateway_client.invoke_gateway_tool")
+    def test_restore_from_snapshot_creates_missing_non_system_jobs(self, mock_gw, mock_dedup):
+        """restore_crons_after_image_update creates non-system jobs from snapshot.
+
+        System crons (Morning Briefing, etc.) are excluded — postgres is
+        canonical for those and the signal-driven reconciler pushes them
+        after restore. Non-system jobs (user reminders, agent-authored
+        ``_sync:*`` summaries) come from the snapshot.
+        """
+        from apps.orchestrator.tasks import restore_crons_after_image_update_task
+
+        self.tenant.cron_jobs_snapshot = {
+            "jobs": [
+                # System cron — must be skipped by the restore.
+                {"name": "Morning Briefing", "id": "abc", "schedule": "0 7 * * *"},
+                # User reminder — must be restored.
+                {"name": "My Reminder", "id": "def", "schedule": "0 12 * * *"},
+                # Agent-authored sync — must be restored.
+                {"name": "_sync:Morning Briefing", "id": "ghi", "schedule": "5 7 12 5 *"},
+            ],
+            "snapshot_at": "2026-01-01T00:00:00",
+            "trigger": "pre-image-update",
+        }
+        self.tenant.save(update_fields=["cron_jobs_snapshot"])
+
+        # cron.list returns empty (container just restarted)
+        mock_gw.return_value = {"jobs": []}
+
+        restore_crons_after_image_update_task(str(self.tenant.id))
+
+        # Only non-system jobs restored. Morning Briefing skipped.
+        add_calls = [c for c in mock_gw.call_args_list if c[0][1] == "cron.add"]
+        added_names = {c[0][2]["job"]["name"] for c in add_calls}
+        self.assertEqual(added_names, {"My Reminder", "_sync:Morning Briefing"})
+        # Verify gateway-internal 'id' field is stripped
+        for call in add_calls:
+            job_arg = call[0][2]["job"]
+            self.assertNotIn("id", job_arg)
+
+    @patch("apps.orchestrator.services.dedup_tenant_cron_jobs")
+    @patch("apps.cron.gateway_client.invoke_gateway_tool")
+    def test_restore_skips_already_existing_jobs(self, mock_gw, mock_dedup):
+        """Jobs already on the container should not be re-created."""
+        from apps.orchestrator.tasks import restore_crons_after_image_update_task
+
+        self.tenant.cron_jobs_snapshot = {
+            "jobs": [
+                {"name": "Morning Briefing", "schedule": "0 7 * * *"},
+                {"name": "My Reminder", "schedule": "0 12 * * *"},
+            ],
+            "snapshot_at": "2026-01-01T00:00:00",
+            "trigger": "pre-image-update",
+        }
+        self.tenant.save(update_fields=["cron_jobs_snapshot"])
+
+        # Container already has Morning Briefing (e.g., its own restore worked)
+        mock_gw.return_value = {"jobs": [{"name": "Morning Briefing", "schedule": "0 7 * * *"}]}
+
+        restore_crons_after_image_update_task(str(self.tenant.id))
+
+        add_calls = [c for c in mock_gw.call_args_list if c[0][1] == "cron.add"]
+        self.assertEqual(len(add_calls), 1)  # Only My Reminder
+        self.assertEqual(add_calls[0][0][2]["job"]["name"], "My Reminder")
+
+    @patch("apps.orchestrator.services.seed_cron_jobs")
+    def test_restore_falls_back_to_seed_when_no_snapshot(self, mock_seed):
+        """Without a snapshot, should fall back to seed_cron_jobs."""
+        from apps.orchestrator.tasks import restore_crons_after_image_update_task
+
+        self.tenant.cron_jobs_snapshot = {}
+        self.tenant.save(update_fields=["cron_jobs_snapshot"])
+
+        restore_crons_after_image_update_task(str(self.tenant.id))
+        mock_seed.assert_called_once()
+
+
+@override_settings()
+class ProvisioningTest(TestCase):
+    def setUp(self):
+        os.environ["AZURE_MOCK"] = "true"
+        self.tenant = create_tenant(
+            display_name="Provision Test",
+            telegram_chat_id=111222333,
+        )
+
+    def tearDown(self):
+        os.environ.pop("AZURE_MOCK", None)
+
+    def test_provision_creates_container(self):
+        provision_tenant(str(self.tenant.id))
+        self.tenant.refresh_from_db()
+        self.assertEqual(self.tenant.status, Tenant.Status.ACTIVE)
+        self.assertTrue(self.tenant.container_id.startswith("oc-"))
+        self.assertTrue(self.tenant.container_fqdn)
+
+    def test_deprovision_marks_deleted(self):
+        provision_tenant(str(self.tenant.id))
+        deprovision_tenant(str(self.tenant.id))
+        self.tenant.refresh_from_db()
+        self.assertEqual(self.tenant.status, Tenant.Status.DELETED)
+        self.assertEqual(self.tenant.container_id, "")
+
+    # ── PR #1.6: per-tenant OpenRouter sub-keys ─────────────────────
+
+    def test_provision_skips_or_subkey_when_flag_off(self):
+        """Default behaviour — feature flag off, tenant uses shared key."""
+        with patch("apps.billing.openrouter_admin.create_sub_key") as mock_create:
+            provision_tenant(str(self.tenant.id))
+        mock_create.assert_not_called()
+        self.tenant.refresh_from_db()
+        self.assertEqual(self.tenant.openrouter_key_secret_name, "")
+        self.assertEqual(self.tenant.openrouter_key_hash, "")
+
+    @override_settings(OPENROUTER_PER_TENANT_KEYS_ENABLED=True)
+    @patch("apps.byo_models.services._write_secret_to_kv")
+    @patch("apps.billing.openrouter_admin.create_sub_key")
+    def test_provision_creates_or_subkey_when_flag_on(self, mock_create, mock_kv_write):
+        mock_create.return_value = ("mock-or-key-xyz", "hash-abc123")
+        provision_tenant(str(self.tenant.id))
+        mock_create.assert_called_once()
+        # Label format includes the first 8 chars of the tenant id
+        args, kwargs = mock_create.call_args
+        self.assertTrue(args[0].startswith("tenant-"))
+        # Limit defaults to TIER_COST_BUDGETS["starter"] = 5.00
+        self.assertEqual(kwargs.get("limit_dollars"), 5.0)
+        self.assertEqual(kwargs.get("limit_reset"), "monthly")
+        # KV write happened with the per-tenant key string
+        mock_kv_write.assert_called_once()
+        kv_args = mock_kv_write.call_args.args
+        self.assertEqual(kv_args[1], "mock-or-key-xyz")
+        # Tenant row updated
+        self.tenant.refresh_from_db()
+        self.assertEqual(self.tenant.openrouter_key_hash, "hash-abc123")
+        self.assertTrue(self.tenant.openrouter_key_secret_name.endswith("-openrouter-key"))
+        # Provisioning still succeeded — tenant is ACTIVE
+        self.assertEqual(self.tenant.status, Tenant.Status.ACTIVE)
+
+    @override_settings(OPENROUTER_PER_TENANT_KEYS_ENABLED=True)
+    @patch("apps.billing.openrouter_admin.create_sub_key")
+    def test_provision_falls_back_to_shared_key_when_or_api_fails(self, mock_create):
+        """OR-side failure must NOT block provisioning — the tenant just
+        uses the shared OPENROUTER_API_KEY until the backfill command
+        retries the sub-key creation later."""
+        from apps.billing.openrouter_admin import OpenRouterAdminError
+
+        mock_create.side_effect = OpenRouterAdminError("403 forbidden", status=403)
+        provision_tenant(str(self.tenant.id))
+        self.tenant.refresh_from_db()
+        # Tenant fields stay empty — no sub-key was persisted.
+        self.assertEqual(self.tenant.openrouter_key_secret_name, "")
+        self.assertEqual(self.tenant.openrouter_key_hash, "")
+        # But provisioning succeeded.
+        self.assertEqual(self.tenant.status, Tenant.Status.ACTIVE)
+
+    @override_settings(OPENROUTER_PER_TENANT_KEYS_ENABLED=True)
+    @patch("apps.byo_models.services._delete_secret_from_kv")
+    @patch("apps.billing.openrouter_admin.delete_sub_key")
+    @patch("apps.byo_models.services._write_secret_to_kv")
+    @patch("apps.billing.openrouter_admin.create_sub_key")
+    def test_deprovision_deletes_or_subkey_and_clears_fields(
+        self, mock_create, mock_kv_write, mock_delete_sub, mock_kv_delete
+    ):
+        mock_create.return_value = ("mock-or-key-xyz", "hash-abc123")
+        provision_tenant(str(self.tenant.id))
+        self.tenant.refresh_from_db()
+        original_hash = self.tenant.openrouter_key_hash
+        original_secret = self.tenant.openrouter_key_secret_name
+        self.assertEqual(original_hash, "hash-abc123")
+        self.assertTrue(original_secret)
+
+        deprovision_tenant(str(self.tenant.id))
+        # Sub-key delete called with the stored hash.
+        mock_delete_sub.assert_called_once_with("hash-abc123")
+        # KV secret delete called with the stored name.
+        mock_kv_delete.assert_called_once_with(original_secret)
+        # Tenant fields cleared.
+        self.tenant.refresh_from_db()
+        self.assertEqual(self.tenant.openrouter_key_secret_name, "")
+        self.assertEqual(self.tenant.openrouter_key_hash, "")
+        self.assertEqual(self.tenant.status, Tenant.Status.DELETED)
+
+    @patch("apps.orchestrator.services.refresh_system_cron_rows_from_seed")
+    @patch("apps.orchestrator.services.upload_config_to_file_share")
+    def test_update_tenant_config_pushes_new_config(self, mock_upload, mock_cron_refresh):
+        # Cron-row refresh writes to postgres inside update_tenant_config; the
+        # signal handler pushes to the gateway asynchronously. Mock it for
+        # this test which only cares about the file-share write.
+        mock_cron_refresh.return_value = {"created": 0, "updated": 0, "preserved_custom": 0, "unchanged": 0}
+        provision_tenant(str(self.tenant.id))
+        self.tenant.refresh_from_db()
+
+        mock_upload.reset_mock()
+        update_tenant_config(str(self.tenant.id))
+
+        # File share is updated (source of truth for OpenClaw)
+        mock_upload.assert_called_once()
+        upload_args = mock_upload.call_args[0]
+        self.assertEqual(upload_args[0], str(self.tenant.id))
+        # Config should contain gateway settings
+        self.assertIn("gateway", upload_args[1])
+
+
+class DeriveFuelCronJobsTest(TestCase):
+    """Pure derive_fuel_cron_jobs(tenant) — Postgres source-of-truth for Fuel crons."""
+
+    def setUp(self):
+        self.tenant = create_tenant(display_name="Derive Fuel Test", telegram_chat_id=999111222)
+        self.tenant.fuel_enabled = True
+        self.tenant.save(update_fields=["fuel_enabled"])
+
+    def _make_workout(self, **kw):
+        from datetime import date as date_cls
+
+        from apps.fuel.models import Workout
+
+        defaults = dict(
+            tenant=self.tenant,
+            date=date_cls(2026, 5, 1),
+            category="strength",
+            activity="Push",
+            status="planned",
+        )
+        defaults.update(kw)
+        return Workout.objects.create(**defaults)
+
+    def test_returns_empty_when_fuel_disabled(self):
+        from datetime import datetime
+
+        self.tenant.fuel_enabled = False
+        self.tenant.save(update_fields=["fuel_enabled"])
+        self._make_workout(scheduled_at=datetime(2026, 5, 1, 7, 0, tzinfo=UTC))
+        jobs = derive_fuel_cron_jobs(self.tenant, now=datetime(2026, 5, 1, 0, 0, tzinfo=UTC))
+        self.assertEqual(jobs, [])
+
+    def test_returns_empty_when_no_scheduled_sessions(self):
+        from datetime import datetime
+
+        # Workout exists but no scheduled_at
+        self._make_workout()
+        jobs = derive_fuel_cron_jobs(self.tenant, now=datetime(2026, 5, 1, 0, 0, tzinfo=UTC))
+        self.assertEqual(jobs, [])
+
+    def test_emits_one_cron_per_planned_session_in_horizon(self):
+        from datetime import datetime
+
+        a = self._make_workout(scheduled_at=datetime(2026, 5, 1, 7, 0, tzinfo=UTC))
+        b = self._make_workout(scheduled_at=datetime(2026, 5, 1, 18, 0, tzinfo=UTC))
+        # Out of horizon
+        self._make_workout(scheduled_at=datetime(2026, 5, 4, 7, 0, tzinfo=UTC))
+        jobs = derive_fuel_cron_jobs(
+            self.tenant,
+            horizon_hours=48,
+            now=datetime(2026, 5, 1, 0, 0, tzinfo=UTC),
+        )
+        self.assertEqual(len(jobs), 2)
+        names = sorted(j["name"] for j in jobs)
+        self.assertEqual(
+            names,
+            sorted([f"_fuel:{str(a.id).split('-')[0]}", f"_fuel:{str(b.id).split('-')[0]}"]),
+        )
+
+    def test_skips_non_planned_statuses(self):
+        from datetime import datetime
+
+        self._make_workout(
+            status="done",
+            scheduled_at=datetime(2026, 5, 1, 7, 0, tzinfo=UTC),
+        )
+        self._make_workout(
+            status="skipped",
+            scheduled_at=datetime(2026, 5, 1, 8, 0, tzinfo=UTC),
+        )
+        jobs = derive_fuel_cron_jobs(self.tenant, now=datetime(2026, 5, 1, 0, 0, tzinfo=UTC))
+        self.assertEqual(jobs, [])
+
+    def test_cron_expr_is_one_shot_in_user_tz(self):
+        from datetime import datetime
+
+        self.tenant.user.timezone = "Asia/Tokyo"
+        self.tenant.user.save(update_fields=["timezone"])
+        # 7am Tokyo = 22:00 UTC the previous day
+        self._make_workout(scheduled_at=datetime(2026, 4, 30, 22, 0, tzinfo=UTC))
+        jobs = derive_fuel_cron_jobs(
+            self.tenant,
+            now=datetime(2026, 4, 30, 0, 0, tzinfo=UTC),
+        )
+        self.assertEqual(len(jobs), 1)
+        # 22:00 UTC = 07:00 Asia/Tokyo on May 1
+        self.assertEqual(jobs[0]["schedule"]["expr"], "0 7 1 5 *")
+        self.assertEqual(jobs[0]["schedule"]["tz"], "Asia/Tokyo")
+
+    def test_cron_payload_shape(self):
+        from datetime import datetime
+
+        self._make_workout(scheduled_at=datetime(2026, 5, 1, 7, 0, tzinfo=UTC))
+        jobs = derive_fuel_cron_jobs(self.tenant, now=datetime(2026, 5, 1, 0, 0, tzinfo=UTC))
+        job = jobs[0]
+        self.assertEqual(job["sessionTarget"], "isolated")
+        self.assertEqual(job["payload"]["kind"], "agentTurn")
+        self.assertEqual(job["delivery"]["mode"], "none")
+        self.assertTrue(job["enabled"])
+        self.assertIn("Fuel background workout prep", job["payload"]["message"])
+
+    def test_unknown_timezone_falls_back_to_utc(self):
+        from datetime import datetime
+
+        self.tenant.user.timezone = "Mars/Olympus_Mons"
+        self.tenant.user.save(update_fields=["timezone"])
+        self._make_workout(scheduled_at=datetime(2026, 5, 1, 7, 0, tzinfo=UTC))
+        jobs = derive_fuel_cron_jobs(self.tenant, now=datetime(2026, 5, 1, 0, 0, tzinfo=UTC))
+        self.assertEqual(len(jobs), 1)
+        self.assertEqual(jobs[0]["schedule"]["tz"], "UTC")
+
+
+class RegenerateFuelCronsTest(TestCase):
+    """regenerate_fuel_crons diff-and-apply against gateway."""
+
+    def setUp(self):
+        from apps.fuel.models import FuelProfile
+
+        self.tenant = create_tenant(display_name="Regen Test", telegram_chat_id=999333444)
+        self.tenant.fuel_enabled = True
+        self.tenant.container_fqdn = "oc-regen.example.com"
+        self.tenant.save(update_fields=["fuel_enabled", "container_fqdn"])
+        FuelProfile.objects.create(tenant=self.tenant, use_session_scheduling=True)
+
+    def _make_workout(self, **kw):
+        from datetime import date as date_cls
+
+        from apps.fuel.models import Workout
+
+        defaults = dict(
+            tenant=self.tenant,
+            date=date_cls(2026, 5, 1),
+            category="strength",
+            activity="Push",
+            status="planned",
+        )
+        defaults.update(kw)
+        return Workout.objects.create(**defaults)
+
+    @patch("apps.cron.gateway_client.invoke_gateway_tool")
+    def test_legacy_no_active_plan_is_noop(self, mock_invoke):
+        """Legacy tenant (session off) with no active plan → desired empty; an
+        empty container yields no actions. (Post-fix the reconciler owns the
+        legacy flow too — it no longer early-returns for non-session tenants.)"""
+        self.tenant.fuel_profile.use_session_scheduling = False
+        self.tenant.fuel_profile.save(update_fields=["use_session_scheduling"])
+        from apps.orchestrator.fuel_cron import regenerate_fuel_crons
+
+        mock_invoke.side_effect = lambda tenant, tool, args: {"details": {"jobs": []}}
+        result = regenerate_fuel_crons(self.tenant)
+        self.assertEqual(result["added"], 0)
+        self.assertEqual(result["removed"], 0)
+        self.assertEqual(result["errors"], 0)
+
+    @patch("apps.cron.gateway_client.invoke_gateway_tool")
+    def test_legacy_reaps_orphans_keeps_active_plan_cron(self, mock_invoke):
+        """The canary scenario on the LEGACY flow: a pile of _fuel:{old plan}
+        orphans plus the active plan's cron. Reap every orphan, keep the
+        active one. This is what cleans up the canary."""
+        from datetime import date as date_cls
+
+        from apps.fuel.models import WorkoutPlan
+        from apps.orchestrator.fuel_cron import regenerate_fuel_crons
+
+        self.tenant.fuel_profile.use_session_scheduling = False
+        self.tenant.fuel_profile.save(update_fields=["use_session_scheduling"])
+        plan = WorkoutPlan.objects.create(
+            tenant=self.tenant,
+            name="Current Block",
+            status="active",
+            start_date=date_cls(2026, 5, 1),
+            weeks=4,
+            days_per_week=3,
+            schedule_json={"0": {}, "2": {}, "4": {}},
+        )
+        desired_name = f"_fuel:{plan.name}"
+        removed = []
+
+        def fake(tenant, tool, args):
+            if tool == "cron.list":
+                return {
+                    "details": {
+                        "jobs": [
+                            {"name": "_fuel:Old A", "id": "o1"},
+                            {"name": "_fuel:Old B", "id": "o2"},
+                            {"name": "_fuel:Renamed Away", "id": "o3"},
+                            {"name": desired_name, "id": "keep"},
+                        ]
+                    }
+                }
+            if tool == "cron.remove":
+                removed.append(args["jobId"])
+            return None
+
+        mock_invoke.side_effect = fake
+        result = regenerate_fuel_crons(self.tenant)
+        self.assertEqual(result["added"], 0)  # active plan's cron already present
+        self.assertEqual(result["unchanged"], 1)
+        self.assertEqual(result["legacy_reaped"], 3)
+        self.assertCountEqual(removed, ["o1", "o2", "o3"])  # the active cron 'keep' survives
+
+    @patch("apps.cron.gateway_client.invoke_gateway_tool")
+    def test_idless_orphan_is_reported_without_name_as_job_id(self, mock_invoke):
+        """An id-less gateway row is an error; its name is not a removable ID."""
+        self.tenant.fuel_profile.use_session_scheduling = False
+        self.tenant.fuel_profile.save(update_fields=["use_session_scheduling"])
+        from apps.orchestrator.fuel_cron import regenerate_fuel_crons
+
+        removed = []
+
+        def fake(tenant, tool, args):
+            if tool == "cron.list":
+                return {"details": {"jobs": [{"name": "_fuel:No Id Orphan"}]}}  # no id/jobId
+            if tool == "cron.remove":
+                removed.append(args["jobId"])
+            return None
+
+        mock_invoke.side_effect = fake
+        # No active plan → desired empty → the id-less orphan is planned for
+        # removal, but the invalid gateway row cannot be removed safely.
+        result = regenerate_fuel_crons(self.tenant)
+        self.assertEqual(removed, [])
+        self.assertEqual(result["legacy_reaped"], 0)
+        self.assertEqual(result["errors"], 1)
+
+    @patch("apps.cron.gateway_client.invoke_gateway_tool")
+    def test_adds_missing_jobs(self, mock_invoke):
+        from datetime import datetime
+
+        from apps.orchestrator.fuel_cron import regenerate_fuel_crons
+
+        self._make_workout(scheduled_at=datetime(2026, 5, 1, 7, 0, tzinfo=UTC))
+        # cron.list returns empty
+        mock_invoke.side_effect = lambda tenant, tool, args: {"details": {"jobs": []}}
+
+        with patch(
+            "apps.orchestrator.fuel_cron.derive_fuel_cron_jobs",
+            return_value=[
+                {
+                    "name": "_fuel:abcd1234",
+                    "schedule": {"kind": "cron", "expr": "0 7 1 5 *", "tz": "UTC"},
+                    "sessionTarget": "isolated",
+                    "payload": {"kind": "agentTurn", "message": "x"},
+                    "delivery": {"mode": "none"},
+                    "enabled": True,
+                }
+            ],
+        ):
+            result = regenerate_fuel_crons(self.tenant)
+        self.assertEqual(result["added"], 1)
+        self.assertEqual(result["removed"], 0)
+
+    @patch("apps.cron.gateway_client.invoke_gateway_tool")
+    def test_removes_stale_session_jobs(self, mock_invoke):
+        from apps.orchestrator.fuel_cron import regenerate_fuel_crons
+
+        # Container has a stale session-prefix job (8 hex chars after _fuel:)
+        # but the desired set is empty.
+        mock_invoke.side_effect = lambda tenant, tool, args: (
+            {"details": {"jobs": [{"name": "_fuel:abcd1234", "id": "job-id-1"}]}} if tool == "cron.list" else None
+        )
+        with patch("apps.orchestrator.fuel_cron.derive_fuel_cron_jobs", return_value=[]):
+            result = regenerate_fuel_crons(self.tenant)
+        self.assertEqual(result["removed"], 1)
+        self.assertEqual(result["added"], 0)
+
+    @patch("apps.cron.gateway_client.invoke_gateway_tool")
+    def test_reaps_legacy_plan_jobs_on_session_tenant(self, mock_invoke):
+        """On a session tenant the reconciler OWNS the whole `_fuel:*` prefix.
+        A legacy `_fuel:{plan_name}` job is a duplicate fire (the dual-writer
+        bug) and must be reaped, not left alone. (Inverts the pre-fix contract:
+        coexistence WAS the bug.)"""
+        from apps.orchestrator.fuel_cron import regenerate_fuel_crons
+
+        removed_ids = []
+        mock_invoke.side_effect = lambda tenant, tool, args: (
+            {"details": {"jobs": [{"name": "_fuel:My Plan", "id": "legacy-id"}]}}
+            if tool == "cron.list"
+            else removed_ids.append(args.get("jobId"))
+        )
+        with patch("apps.orchestrator.fuel_cron.derive_fuel_cron_jobs", return_value=[]):
+            result = regenerate_fuel_crons(self.tenant)
+        self.assertEqual(result["removed"], 1)
+        self.assertEqual(result["legacy_reaped"], 1)
+        self.assertEqual(removed_ids, ["legacy-id"])
+
+    @patch("apps.cron.gateway_client.invoke_gateway_tool")
+    def test_reaps_same_name_duplicates_keeping_newest(self, mock_invoke):
+        """Two gateway jobs sharing a desired session name → keep the newest
+        (by createdAtMs), reap the older copy. The pre-fix name-keyed dict
+        collapsed these into one entry and could never remove the extra."""
+        from apps.orchestrator.fuel_cron import regenerate_fuel_crons
+
+        removed_ids = []
+        mock_invoke.side_effect = lambda tenant, tool, args: (
+            {
+                "details": {
+                    "jobs": [
+                        {"name": "_fuel:abcd1234", "id": "old", "createdAtMs": 100},
+                        {"name": "_fuel:abcd1234", "id": "new", "createdAtMs": 200},
+                    ]
+                }
+            }
+            if tool == "cron.list"
+            else removed_ids.append(args.get("jobId"))
+        )
+        desired = [
+            {
+                "name": "_fuel:abcd1234",
+                "schedule": {"kind": "cron", "expr": "0 7 1 5 *", "tz": "UTC"},
+                "payload": {"kind": "agentTurn", "message": "x"},
+                "delivery": {"mode": "none"},
+                "enabled": True,
+            }
+        ]
+        with patch("apps.orchestrator.fuel_cron.derive_fuel_cron_jobs", return_value=desired):
+            result = regenerate_fuel_crons(self.tenant)
+        self.assertEqual(result["added"], 0)  # the desired name is already present
+        self.assertEqual(result["unchanged"], 1)
+        self.assertEqual(result["duplicates_reaped"], 1)
+        self.assertEqual(removed_ids, ["old"])  # older copy reaped, newest kept
+
+
+class PlanFuelCronReconcileTest(TestCase):
+    """Pure planner — classification of the `_fuel:*` namespace with no gateway
+    or DB. This is the heart of the duplicate-fuel-cron fix."""
+
+    @staticmethod
+    def _desired(*names):
+        return {n: {"name": n} for n in names}
+
+    def test_is_session_cron_name(self):
+        from apps.orchestrator.fuel_cron import _is_session_cron_name
+
+        self.assertTrue(_is_session_cron_name("_fuel:abcd1234"))
+        self.assertTrue(_is_session_cron_name("_fuel:deadbeef"))
+        # Legacy plan-name jobs (not exactly 8 lowercase-hex):
+        self.assertFalse(_is_session_cron_name("_fuel:My Plan"))
+        self.assertFalse(_is_session_cron_name("_fuel:Strength"))  # 8 chars but not hex
+        self.assertFalse(_is_session_cron_name("_fuel:abcd123"))  # 7 chars
+        self.assertFalse(_is_session_cron_name("_fuel:abcd12345"))  # 9 chars
+        self.assertFalse(_is_session_cron_name("_fuel:ABCD1234"))  # uppercase ≠ minted form
+        self.assertFalse(_is_session_cron_name("Morning Briefing"))  # not even fuel
+
+    def test_clean_state_no_actions(self):
+        from apps.orchestrator.fuel_cron import plan_fuel_cron_reconcile
+
+        desired = self._desired("_fuel:abcd1234")
+        current = [{"name": "_fuel:abcd1234", "id": "j1"}]
+        plan = plan_fuel_cron_reconcile(desired, current)
+        self.assertEqual(plan["to_add"], [])
+        self.assertEqual(plan["to_remove"], [])
+        self.assertEqual(plan["unchanged"], 1)
+
+    def test_ignores_non_fuel_jobs(self):
+        from apps.orchestrator.fuel_cron import plan_fuel_cron_reconcile
+
+        current = [{"name": "Morning Briefing", "id": "sys"}, {"name": "_sync:foo", "id": "sync"}]
+        plan = plan_fuel_cron_reconcile(self._desired("_fuel:abcd1234"), current)
+        # Only the missing desired job; the system/sync jobs are untouched.
+        self.assertEqual([j["name"] for j in plan["to_add"]], ["_fuel:abcd1234"])
+        self.assertEqual(plan["to_remove"], [])
+
+    def test_canary_mixed_shape(self):
+        """The real canary shape: desired {a,b}; container has a×2 (dup), b,
+        a legacy plan-name cron, and a stale 8-hex cron. One pass converges all
+        of it — keep one a + b, add nothing, reap dup+legacy+stale."""
+        from apps.orchestrator.fuel_cron import plan_fuel_cron_reconcile
+
+        desired = self._desired("_fuel:aaaa0000", "_fuel:bbbb1111")
+        current = [
+            {"name": "_fuel:aaaa0000", "id": "a-old", "createdAtMs": 1},
+            {"name": "_fuel:aaaa0000", "id": "a-new", "createdAtMs": 2},
+            {"name": "_fuel:bbbb1111", "id": "b1", "createdAtMs": 5},
+            {"name": "_fuel:Summer Cut", "id": "legacy1"},
+            {"name": "_fuel:Cutting Block", "id": "legacy2"},  # rename orphan
+            {"name": "_fuel:deadbeef", "id": "stale1"},  # 8-hex, not desired
+        ]
+        plan = plan_fuel_cron_reconcile(desired, current)
+
+        self.assertEqual(plan["to_add"], [])  # both desired names already present
+        self.assertEqual(plan["unchanged"], 2)
+
+        by_reason = {}
+        for job, reason in plan["to_remove"]:
+            by_reason.setdefault(reason, []).append(job["id"])
+        self.assertEqual(by_reason["duplicate"], ["a-old"])  # newest (a-new) kept
+        self.assertCountEqual(by_reason["legacy"], ["legacy1", "legacy2"])
+        self.assertEqual(by_reason["stale"], ["stale1"])
+
+    def test_missing_desired_is_added(self):
+        from apps.orchestrator.fuel_cron import plan_fuel_cron_reconcile
+
+        plan = plan_fuel_cron_reconcile(self._desired("_fuel:abcd1234"), [])
+        self.assertEqual([j["name"] for j in plan["to_add"]], ["_fuel:abcd1234"])
+        self.assertEqual(plan["unchanged"], 0)
+
+    def test_reserved_welcome_cron_is_never_reaped(self):
+        """``_fuel:welcome`` belongs to the welcome scheduler, not the workout
+        reconciler — it must be left untouched (not reaped as an orphan), or the
+        reconciler would fight the welcome lifecycle / kill a pending welcome."""
+        from apps.orchestrator.fuel_cron import plan_fuel_cron_reconcile
+
+        current = [
+            {"name": "_fuel:welcome", "id": "w1"},
+            {"name": "_fuel:Old Plan", "id": "o1"},
+        ]
+        plan = plan_fuel_cron_reconcile({}, current)  # desired empty
+        removed_names = [j["name"] for j, _ in plan["to_remove"]]
+        self.assertNotIn("_fuel:welcome", removed_names)  # reserved — untouched
+        self.assertIn("_fuel:Old Plan", removed_names)  # real orphan — reaped
+
+
+class DesiredFuelCronsTest(TestCase):
+    """_desired_fuel_crons branches by flow — this is what makes the reconciler
+    (and cleanup) own _fuel:* for legacy tenants, not just session ones."""
+
+    def setUp(self):
+        self.tenant = create_tenant(display_name="Desired Test", telegram_chat_id=999555666)
+        self.tenant.fuel_enabled = True
+        self.tenant.save(update_fields=["fuel_enabled"])
+
+    def test_fuel_disabled_returns_empty(self):
+        from apps.orchestrator.fuel_cron import _desired_fuel_crons
+
+        self.tenant.fuel_enabled = False
+        self.tenant.save(update_fields=["fuel_enabled"])
+        self.assertEqual(_desired_fuel_crons(self.tenant), [])
+
+    def test_legacy_no_active_plan_returns_empty(self):
+        from apps.fuel.models import FuelProfile
+        from apps.orchestrator.fuel_cron import _desired_fuel_crons
+
+        FuelProfile.objects.create(tenant=self.tenant, use_session_scheduling=False)
+        self.assertEqual(_desired_fuel_crons(self.tenant), [])
+
+    def test_legacy_active_plan_returns_one_named_cron(self):
+        from datetime import date as date_cls
+
+        from apps.fuel.models import FuelProfile, WorkoutPlan
+        from apps.orchestrator.fuel_cron import _desired_fuel_crons
+
+        FuelProfile.objects.create(tenant=self.tenant, use_session_scheduling=False, preferred_time="morning")
+        WorkoutPlan.objects.create(
+            tenant=self.tenant,
+            name="Builder",
+            status="active",
+            start_date=date_cls(2026, 5, 1),
+            weeks=4,
+            days_per_week=3,
+            schedule_json={"0": {}, "2": {}, "4": {}},
+        )
+        jobs = _desired_fuel_crons(self.tenant)
+        self.assertEqual([j["name"] for j in jobs], ["_fuel:Builder"])
+
+    def test_legacy_concurrent_plans_each_get_a_cron(self):
+        """Concurrent (opt-in) active plans each get their own prep cron —
+        normally there's just one (single-active invariant), but if a user
+        explicitly keeps two, the cron layer schedules BOTH (no silent
+        cron-less plan). Most-recent-first order, name-deduped."""
+        from datetime import date as date_cls
+
+        from apps.fuel.models import FuelProfile, WorkoutPlan
+        from apps.orchestrator.fuel_cron import _desired_fuel_crons
+
+        FuelProfile.objects.create(tenant=self.tenant, use_session_scheduling=False)
+        WorkoutPlan.objects.create(
+            tenant=self.tenant,
+            name="Older",
+            status="active",
+            start_date=date_cls(2026, 4, 1),
+            weeks=4,
+            days_per_week=3,
+            schedule_json={"0": {}},
+        )
+        WorkoutPlan.objects.create(
+            tenant=self.tenant,
+            name="Newer",
+            status="active",
+            start_date=date_cls(2026, 5, 1),
+            weeks=4,
+            days_per_week=3,
+            schedule_json={"0": {}},
+        )
+        jobs = _desired_fuel_crons(self.tenant)
+        self.assertEqual([j["name"] for j in jobs], ["_fuel:Newer", "_fuel:Older"])  # most-recent first
+
+    def test_session_flow_routes_to_derive(self):
+        from apps.fuel.models import FuelProfile
+        from apps.orchestrator.fuel_cron import _desired_fuel_crons
+
+        FuelProfile.objects.create(tenant=self.tenant, use_session_scheduling=True)
+        with patch(
+            "apps.orchestrator.fuel_cron.derive_fuel_cron_jobs",
+            return_value=[{"name": "_fuel:abcd1234"}],
+        ) as mock_derive:
+            jobs = _desired_fuel_crons(self.tenant)
+        mock_derive.assert_called_once_with(self.tenant)
+        self.assertEqual([j["name"] for j in jobs], ["_fuel:abcd1234"])
+
+    def test_legacy_desired_matches_seed_emission(self):
+        """Anti-flapping lock: the reconciler's legacy desired cron must be
+        byte-identical to build_cron_seed_jobs' _fuel: emission. The planner
+        keys on NAME only, so if the two hand-written legacy blocks ever drift
+        in expr/payload, the reconciler would never self-correct the body."""
+        from datetime import date as date_cls
+
+        from apps.fuel.models import FuelProfile, WorkoutPlan
+        from apps.orchestrator.config_generator import build_cron_seed_jobs
+        from apps.orchestrator.fuel_cron import _desired_fuel_crons
+
+        FuelProfile.objects.create(tenant=self.tenant, use_session_scheduling=False, preferred_time="evening")
+        WorkoutPlan.objects.create(
+            tenant=self.tenant,
+            name="Builder",
+            status="active",
+            start_date=date_cls(2026, 5, 1),
+            weeks=4,
+            days_per_week=3,
+            schedule_json={"0": {}, "2": {}},
+        )
+        desired = _desired_fuel_crons(self.tenant)
+        seed_fuel = [j for j in build_cron_seed_jobs(self.tenant) if j["name"].startswith("_fuel:")]
+        self.assertEqual(desired, seed_fuel)  # full dict equality, not just name
+
+    def test_concurrent_desired_matches_seed_emission(self):
+        """Anti-flap lock with TWO active plans — the multi-plan case the change
+        actually adds. Both emission sites must be byte-identical (order, dedup,
+        full dict) or the name-keyed reconciler churns on concurrent tenants."""
+        from datetime import date as date_cls
+
+        from apps.fuel.models import FuelProfile, WorkoutPlan
+        from apps.orchestrator.config_generator import build_cron_seed_jobs
+        from apps.orchestrator.fuel_cron import _desired_fuel_crons
+
+        FuelProfile.objects.create(tenant=self.tenant, use_session_scheduling=False, preferred_time="evening")
+        WorkoutPlan.objects.create(
+            tenant=self.tenant,
+            name="Lifting",
+            status="active",
+            start_date=date_cls(2026, 4, 1),
+            weeks=4,
+            days_per_week=3,
+            schedule_json={"0": {}, "2": {}},
+        )
+        WorkoutPlan.objects.create(
+            tenant=self.tenant,
+            name="Running",
+            status="active",
+            start_date=date_cls(2026, 5, 1),
+            weeks=4,
+            days_per_week=2,
+            schedule_json={"1": {}, "3": {}},
+        )
+        desired = _desired_fuel_crons(self.tenant)
+        seed_fuel = [j for j in build_cron_seed_jobs(self.tenant) if j["name"].startswith("_fuel:")]
+        self.assertEqual(len(desired), 2)
+        self.assertEqual(desired, seed_fuel)  # full list-of-dicts equality for N=2
+
+    def test_plan_named_welcome_gets_no_cron(self):
+        """A plan literally named 'welcome' collides with the reserved
+        _fuel:welcome — it must NOT be emitted (would flap the reconciler)."""
+        from datetime import date as date_cls
+
+        from apps.fuel.models import FuelProfile, WorkoutPlan
+        from apps.orchestrator.config_generator import build_cron_seed_jobs
+        from apps.orchestrator.fuel_cron import _desired_fuel_crons
+
+        FuelProfile.objects.create(tenant=self.tenant, use_session_scheduling=False)
+        WorkoutPlan.objects.create(
+            tenant=self.tenant,
+            name="welcome",
+            status="active",
+            start_date=date_cls(2026, 5, 1),
+            weeks=4,
+            days_per_week=2,
+            schedule_json={"0": {}, "2": {}},
+        )
+        self.assertEqual(_desired_fuel_crons(self.tenant), [])
+        # And the seed path agrees (no _fuel:welcome emitted for the plan).
+        seed_fuel = [j for j in build_cron_seed_jobs(self.tenant) if j["name"].startswith("_fuel:")]
+        self.assertEqual(seed_fuel, [])
+
+
+class ReconcileFuelCronsFleetTest(TestCase):
+    """The hourly fleet sweep MUST reach LEGACY (session-off) fuel tenants — every
+    prod fuel tenant is session-off, so this tenant-selection is the only thing
+    that reaps the accumulated _fuel: orphans. Pin it against a regression to a
+    session-only filter (which would pass the whole suite while leaving the leak)."""
+
+    def _mk(self, name, chat, *, fuel, fqdn, session=False):
+        from apps.fuel.models import FuelProfile
+
+        t = create_tenant(display_name=name, telegram_chat_id=chat)
+        t.fuel_enabled = fuel
+        t.container_fqdn = fqdn
+        t.save(update_fields=["fuel_enabled", "container_fqdn"])
+        if fuel:
+            FuelProfile.objects.create(tenant=t, use_session_scheduling=session)
+        return t
+
+    def test_fleet_sweep_selects_legacy_fuel_tenant_only(self):
+        legacy = self._mk("Legacy Fuel", 991001, fuel=True, fqdn="oc-legacy.example.com", session=False)
+        non_fuel = self._mk("No Fuel", 991002, fuel=False, fqdn="oc-nofuel.example.com")
+        blank_fqdn = self._mk("Blank FQDN", 991003, fuel=True, fqdn="", session=False)
+
+        from apps.orchestrator.tasks import reconcile_fuel_crons_task
+
+        per_tenant = {
+            "added": 0,
+            "removed": 3,
+            "unchanged": 1,
+            "errors": 0,
+            "duplicates_reaped": 0,
+            "legacy_reaped": 3,
+            "stale_reaped": 0,
+        }
+        with patch("apps.orchestrator.fuel_cron.regenerate_fuel_crons", return_value=per_tenant) as mock_regen:
+            totals = reconcile_fuel_crons_task()
+
+        called_ids = {c.args[0].id for c in mock_regen.call_args_list}
+        self.assertIn(legacy.id, called_ids)  # session-OFF legacy tenant IS swept
+        self.assertNotIn(non_fuel.id, called_ids)  # non-fuel tenant skipped
+        self.assertNotIn(blank_fqdn.id, called_ids)  # half-provisioned (blank fqdn) skipped
+        self.assertEqual(totals["tenants"], 1)
+        self.assertEqual(totals["legacy_reaped"], 3)
+
+
+class CompleteElapsedPlansTest(TestCase):
+    """Daily auto-complete: a plan whose weeks have elapsed flips to completed so
+    "active" stays meaningful; a still-running plan is untouched."""
+
+    def _plan(self, tenant, name, start, weeks=4):
+        from apps.fuel.models import WorkoutPlan
+
+        return WorkoutPlan.objects.create(
+            tenant=tenant,
+            name=name,
+            status="active",
+            start_date=start,
+            weeks=weeks,
+            days_per_week=3,
+            schedule_json={"0": {}, "2": {}},
+        )
+
+    @patch("apps.orchestrator.fuel_cron.regenerate_fuel_crons", return_value={})
+    def test_completes_elapsed_keeps_current(self, mock_regen):
+        from datetime import date as date_cls
+        from datetime import timedelta
+
+        from apps.fuel.models import PlanStatus, WorkoutPlan
+        from apps.orchestrator.tasks import complete_elapsed_plans_task
+
+        tenant = create_tenant(display_name="Elapse", telegram_chat_id=992001)
+        tenant.fuel_enabled = True
+        tenant.save(update_fields=["fuel_enabled"])
+        # Elapsed: started 10 weeks ago, 4-week plan → ended ~6 weeks ago.
+        elapsed = self._plan(tenant, "Old Block", date_cls.today() - timedelta(weeks=10))
+        # Current: started this week, still running.
+        current = self._plan(tenant, "Current Block", date_cls.today() - timedelta(days=2))
+
+        totals = complete_elapsed_plans_task()
+
+        elapsed.refresh_from_db()
+        current.refresh_from_db()
+        self.assertEqual(elapsed.status, PlanStatus.COMPLETED)
+        self.assertEqual(current.status, PlanStatus.ACTIVE)
+        self.assertEqual(totals["plans_completed"], 1)
+        self.assertEqual(WorkoutPlan.objects.filter(tenant=tenant, status="active").count(), 1)
+        # The affected tenant's fuel crons are reconciled so the completed
+        # plan's prep cron is dropped.
+        self.assertEqual(totals["tenants_reconciled"], 1)
+        self.assertEqual({c.args[0].id for c in mock_regen.call_args_list}, {tenant.id})
+
+
+class FuelEmissionSuppressionTest(TestCase):
+    """build_cron_seed_jobs must suppress legacy `_fuel:{plan_name}` emission
+    once the tenant is on the new per-session flow."""
+
+    def setUp(self):
+        from apps.fuel.models import FuelProfile, WorkoutPlan
+
+        self.tenant = create_tenant(display_name="Suppression Test", telegram_chat_id=999444555)
+        self.tenant.fuel_enabled = True
+        self.tenant.save(update_fields=["fuel_enabled"])
+        WorkoutPlan.objects.create(
+            tenant=self.tenant,
+            name="My Plan",
+            status="active",
+            start_date="2026-04-28",
+            weeks=4,
+            days_per_week=3,
+            schedule_json={"0": {}, "2": {}, "4": {}},
+        )
+        self.profile = FuelProfile.objects.create(tenant=self.tenant, preferred_time="morning")
+
+    def test_legacy_fuel_cron_emitted_when_flag_off(self):
+        jobs = build_cron_seed_jobs(self.tenant)
+        names = [j["name"] for j in jobs]
+        self.assertIn("_fuel:My Plan", names)
+
+    def test_legacy_fuel_cron_suppressed_when_flag_on(self):
+        self.profile.use_session_scheduling = True
+        self.profile.save(update_fields=["use_session_scheduling"])
+        jobs = build_cron_seed_jobs(self.tenant)
+        names = [j["name"] for j in jobs]
+        self.assertNotIn("_fuel:My Plan", names)
+
+
+class WorkoutSignalRegenTest(TestCase):
+    """Workout post_save / post_delete fires the debounced regen task only
+    when the tenant has opted into session scheduling."""
+
+    def setUp(self):
+        from apps.fuel.models import FuelProfile
+
+        self.tenant = create_tenant(display_name="Signal Test", telegram_chat_id=999555666)
+        self.tenant.fuel_enabled = True
+        self.tenant.save(update_fields=["fuel_enabled"])
+        FuelProfile.objects.create(tenant=self.tenant)
+
+    def _make_workout(self):
+        from datetime import date as date_cls
+
+        from apps.fuel.models import Workout
+
+        return Workout.objects.create(
+            tenant=self.tenant,
+            date=date_cls(2026, 5, 1),
+            category="strength",
+            activity="Push",
+            status="planned",
+        )
+
+    @patch("apps.cron.publish.publish_task")
+    def test_no_publish_when_flag_off(self, mock_publish):
+        self._make_workout()
+        mock_publish.assert_not_called()
+
+    @patch("apps.cron.publish.publish_task")
+    def test_publishes_debounced_regen_when_flag_on(self, mock_publish):
+        self.tenant.fuel_profile.use_session_scheduling = True
+        self.tenant.fuel_profile.save(update_fields=["use_session_scheduling"])
+        self._make_workout()
+        mock_publish.assert_called()
+        call = mock_publish.call_args
+        self.assertEqual(call[0][0], "regenerate_fuel_crons")
+        self.assertEqual(call[1]["delay_seconds"], 30)
+        self.assertEqual(call[1]["idempotency_key"], f"regen-fuel-{self.tenant.id}")
+
+    @patch("apps.cron.publish.publish_task")
+    def test_publishes_on_delete(self, mock_publish):
+        self.tenant.fuel_profile.use_session_scheduling = True
+        self.tenant.fuel_profile.save(update_fields=["use_session_scheduling"])
+        w = self._make_workout()
+        mock_publish.reset_mock()
+        w.delete()
+        mock_publish.assert_called_once()
+
+
+class FuelEndToEndTest(TestCase):
+    """End-to-end: Workout save → signal → regen → cron-list mutations.
+
+    QStash isn't configured in tests, so publish_task executes the regen
+    synchronously. We mock invoke_gateway_tool to capture what would be
+    sent to the container.
+    """
+
+    def setUp(self):
+        from apps.fuel.models import FuelProfile
+
+        self.tenant = create_tenant(display_name="E2E Test", telegram_chat_id=999666777)
+        self.tenant.fuel_enabled = True
+        self.tenant.container_fqdn = "oc-e2e.example.com"
+        self.tenant.save(update_fields=["fuel_enabled", "container_fqdn"])
+        FuelProfile.objects.create(tenant=self.tenant, use_session_scheduling=True)
+
+    @patch("apps.cron.gateway_client.invoke_gateway_tool")
+    def test_creating_planned_workout_emits_cron_add(self, mock_invoke):
+        from datetime import datetime, timedelta
+
+        from apps.fuel.models import Workout
+
+        # cron.list returns empty → all derived jobs are new adds
+        mock_invoke.side_effect = lambda tenant, tool, args: {"details": {"jobs": []}} if tool == "cron.list" else None
+        future = datetime.now(tz=UTC) + timedelta(hours=4)
+        Workout.objects.create(
+            tenant=self.tenant,
+            date=future.date(),
+            scheduled_at=future,
+            category="strength",
+            activity="Push",
+            status="planned",
+        )
+        # Signal → publish_task (sync since QStash not configured) → regen.
+        # Expect at least one cron.add call for the session.
+        add_calls = [c for c in mock_invoke.call_args_list if c[0][1] == "cron.add"]
+        self.assertGreaterEqual(len(add_calls), 1)
+        added_job = add_calls[0][0][2]["job"]
+        self.assertTrue(added_job["name"].startswith("_fuel:"))
+        self.assertEqual(len(added_job["name"]) - len("_fuel:"), 8)
+
+    @patch("apps.cron.gateway_client.invoke_gateway_tool")
+    def test_skip_workout_removes_its_cron(self, mock_invoke):
+        from datetime import datetime, timedelta
+
+        from apps.fuel.models import Workout, WorkoutStatus
+
+        future = datetime.now(tz=UTC) + timedelta(hours=4)
+        w = Workout.objects.create(
+            tenant=self.tenant,
+            date=future.date(),
+            scheduled_at=future,
+            category="strength",
+            activity="Push",
+            status="planned",
+        )
+        short = str(w.id).split("-")[0]
+
+        # After flipping to skipped, cron.list should still see the
+        # session's previously-added job; the next regen should remove it.
+        mock_invoke.reset_mock()
+        mock_invoke.side_effect = lambda tenant, tool, args: (
+            {"details": {"jobs": [{"name": f"_fuel:{short}", "id": "job-id-existing"}]}}
+            if tool == "cron.list"
+            else None
+        )
+
+        w.status = WorkoutStatus.SKIPPED
+        w.save(update_fields=["status", "updated_at"])
+
+        remove_calls = [c for c in mock_invoke.call_args_list if c[0][1] == "cron.remove"]
+        self.assertGreaterEqual(len(remove_calls), 1)
+        self.assertEqual(remove_calls[0][0][2]["jobId"], "job-id-existing")
+
+
+class HeartbeatPromptDistillationStepTest(TestCase):
+    """Heartbeat prompt directs the assistant to distill pending YardTalk sessions."""
+
+    def test_heartbeat_prompt_includes_distillation_step(self):
+        from .config_generator import _HEARTBEAT_CHECKIN_PROMPT
+
+        # The Step 0 distillation block must reference both runtime tools by
+        # name so the assistant can call them. Position must be before Step 1
+        # so distilled content is filed into the daily note BEFORE the
+        # cross-reference scan, otherwise the heartbeat would re-surface
+        # session content as proactive nudges.
+        self.assertIn("Step 0", _HEARTBEAT_CHECKIN_PROMPT)
+        self.assertIn("nbhd_sessions_pending", _HEARTBEAT_CHECKIN_PROMPT)
+        self.assertIn("nbhd_session_mark_processed", _HEARTBEAT_CHECKIN_PROMPT)
+
+        step_0_pos = _HEARTBEAT_CHECKIN_PROMPT.index("Step 0")
+        step_1_pos = _HEARTBEAT_CHECKIN_PROMPT.index("Step 1")
+        self.assertLess(step_0_pos, step_1_pos)
+
+    def test_heartbeat_prompt_marks_distillation_silent(self):
+        """Distillation must not produce a user-facing message."""
+        from .config_generator import _HEARTBEAT_CHECKIN_PROMPT
+
+        # The 'silent' instruction prevents distillation from triggering the
+        # Phase 2 sync block (which only fires when nbhd_send_to_user was
+        # called). It also prevents accidental user spam.
+        self.assertIn("SILENT", _HEARTBEAT_CHECKIN_PROMPT)

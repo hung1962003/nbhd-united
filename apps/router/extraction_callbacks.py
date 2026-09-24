@@ -1,0 +1,487 @@
+"""Telegram callback handlers for PendingExtraction approval actions.
+
+Callback data format:  extract:<action>:<pending_id>
+
+Actions:
+  approve_lesson  — create Lesson record, mark approved
+  approve_goal    — append to goals Document, mark approved
+  approve_task    — append to tasks Document, mark approved
+  undo_lesson     — delete Lesson, mark undone
+  undo_goal       — remove goal from Document, mark undone
+  undo_task       — remove task from Document, mark undone
+  dismiss         — mark dismissed (suppresses re-extraction for 30 days)
+"""
+
+from __future__ import annotations
+
+import logging
+import re
+from datetime import date
+
+import requests
+from django.conf import settings
+from django.http import JsonResponse
+from django.utils import timezone
+
+from apps.common.eval_sink import blocks_real_transport_for_identifier
+from apps.journal.document_authoring import merge_field_receipt, refresh_field_redactions
+from apps.journal.models import Document, PendingExtraction
+from apps.lessons.models import Lesson
+from apps.lessons.services import process_approved_lesson
+from apps.tenants.models import Tenant
+
+logger = logging.getLogger(__name__)
+
+TELEGRAM_API_BASE = "https://api.telegram.org/bot"
+TELEGRAM_TIMEOUT = 5
+
+
+def _author_legacy_document_entry(pending: PendingExtraction, *, seam: str):
+    """Author an extraction's text before it is spliced into a legacy document.
+
+    The typed Task/Goal branches already route through the chokepoint (W1c);
+    this covers the markdown-document fallback tenants still on, which was
+    appending ``pending.text`` verbatim. Background writer class — the text came
+    out of the nightly extractor, not from the human typing it here.
+    """
+    from apps.pii.authoring import author_text
+
+    return author_text(
+        pending.tenant,
+        pending.text,
+        seam=seam,
+        writer="background",
+        field="markdown",
+        model_label="journal.Document",
+    )
+
+
+def _undo_candidate_texts(pending: PendingExtraction) -> list[str]:
+    """Forms of ``pending.text`` an approved entry could be stored under.
+
+    Approval authors the text, so scrubbing on the RAW text alone would silently
+    leave a redacted entry in the document forever. The known-value substitution
+    reproduces what authoring stored (anything authoring minted is a binding by
+    now) without the minting side effects of a second authoring pass; the raw
+    form stays in the list for rows approved before this shipped.
+    """
+    from apps.pii.egress import redact_known_values
+
+    scrubbed = redact_known_values(pending.tenant, pending.text, seam="journal.extraction.undo")
+    return [scrubbed] if scrubbed == pending.text else [scrubbed, pending.text]
+
+
+def _owner_pending_text(pending: PendingExtraction) -> str:
+    """Render a placeholder-stored extraction at the Telegram owner boundary."""
+    from apps.pii.redactor import rehydrate_text
+
+    return rehydrate_text(pending.text, pending.tenant.pii_entity_map)
+
+
+# ── Telegram helpers ──────────────────────────────────────────────────────────
+
+
+def _answer_callback(callback_id: str, text: str) -> JsonResponse:
+    return JsonResponse({"method": "answerCallbackQuery", "callback_query_id": callback_id, "text": text})
+
+
+def _edit_message(chat_id: int, message_id: int, text: str) -> None:
+    if blocks_real_transport_for_identifier("telegram", chat_id):
+        return
+    token = getattr(settings, "TELEGRAM_BOT_TOKEN", "").strip()
+    if not token:
+        return
+    try:
+        requests.post(
+            f"{TELEGRAM_API_BASE}{token}/editMessageText",
+            json={"chat_id": chat_id, "message_id": message_id, "text": text, "reply_markup": {"inline_keyboard": []}},
+            timeout=TELEGRAM_TIMEOUT,
+        )
+    except Exception:
+        logger.exception("extraction_callbacks: failed to edit message")
+
+
+# ── Approval actions ──────────────────────────────────────────────────────────
+
+
+def _approve_lesson(pending: PendingExtraction) -> tuple[str, str | None]:
+    """Create a Lesson from the pending extraction and process its embedding.
+
+    Returns (user_message, lesson_id_str).
+    """
+    context = (
+        f"Extracted from daily note — {pending.source_date.isoformat() if pending.source_date else 'recent entries'}"
+    )
+    from apps.pii.store_authoring import author_store_fields
+
+    authored, receipts = author_store_fields(
+        pending.tenant,
+        {"text": pending.text, "context": context},
+        model_label="lessons.Lesson",
+        seam="router.extraction.approve_lesson",
+        writer="background",
+    )
+    lesson = Lesson.objects.create(
+        tenant=pending.tenant,
+        text=authored["text"],
+        context=authored["context"],
+        pii_receipts=receipts,
+        tags=pending.tags,
+        source_type="journal",
+        source_ref=str(pending.source_date or date.today()),
+        status="approved",
+        approved_at=timezone.now(),
+    )
+
+    # Generate embedding + connections (matches lesson_callbacks.py pattern)
+    try:
+        process_approved_lesson(lesson)
+    except Exception:
+        logger.exception("extraction_callbacks: embedding failed for lesson %s", lesson.id)
+
+    # Re-cluster if threshold reached (matches views.py pattern)
+    try:
+        from apps.lessons.clustering import refresh_constellation
+
+        if Lesson.objects.filter(tenant=pending.tenant, status="approved").count() >= 5:
+            refresh_constellation(pending.tenant)
+    except Exception:
+        logger.exception("extraction_callbacks: clustering failed for tenant %s", str(pending.tenant.id)[:8])
+
+    return "Added to your learning constellation! ✨", lesson.id
+
+
+def _approve_goal(pending: PendingExtraction) -> tuple[str, None]:
+    """Create a Goal — typed row when the tenant flag is on, legacy markdown otherwise.
+
+    Returns (user_message, None). The created row id (if any) is stored on
+    the pending extraction so undo can find it later.
+
+    NOTE: un-deduped insert primitive — see _approve_task. Human-tap approval
+    is exempt; agent/cron callers must dedupe upstream (find_duplicate_goal in
+    apps/journal/extraction.py).
+    """
+    if getattr(pending.tenant, "experimental_typed_journal_lifecycle", False):
+        from apps.journal.models import Goal
+        from apps.pii.authoring import author_text, truncate_placeholder_safe
+
+        authored_title = author_text(
+            pending.tenant,
+            pending.text,
+            seam="journal.extraction.goal.approve",
+            writer="background",
+            field="title",
+            model_label="journal.Goal",
+        )
+        authored_description = author_text(
+            pending.tenant,
+            "",
+            seam="journal.extraction.goal.approve",
+            writer="background",
+            field="description",
+            model_label="journal.Goal",
+        )
+        goal = Goal.objects.create(
+            tenant=pending.tenant,
+            title=truncate_placeholder_safe(
+                authored_title.text,
+                Goal._meta.get_field("title").max_length,
+            ),
+            description=authored_description.text,
+            pii_receipts={
+                "title": authored_title.receipt,
+                "description": authored_description.receipt,
+            },
+        )
+        pending.goal = goal
+        pending.save(update_fields=["goal"])
+        return "Added to your goals! 🎯", None
+
+    doc, _ = Document.objects.get_or_create(
+        tenant=pending.tenant,
+        kind=Document.Kind.GOAL,
+        slug="goals",
+        defaults={"title": "Goals", "markdown": "# Goals\n\n## Active\n\n## Completed\n"},
+    )
+    authored = _author_legacy_document_entry(pending, seam="journal.extraction.goal.approve")
+    today = date.today().isoformat()
+    new_entry = f"\n### {authored.text}\n- Added: {today}\n- Status: active\n"
+
+    if "## Active" in doc.markdown:
+        doc.markdown = doc.markdown.replace("## Active", f"## Active\n{new_entry}", 1)
+    else:
+        doc.markdown += f"\n## Active\n{new_entry}"
+
+    doc.pii_receipts = merge_field_receipt(
+        doc.pii_receipts,
+        "markdown",
+        authored.receipt,
+        stored_text=doc.markdown,
+    )
+    doc.save(update_fields=["markdown", "pii_receipts", "updated_at"])
+    return "Added to your goals! 🎯", None
+
+
+def _approve_task(pending: PendingExtraction) -> tuple[str, None]:
+    """Create a Task — typed row when the tenant flag is on, legacy markdown otherwise.
+
+    Returns (user_message, None). The created row id (if any) is stored on
+    the pending extraction so undo can find it later.
+
+    NOTE: this is an un-deduped insert primitive. The human-tap approval
+    callers (Telegram / LINE / web) are intentionally exempt — approving is
+    explicit user intent. Any *agent- or cron-reachable* caller MUST dedupe
+    upstream before creating the PendingExtraction (see the find_duplicate_task
+    guard in apps/journal/extraction.py) or it reintroduces the task-
+    resurrection loop.
+    """
+    if getattr(pending.tenant, "experimental_typed_journal_lifecycle", False):
+        from apps.journal.models import Task
+        from apps.pii.authoring import author_text, truncate_placeholder_safe
+
+        authored_title = author_text(
+            pending.tenant,
+            pending.text,
+            seam="journal.extraction.task.approve",
+            writer="background",
+            field="title",
+            model_label="journal.Task",
+        )
+        authored_description = author_text(
+            pending.tenant,
+            "",
+            seam="journal.extraction.task.approve",
+            writer="background",
+            field="description",
+            model_label="journal.Task",
+        )
+        task = Task.objects.create(
+            tenant=pending.tenant,
+            title=truncate_placeholder_safe(
+                authored_title.text,
+                Task._meta.get_field("title").max_length,
+            ),
+            description=authored_description.text,
+            pii_receipts={
+                "title": authored_title.receipt,
+                "description": authored_description.receipt,
+            },
+        )
+        pending.task = task
+        pending.save(update_fields=["task"])
+        return "Added to your tasks! ✅", None
+
+    doc, _ = Document.objects.get_or_create(
+        tenant=pending.tenant,
+        kind=Document.Kind.TASKS,
+        slug="tasks",
+        defaults={"title": "Tasks", "markdown": "# Tasks\n\n"},
+    )
+    authored = _author_legacy_document_entry(pending, seam="journal.extraction.task.approve")
+    today = date.today().isoformat()
+    doc.markdown += f"- [ ] {authored.text}  _(added {today})_\n"
+    doc.pii_receipts = merge_field_receipt(
+        doc.pii_receipts,
+        "markdown",
+        authored.receipt,
+        stored_text=doc.markdown,
+    )
+    doc.save(update_fields=["markdown", "pii_receipts", "updated_at"])
+    return "Added to your tasks! ✅", None
+
+
+def _approve_purpose(pending: PendingExtraction) -> tuple[str, None]:
+    """Materialize an approved purpose-hypothesis card into a confirmed Purpose.
+
+    Approving a North Star card IS the user's explicit assent, so the created
+    Purpose is ``CONFIRMED`` (not merely proposed) with ``origin=assistant_
+    proposed`` — the assistant surfaced it, the user endorsed it. Pillars are
+    carried from the card's ``tags``; the source date is recorded as evidence.
+    Idempotent-ish: a second approval of the same card would create a duplicate,
+    but ``ExtractionApproveView`` only acts on ``status=PENDING`` cards, so the
+    status flip guards re-entry.
+    """
+    from apps.journal.models import Purpose
+
+    pillars = [p for p in (pending.tags or []) if isinstance(p, str) and p.strip()]
+    evidence = []
+    if pending.source_date:
+        evidence.append(
+            {
+                "kind": "extraction",
+                "ref": pending.source_date.isoformat(),
+                "note": "Nightly cross-pillar hypothesis, confirmed by user.",
+            }
+        )
+    from apps.journal.store_authoring import author_store_fields
+
+    authored, receipts = author_store_fields(
+        pending.tenant,
+        {"statement": pending.text.strip(), "evidence": evidence},
+        model_label="journal.Purpose",
+        seam="journal.purpose.approve.background",
+        writer="background",
+    )
+    Purpose.objects.create(
+        tenant=pending.tenant,
+        statement=authored["statement"],
+        pillars=pillars,
+        origin=Purpose.Origin.ASSISTANT_PROPOSED,
+        status=Purpose.Status.CONFIRMED,
+        confirmed_at=timezone.now(),
+        evidence=authored["evidence"],
+        pii_receipts=receipts,
+    )
+    return "Set as your North Star. ✨", None
+
+
+# ── Undo actions ─────────────────────────────────────────────────────────────
+
+
+def _undo_lesson(pending: PendingExtraction) -> None:
+    """Delete the Lesson created by this extraction."""
+    if pending.lesson_id:
+        Lesson.objects.filter(id=pending.lesson_id, tenant=pending.tenant).delete()
+
+
+def _undo_goal(pending: PendingExtraction) -> None:
+    """Reverse the goal approval — delete the typed row when present,
+    otherwise scrub the legacy markdown block."""
+    if pending.goal_id:
+        from apps.journal.models import Goal
+
+        Goal.objects.filter(id=pending.goal_id, tenant=pending.tenant).delete()
+        return
+
+    doc = Document.objects.filter(tenant=pending.tenant, kind=Document.Kind.GOAL, slug="goals").first()
+    if doc:
+        for text in _undo_candidate_texts(pending):
+            pattern = r"\n" + re.escape(f"### {text}") + r"\n- Added: \d{4}-\d{2}-\d{2}\n- Status: active\n"
+            scrubbed = re.sub(pattern, "", doc.markdown)
+            if scrubbed != doc.markdown:
+                doc.markdown = scrubbed
+                break
+        doc.pii_receipts = refresh_field_redactions(doc.pii_receipts, "markdown", doc.markdown)
+        doc.save(update_fields=["markdown", "pii_receipts", "updated_at"])
+
+
+def _undo_task(pending: PendingExtraction) -> None:
+    """Reverse the task approval — delete the typed row when present,
+    otherwise scrub the legacy markdown line."""
+    if pending.task_id:
+        from apps.journal.models import Task
+
+        Task.objects.filter(id=pending.task_id, tenant=pending.tenant).delete()
+        return
+
+    doc = Document.objects.filter(tenant=pending.tenant, kind=Document.Kind.TASKS, slug="tasks").first()
+    if doc:
+        for text in _undo_candidate_texts(pending):
+            pattern = re.escape(f"- [ ] {text}") + r"  _\(added \d{4}-\d{2}-\d{2}\)_\n"
+            scrubbed = re.sub(pattern, "", doc.markdown)
+            if scrubbed != doc.markdown:
+                doc.markdown = scrubbed
+                break
+        doc.pii_receipts = refresh_field_redactions(doc.pii_receipts, "markdown", doc.markdown)
+        doc.save(update_fields=["markdown", "pii_receipts", "updated_at"])
+
+
+# ── Main handler ──────────────────────────────────────────────────────────────
+
+
+def handle_extraction_callback(update: dict, tenant: Tenant) -> JsonResponse:
+    """Handle inline button presses for PendingExtraction approval/dismissal."""
+    callback_query = update["callback_query"]
+    callback_data = callback_query["data"]
+    callback_id = callback_query["id"]
+    chat_id = callback_query["message"]["chat"]["id"]
+    message_id = callback_query["message"]["message_id"]
+
+    # Format: extract:<action>:<uuid>
+    parts = callback_data.split(":")
+    if len(parts) != 3:
+        return _answer_callback(callback_id, "Invalid action")
+
+    _, action, pending_id = parts
+
+    # Undo actions operate on APPROVED items
+    is_undo = action in ("undo_lesson", "undo_goal", "undo_task")
+
+    if is_undo:
+        pending = PendingExtraction.objects.filter(
+            id=pending_id,
+            tenant=tenant,
+            status=PendingExtraction.Status.APPROVED,
+        ).first()
+
+        if not pending:
+            # May already be undone
+            already = PendingExtraction.objects.filter(
+                id=pending_id,
+                tenant=tenant,
+                status=PendingExtraction.Status.UNDONE,
+            ).exists()
+            if already:
+                return _answer_callback(callback_id, "Already removed")
+            return _answer_callback(callback_id, "Not found")
+
+        try:
+            if action == "undo_lesson":
+                _undo_lesson(pending)
+            elif action == "undo_goal":
+                _undo_goal(pending)
+            elif action == "undo_task":
+                _undo_task(pending)
+        except Exception:
+            logger.exception("extraction_callbacks: undo failed for %s", pending_id)
+            return _answer_callback(callback_id, "Something went wrong — try again")
+
+        pending.status = PendingExtraction.Status.UNDONE
+        pending.resolved_at = timezone.now()
+        pending.save(update_fields=["status", "resolved_at"])
+
+        _edit_message(chat_id, message_id, f"~{_owner_pending_text(pending)[:80]}~ — removed")
+        return _answer_callback(callback_id, "Removed!")
+
+    # Approve/dismiss actions operate on PENDING items
+    pending = PendingExtraction.objects.filter(
+        id=pending_id,
+        tenant=tenant,
+        status=PendingExtraction.Status.PENDING,
+    ).first()
+
+    if not pending:
+        _edit_message(chat_id, message_id, "Already processed.")
+        return _answer_callback(callback_id, "Already processed")
+
+    if action == "dismiss":
+        pending.status = PendingExtraction.Status.DISMISSED
+        pending.resolved_at = timezone.now()
+        pending.save(update_fields=["status", "resolved_at"])
+        _edit_message(chat_id, message_id, f"❌ Skipped: {_owner_pending_text(pending)[:80]}")
+        return _answer_callback(callback_id, "Skipped")
+
+    try:
+        if action == "approve_lesson":
+            answer, lesson_id = _approve_lesson(pending)
+        elif action == "approve_goal":
+            answer, _ = _approve_goal(pending)
+        elif action == "approve_task":
+            answer, _ = _approve_task(pending)
+        else:
+            return _answer_callback(callback_id, "Unknown action")
+    except Exception:
+        logger.exception("extraction_callbacks: approval failed for %s", pending_id)
+        return _answer_callback(callback_id, "Something went wrong — try again")
+
+    pending.status = PendingExtraction.Status.APPROVED
+    pending.resolved_at = timezone.now()
+    if action == "approve_lesson" and lesson_id:
+        pending.lesson_id = lesson_id
+        pending.save(update_fields=["status", "resolved_at", "lesson_id"])
+    else:
+        pending.save(update_fields=["status", "resolved_at"])
+
+    kind_emoji = {"lesson": "💡", "goal": "🎯", "task": "✅"}.get(pending.kind, "✅")
+    _edit_message(chat_id, message_id, f"{kind_emoji} {_owner_pending_text(pending)[:80]}")
+    return _answer_callback(callback_id, answer)

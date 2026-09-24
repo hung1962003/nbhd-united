@@ -1,0 +1,373 @@
+import { wrapTool } from "../../tool-logger.js";
+const wrap = (def) => wrapTool(def, { plugin: "nbhd-settings-tools" });
+
+/**
+ * NBHD Settings Tools Plugin
+ *
+ * Tools for the assistant to read or change tenant-level settings that
+ * the consumer dashboard owns. Phase 1 exposes only primary-model
+ * selection. The tier gate enforced by the consumer PreferredModelView
+ * is reused at the runtime endpoint, so the assistant cannot quietly
+ * upgrade itself past its tier ceiling — a forbidden model returns
+ * "model_not_allowed" with the allowed list, which the assistant must
+ * relay honestly to the user instead of hallucinating a switch.
+ */
+
+const DEFAULT_REQUEST_TIMEOUT_MS = 15000;
+
+function asObject(value) {
+  return value && typeof value === "object" && !Array.isArray(value) ? value : {};
+}
+
+function asTrimmedString(value) {
+  return typeof value === "string" ? value.trim() : "";
+}
+
+function parseInteger(value, { defaultValue, min, max }) {
+  if (value === undefined || value === null || value === "") return defaultValue;
+  const parsed = Number.parseInt(String(value), 10);
+  if (Number.isNaN(parsed)) return defaultValue;
+  return Math.max(min, Math.min(max, parsed));
+}
+
+function getRuntimeConfig(api) {
+  const pluginConfig = asObject(api.pluginConfig);
+  const apiBaseUrl = asTrimmedString(
+    pluginConfig.apiBaseUrl || process.env.NBHD_API_BASE_URL,
+  ).replace(/\/+$/, "");
+  const tenantId = asTrimmedString(process.env.NBHD_TENANT_ID);
+  const internalKey = asTrimmedString(process.env.NBHD_INTERNAL_API_KEY);
+  const requestTimeoutMs = parseInteger(pluginConfig.requestTimeoutMs, {
+    defaultValue: DEFAULT_REQUEST_TIMEOUT_MS,
+    min: 1000,
+    max: 60000,
+  });
+
+  if (!apiBaseUrl) throw new Error("NBHD_API_BASE_URL is required");
+  if (!tenantId) throw new Error("NBHD_TENANT_ID is required");
+  if (!internalKey) throw new Error("NBHD_INTERNAL_API_KEY is required");
+
+  return { apiBaseUrl, tenantId, internalKey, requestTimeoutMs };
+}
+
+function renderPayload(payload) {
+  return {
+    content: [{ type: "text", text: JSON.stringify(payload, null, 2) }],
+    details: { json: payload },
+  };
+}
+
+function buildUrl(baseUrl, path, query) {
+  const url = new URL(`${baseUrl}${path}`);
+  for (const [key, value] of Object.entries(query || {})) {
+    if (value === undefined || value === null || value === "") continue;
+    url.searchParams.set(key, String(value));
+  }
+  return url;
+}
+
+const TOOL_ERROR_DETAIL_MAX_CHARS = 2000;
+
+function clampErrorDetail(text) {
+  if (text.length <= TOOL_ERROR_DETAIL_MAX_CHARS) return text;
+  return `${text.slice(0, TOOL_ERROR_DETAIL_MAX_CHARS)}… [truncated]`;
+}
+
+function compactErrorDetail(payload) {
+  const normalized = asObject(payload);
+  const entries = Object.entries(normalized).filter(([key]) => key !== "error");
+  if (entries.length === 0) return "";
+
+  const detail = normalized.detail;
+  const detailIsOnlyKey = entries.length === 1 && detail !== undefined;
+  if (detailIsOnlyKey && typeof detail === "string") {
+    return detail.trim() ? clampErrorDetail(detail.trim()) : "";
+  }
+
+  const value = detailIsOnlyKey ? detail : Object.fromEntries(entries);
+  if (value === null || (typeof value === "object" && Object.keys(value).length === 0)) return "";
+
+  try {
+    return clampErrorDetail(JSON.stringify(value));
+  } catch {
+    return clampErrorDetail(String(value));
+  }
+}
+
+async function callRuntime(
+  api,
+  { path, method = "GET", query, body, allowResponseStatuses = [] },
+) {
+  const runtime = getRuntimeConfig(api);
+  const url = buildUrl(runtime.apiBaseUrl, path, query);
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), runtime.requestTimeoutMs);
+
+  try {
+    const headers = {
+      "X-NBHD-Internal-Key": runtime.internalKey,
+      "X-NBHD-Tenant-Id": runtime.tenantId,
+    };
+    let requestBody;
+    if (method !== "GET" && body !== undefined) {
+      headers["Content-Type"] = "application/json";
+      requestBody = JSON.stringify(body);
+    }
+
+    const response = await fetch(url, {
+      method,
+      headers,
+      body: requestBody,
+      signal: controller.signal,
+    });
+
+    const raw = await response.text();
+    let payload = {};
+    if (raw) {
+      try {
+        payload = JSON.parse(raw);
+      } catch {
+        payload = { detail: "upstream returned a non-JSON response body" };
+      }
+    }
+
+    // The 400 "model_not_allowed" path is expected — the assistant needs
+    // to read the body to tell the user what's available. Surface it as
+    // a normal return rather than throwing, so the tool result includes
+    // the allowed_models array.
+    if (response.status === 400 && asObject(payload).error === "model_not_allowed") {
+      return asObject(payload);
+    }
+
+    if (!response.ok && !allowResponseStatuses.includes(response.status)) {
+      const normalized = asObject(payload);
+      const code = asTrimmedString(normalized.error) || "runtime_request_failed";
+      // DRF commonly returns field errors at the top level, e.g.
+      // {week_rating: ["..."]}, rather than under `detail`. Preserve that
+      // compact validation payload so the model can correct and retry.
+      const detail = compactErrorDetail(normalized);
+      const detailSuffix = detail ? ` (${detail})` : "";
+      throw new Error(`NBHD runtime error ${response.status}: ${code}${detailSuffix}`);
+    }
+
+    return asObject(payload);
+  } catch (error) {
+    if (error && error.name === "AbortError") {
+      throw new Error(`NBHD runtime request timed out after ${runtime.requestTimeoutMs}ms`);
+    }
+    throw error;
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
+function preferredModelPath(api) {
+  const runtime = getRuntimeConfig(api);
+  return `/api/v1/tenants/runtime/${encodeURIComponent(runtime.tenantId)}/preferred-model/`;
+}
+
+function placesSearchPath(api) {
+  const runtime = getRuntimeConfig(api);
+  return `/api/v1/integrations/runtime/${encodeURIComponent(runtime.tenantId)}/places/search/`;
+}
+
+function normalizePlace(value) {
+  const place = asObject(value);
+  return {
+    id: asTrimmedString(place.id),
+    name: asTrimmedString(place.name),
+    latitude: Number(place.latitude),
+    longitude: Number(place.longitude),
+    formatted_address_lines: Array.isArray(place.formatted_address_lines)
+      ? place.formatted_address_lines.filter((line) => typeof line === "string")
+      : [],
+    country: asTrimmedString(place.country),
+    country_code: asTrimmedString(place.country_code),
+    poi_category: asTrimmedString(place.poi_category),
+  };
+}
+
+function normalizePlacesPayload(value) {
+  const payload = asObject(value);
+  const normalized = {
+    verified: payload.verified === true,
+    fresh: payload.fresh === true,
+    source: asTrimmedString(payload.source),
+    results: Array.isArray(payload.results) ? payload.results.map(normalizePlace) : [],
+  };
+  const reason = asTrimmedString(payload.reason);
+  if (reason) normalized.reason = reason;
+  return normalized;
+}
+
+export default function register(api) {
+  // The manifest keys and this tool ship together. Fail closed unless the
+  // version-gated Django config explicitly enables tour-guide delivery.
+  if (asObject(api.pluginConfig).tourGuideEnabled === true) {
+    api.registerTool(
+      wrap({
+        name: "nbhd_tour_guide",
+        description:
+          "Returns the exact reply contract for travel/place recommendations. " +
+          "Call before answering what-to-do / where-to-eat / itinerary asks or any message " +
+          "with a 📍 Current location line.",
+        parameters: {
+          type: "object",
+          additionalProperties: false,
+          properties: {},
+        },
+        async execute(_id, _params) {
+          const pluginConfig = asObject(api.pluginConfig);
+          const payload = {
+            tour_guide_contract: pluginConfig.tourGuideContract,
+            mode: pluginConfig.tourGuideMode,
+          };
+          return renderPayload(payload);
+        },
+      }),
+      { optional: true },
+    );
+
+    api.registerTool(
+      wrap({
+        name: "nbhd_places_search",
+        description:
+          "Search Apple Maps structured place data for tour recommendations. Call this before " +
+          "recommending any place and use only the returned names and coordinates. A degraded " +
+          "verified=false response means hedge or recommend nothing as the tour-guide contract directs.",
+        parameters: {
+          type: "object",
+          additionalProperties: false,
+          properties: {
+            query: {
+              type: "string",
+              minLength: 1,
+              maxLength: 200,
+              description: "Place or category to search for.",
+            },
+            latitude: { type: "number", minimum: -90, maximum: 90 },
+            longitude: { type: "number", minimum: -180, maximum: 180 },
+            language: {
+              type: "string",
+              maxLength: 35,
+              pattern: "^[A-Za-z]{2,3}(?:-[A-Za-z0-9]{2,8})*$",
+            },
+            country: {
+              type: "string",
+              pattern: "^[A-Za-z]{2}$",
+            },
+            categories: {
+              type: "array",
+              maxItems: 10,
+              uniqueItems: true,
+              items: {
+                type: "string",
+                maxLength: 64,
+                pattern: "^[A-Za-z][A-Za-z0-9]*$",
+              },
+            },
+            limit: { type: "integer", minimum: 1, maximum: 20 },
+          },
+          required: ["query"],
+        },
+        async execute(_id, params) {
+          const input = asObject(params);
+          const hasLatitude = typeof input.latitude === "number";
+          const hasLongitude = typeof input.longitude === "number";
+          if (hasLatitude !== hasLongitude) {
+            throw new Error("latitude and longitude must be provided together");
+          }
+
+          const query = { q: asTrimmedString(input.query) };
+          if (hasLatitude) {
+            query.lat = input.latitude;
+            query.lon = input.longitude;
+          }
+          const language = asTrimmedString(input.language);
+          if (language) query.lang = language;
+          const country = asTrimmedString(input.country);
+          if (country) query.country = country;
+          if (Array.isArray(input.categories) && input.categories.length) {
+            query.categories = input.categories.map(asTrimmedString).filter(Boolean).join(",");
+          }
+          if (Number.isInteger(input.limit)) query.limit = input.limit;
+
+          const payload = await callRuntime(api, {
+            path: placesSearchPath(api),
+            method: "GET",
+            query,
+            allowResponseStatuses: [429, 503],
+          });
+          return renderPayload(normalizePlacesPayload(payload));
+        },
+      }),
+      { optional: true },
+    );
+  }
+
+  // ── Read state ──────────────────────────────────────────────────────
+  api.registerTool(
+    wrap({
+      name: "nbhd_get_preferred_model_state",
+      description:
+        "Read the user's current primary model and the list of models available to switch to. " +
+        "Returns: preferred_model (current selection — empty string means tier default is in use), " +
+        "applied_model (what the container is actually serving — may differ briefly during a switch), " +
+        "model_tier, and allowed_models (array of {model_id, alias}). " +
+        "Use this when the user asks 'what models can I use?' or before attempting nbhd_set_preferred_model.",
+      parameters: {
+        type: "object",
+        additionalProperties: false,
+        properties: {},
+      },
+      async execute(_id, _params) {
+        const payload = await callRuntime(api, {
+          path: preferredModelPath(api),
+          method: "GET",
+        });
+        return renderPayload(payload);
+      },
+    }),
+    { optional: true },
+  );
+
+  // ── Write — switch model ────────────────────────────────────────────
+  api.registerTool(
+    wrap({
+      name: "nbhd_set_preferred_model",
+      description:
+        "Switch the user's primary model. Pass model_id as one of the values returned by " +
+        "nbhd_get_preferred_model_state. Pass an empty string to revert to the tier default. " +
+        "If the model is not allowed on the user's tier, the response will have " +
+        "error='model_not_allowed' with the allowed_models list — relay this honestly to the " +
+        "user (e.g. 'Opus isn't on your tier, but you can switch to: <aliases>'). " +
+        "After a successful switch, the new model is active within ~30s (config push + " +
+        "gateway reload). 'applied_model' lags 'preferred_model' until the reload lands.",
+      parameters: {
+        type: "object",
+        additionalProperties: false,
+        properties: {
+          model_id: {
+            type: "string",
+            description:
+              "Exact model_id from allowed_models (not the alias). Empty string clears to tier default.",
+          },
+        },
+        required: ["model_id"],
+      },
+      async execute(_id, params) {
+        const input = asObject(params);
+        // Accept missing/null as empty (clear to default), but require the
+        // caller to have considered the input — we don't infer.
+        const modelId = typeof input.model_id === "string" ? input.model_id.trim() : "";
+        const payload = await callRuntime(api, {
+          path: preferredModelPath(api),
+          method: "POST",
+          body: { model_id: modelId },
+        });
+        return renderPayload(payload);
+      },
+    }),
+    { optional: true },
+  );
+}

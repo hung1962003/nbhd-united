@@ -1,0 +1,91 @@
+"""Serializers for usage dashboard endpoints."""
+
+from rest_framework import serializers
+
+
+class ModelBreakdownSerializer(serializers.Serializer):
+    model = serializers.CharField()
+    display_name = serializers.CharField()
+    input_tokens = serializers.IntegerField()
+    output_tokens = serializers.IntegerField()
+    cost = serializers.FloatField()
+    count = serializers.IntegerField()
+
+
+class BudgetSerializer(serializers.Serializer):
+    tenant_tokens_used = serializers.IntegerField()
+    tenant_token_budget = serializers.IntegerField()
+    tenant_estimated_cost = serializers.FloatField()
+    tenant_cost_used = serializers.FloatField()
+    tenant_cost_budget = serializers.FloatField()
+    budget_percentage = serializers.FloatField()
+    global_spent = serializers.FloatField()
+    global_remaining = serializers.FloatField(allow_null=True)
+
+
+class PeriodSerializer(serializers.Serializer):
+    start = serializers.CharField()
+    end = serializers.CharField()
+
+
+class SummaryInfraBreakdownSerializer(serializers.Serializer):
+    container = serializers.FloatField()
+    database_share = serializers.FloatField()
+    storage_share = serializers.FloatField()
+    platform_share = serializers.FloatField()
+
+
+class UsageSummarySerializer(serializers.Serializer):
+    period = PeriodSerializer()
+    total_input_tokens = serializers.IntegerField()
+    total_output_tokens = serializers.IntegerField()
+    total_tokens = serializers.IntegerField()
+    total_cost = serializers.FloatField()
+    message_count = serializers.IntegerField()
+    by_model = ModelBreakdownSerializer(many=True)
+    budget = BudgetSerializer()
+    # True-cost display (additive; distinct from the quota-driving budget block).
+    llm_cost = serializers.FloatField()
+    infra_cost = serializers.FloatField()
+    infra_source = serializers.CharField()
+    true_total_cost = serializers.FloatField()
+    infra_breakdown = SummaryInfraBreakdownSerializer()
+
+
+class DailyUsageSerializer(serializers.Serializer):
+    date = serializers.CharField()
+    input_tokens = serializers.IntegerField()
+    output_tokens = serializers.IntegerField()
+    cost = serializers.FloatField()
+    message_count = serializers.IntegerField()
+
+
+class ModelRateSerializer(serializers.Serializer):
+    model = serializers.CharField()
+    display_name = serializers.CharField()
+    input_per_million = serializers.FloatField()
+    output_per_million = serializers.FloatField()
+
+
+class InfraBreakdownSerializer(serializers.Serializer):
+    container = serializers.FloatField()
+    database_share = serializers.FloatField()
+    storage_share = serializers.FloatField()
+    platform_share = serializers.FloatField()
+    total = serializers.FloatField()
+    source = serializers.CharField(default="estimate")
+
+
+class TransparencySerializer(serializers.Serializer):
+    period = PeriodSerializer()
+    subscription_price = serializers.FloatField()
+    your_actual_cost = serializers.FloatField()
+    platform_infra = serializers.FloatField()
+    surplus = serializers.FloatField()
+    donation_amount = serializers.FloatField()
+    donation_enabled = serializers.BooleanField()
+    donation_percentage = serializers.IntegerField()
+    message_count = serializers.IntegerField()
+    model_rates = ModelRateSerializer(many=True)
+    infra_breakdown = InfraBreakdownSerializer()
+    explanation = serializers.CharField()

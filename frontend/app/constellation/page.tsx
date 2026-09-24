@@ -1,0 +1,774 @@
+"use client";
+
+import Link from "next/link";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+
+import { useConstellationQuery, useDeleteLessonMutation, usePendingLessonsQuery } from "@/lib/queries";
+import { isPlayEnabled } from "@/lib/constellation-game/flag";
+import {
+  ConstellationData,
+  ConstellationNode,
+  GraphData,
+  GraphEdge,
+  GraphNode,
+  GraphNodeKind,
+  GraphRelType,
+} from "@/lib/types";
+
+// ── Constants ────────────────────────────────────────────────────────────────
+
+const KIND_COLORS: Record<GraphNodeKind, string> = {
+  Lesson: "#7C6BF0", Cluster: "#E8B4B8", Evidence: "#4ECDC4", Tag: "#FBBF24",
+};
+const REL_COLORS: Record<GraphRelType, string> = {
+  IN_CLUSTER: "#E8B4B8", SIMILAR_TO: "#7C6BF0", EVIDENCED_BY: "#4ECDC4", TAGGED_WITH: "#FBBF24", REFINES: "#F472B6",
+};
+const ALL_KINDS: GraphNodeKind[] = ["Lesson", "Cluster", "Evidence", "Tag"];
+const ALL_RELS: GraphRelType[] = ["IN_CLUSTER", "SIMILAR_TO", "EVIDENCED_BY", "TAGGED_WITH", "REFINES"];
+const CLUSTER_PALETTE = ["#7C6BF0", "#E8B4B8", "#4ECDC4", "#FBBF24", "#60A5FA", "#F472B6", "#34D399", "#FB923C"];
+const VW = 2800;
+const VH = 1900;
+
+// ── Helpers ──────────────────────────────────────────────────────────────────
+
+function clusterColor(id: number): string { return CLUSTER_PALETTE[Math.abs(id) % CLUSTER_PALETTE.length]; }
+
+// Lessons wear their constellation's colour (the galaxy + iOS views already do)
+// so groups read as colour families at a glance; kind still drives the shape.
+function nodeColor(n: GraphNode): string {
+  if (n.kind === "Lesson") return n.cluster_id != null ? clusterColor(n.cluster_id) : "#9FB0C8";
+  if (n.kind === "Cluster") return n.color || KIND_COLORS.Cluster;
+  return KIND_COLORS[n.kind];
+}
+
+// Every colour a node can wear — one soft radial-gradient halo def per colour
+// (cheap glow; per-node blur filters are what kill mobile).
+const HALO_COLORS = [...new Set([...CLUSTER_PALETTE, ...Object.values(KIND_COLORS), "#9FB0C8"])];
+
+function nodeLabel(n: GraphNode): string {
+  if (n.kind === "Lesson") { const t = n.text?.split(".")[0]; return t ? (t.length > 80 ? t.slice(0, 77) + "\u2026" : t + ".") : String(n.id); }
+  if (n.kind === "Cluster") return n.constellation || n.label;
+  if (n.kind === "Evidence") return n.label;
+  if (n.kind === "Tag") return `#${n.label}`;
+  return String(n.id);
+}
+
+// Base (world-unit) radius; the render counter-scales each node group so the
+// on-screen size stays in the same comfortable band across zoom levels.
+function nodeRadius(n: GraphNode): number {
+  return n.kind === "Cluster" ? 24 : n.kind === "Lesson" ? 12 + (n.weight || 2) * 1.6 : n.kind === "Evidence" ? 10 : 8;
+}
+
+function cypherPathFor(node: GraphNode): string {
+  if (node.kind === "Lesson") return `MATCH (l:Lesson {id: ${node.id}})-[r]-(n) RETURN l, r, n`;
+  if (node.kind === "Cluster") return `MATCH (c:Cluster {id: ${String(node.id).split(":")[1]}})<-[:IN_CLUSTER]-(l:Lesson) RETURN c, l`;
+  if (node.kind === "Evidence") return `MATCH (l:Lesson)-[:EVIDENCED_BY]->(e:Evidence {id: "${node.id}"}) RETURN l, e`;
+  if (node.kind === "Tag") return `MATCH (l:Lesson)-[:TAGGED_WITH]->(t:Tag {name: "${node.label}"}) RETURN l, t`;
+  return `MATCH (n) RETURN n LIMIT 25`;
+}
+
+// ── Data transformation ──────────────────────────────────────────────────────
+
+function detectRefines(nodes: ConstellationNode[]): Array<{ from: number; to: number }> {
+  const byCluster = new Map<number, ConstellationNode[]>();
+  for (const n of nodes) { if (n.cluster_id != null) { const arr = byCluster.get(n.cluster_id) || []; arr.push(n); byCluster.set(n.cluster_id, arr); } }
+  const result: Array<{ from: number; to: number }> = [];
+  for (const group of byCluster.values()) {
+    if (group.length < 2) continue;
+    const sorted = [...group].sort((a, b) => new Date(a.created_at).getTime() - new Date(b.created_at).getTime());
+    for (let i = 0; i < sorted.length - 1; i++) {
+      const days = (new Date(sorted[i + 1].created_at).getTime() - new Date(sorted[i].created_at).getTime()) / 864e5;
+      if (days > 30) result.push({ from: sorted[i].id, to: sorted[i + 1].id });
+    }
+  }
+  return result;
+}
+
+function buildGraphData(data: ConstellationData): GraphData {
+  const { nodes, edges, affinity_edges, clusters } = data;
+  const lessonNodes: GraphNode[] = nodes.map((n) => ({ id: n.id, kind: "Lesson" as const, label: n.tags.slice(0, 2).join(" / ") || n.text.split(/\s+/).slice(0, 5).join(" "), text: n.text, context: n.context, tags: n.tags, source_type: n.source_type, source_ref: n.source_ref, created_at: n.created_at, cluster_id: n.cluster_id ?? undefined, weight: 3, x: n.x, y: n.y }));
+  const clusterNodes: GraphNode[] = clusters.map((c) => ({ id: `c:${c.id}`, kind: "Cluster" as const, label: c.label, constellation: c.label, theme: c.label, color: clusterColor(c.id), count: c.count, tags: c.tags }));
+  const evidenceNodes: GraphNode[] = nodes.filter((n) => n.source_ref).map((n) => ({ id: `ev:${n.id}`, kind: "Evidence" as const, label: n.source_ref!, source_type: n.source_type, source_ref: n.source_ref, created_at: n.created_at }));
+  const tagSet = new Set<string>(); nodes.forEach((n) => n.tags.forEach((t) => tagSet.add(t)));
+  const tagNodes: GraphNode[] = [...tagSet].map((t) => ({ id: `tag:${t}`, kind: "Tag" as const, label: t }));
+  const seen = new Set<string>();
+  const uniqueEdges = [...edges, ...affinity_edges].filter((e) => { const k = `${Math.min(Number(e.source), Number(e.target))}-${Math.max(Number(e.source), Number(e.target))}`; if (seen.has(k)) return false; seen.add(k); return true; });
+  const similarEdges: GraphEdge[] = uniqueEdges.map((e) => ({ source: Number(e.source), target: Number(e.target), type: "SIMILAR_TO" as const, similarity: e.similarity }));
+  const clusterEdges: GraphEdge[] = nodes.filter((n) => n.cluster_id != null).map((n) => ({ source: n.id, target: `c:${n.cluster_id}`, type: "IN_CLUSTER" as const }));
+  const evidenceEdges: GraphEdge[] = nodes.filter((n) => n.source_ref).map((n) => ({ source: n.id, target: `ev:${n.id}`, type: "EVIDENCED_BY" as const }));
+  const tagEdges: GraphEdge[] = nodes.flatMap((n) => n.tags.map((t) => ({ source: n.id, target: `tag:${t}`, type: "TAGGED_WITH" as const })));
+  const refinesEdges: GraphEdge[] = detectRefines(nodes).map((r) => ({ source: r.from, target: r.to, type: "REFINES" as const }));
+  return { nodes: [...lessonNodes, ...clusterNodes, ...evidenceNodes, ...tagNodes], edges: [...clusterEdges, ...similarEdges, ...evidenceEdges, ...tagEdges, ...refinesEdges], kindColors: KIND_COLORS, relColors: REL_COLORS };
+}
+
+// ── Tag-based clustering fallback ────────────────────────────────────────────
+
+function clusterByTags(nodes: ConstellationNode[]): { clusters: ConstellationData["clusters"]; clusterMap: Map<number, number> } {
+  if (nodes.length === 0) return { clusters: [], clusterMap: new Map() };
+  const tagCounts = new Map<string, number>();
+  for (const n of nodes) for (const t of n.tags) tagCounts.set(t, (tagCounts.get(t) || 0) + 1);
+  const seedTags = [...tagCounts.entries()].filter(([, c]) => c >= 2).sort((a, b) => b[1] - a[1]).slice(0, 8).map(([t]) => t);
+  if (seedTags.length < 2) { seedTags.length = 0; seedTags.push(...[...tagCounts.entries()].sort((a, b) => b[1] - a[1]).slice(0, 6).map(([t]) => t)); }
+  const clusterMap = new Map<number, number>();
+  for (const n of nodes) { const idx = n.tags.findIndex((t) => seedTags.includes(t)); if (idx >= 0) clusterMap.set(n.id, seedTags.indexOf(n.tags[idx])); }
+  for (const n of nodes) { if (!clusterMap.has(n.id) && seedTags.length > 0) clusterMap.set(n.id, n.id % seedTags.length); }
+  const counts = new Map<number, number>(); const tagSets = new Map<number, Set<string>>();
+  for (const [nid, cid] of clusterMap) { counts.set(cid, (counts.get(cid) || 0) + 1); const nd = nodes.find((x) => x.id === nid); if (nd) { const s = tagSets.get(cid) || new Set<string>(); nd.tags.forEach((t) => s.add(t)); tagSets.set(cid, s); } }
+  return { clusters: seedTags.map((tag, i) => ({ id: i, label: tag.charAt(0).toUpperCase() + tag.slice(1).replace(/_/g, " "), count: counts.get(i) || 0, tags: [...(tagSets.get(i) || [])].slice(0, 5) })).filter((c) => c.count > 0), clusterMap };
+}
+
+// ── Graph layout ─────────────────────────────────────────────────────────────
+// Semantic islands. The backend already projects every lesson's embedding to 2D
+// (PCA — the same coordinates the galaxy game flies through), so the layout's
+// job is presentation, not invention: seed each constellation at its embedding
+// centroid (similar constellations stay neighbours), relax the islands apart so
+// each owns its region with void between, and keep each lesson's real position
+// within its island. The old ring-of-hubs fanned every cluster outward and sent
+// every cross-cluster link straight through the empty middle — the hairball.
+
+const GOLDEN = Math.PI * (3 - Math.sqrt(5)); // golden-angle spiral for coordless nodes
+
+function layoutGraph(graphNodes: GraphNode[], graphEdges: GraphEdge[], clusters: ConstellationData["clusters"]): Record<string, { x: number; y: number }> {
+  const pos: Record<string, { x: number; y: number }> = {};
+  const lessons = graphNodes.filter((n) => n.kind === "Lesson");
+  const hasXY = (n: GraphNode) => n.x != null && n.y != null && isFinite(n.x) && isFinite(n.y);
+  const valid = lessons.filter(hasXY);
+
+  // PCA bounds → canvas mapping (the semantic seed for hubs and lone lessons).
+  let minX = Infinity, maxX = -Infinity, minY = Infinity, maxY = -Infinity;
+  for (const n of valid) { minX = Math.min(minX, n.x!); maxX = Math.max(maxX, n.x!); minY = Math.min(minY, n.y!); maxY = Math.max(maxY, n.y!); }
+  const spanX = maxX - minX || 1, spanY = maxY - minY || 1;
+  const toWorld = (x: number, y: number) => ({ x: ((x - minX) / spanX) * (VW * 0.76) + VW * 0.12, y: ((y - minY) / spanY) * (VH * 0.76) + VH * 0.12 });
+
+  const byCluster = new Map<number, GraphNode[]>();
+  for (const n of lessons) { if (n.cluster_id != null) { const a = byCluster.get(n.cluster_id) ?? []; a.push(n); byCluster.set(n.cluster_id, a); } }
+
+  // Island radius: room for a disc of members.
+  const discR = new Map<number, number>();
+  for (const [cid, arr] of byCluster) discR.set(cid, Math.max(170, 64 * Math.sqrt(arr.length) + 70));
+
+  // Hub seeds: embedding centroid; clusters with no positioned members get a ring slot.
+  const cidList = clusters.map((c) => c.id);
+  const hub = new Map<number, { x: number; y: number }>();
+  cidList.forEach((cid, i) => {
+    const members = (byCluster.get(cid) ?? []).filter(hasXY);
+    if (members.length && valid.length >= 2) {
+      let mx = 0, my = 0;
+      for (const m of members) { mx += m.x!; my += m.y!; }
+      hub.set(cid, toWorld(mx / members.length, my / members.length));
+    } else {
+      const a = (i / Math.max(1, cidList.length)) * Math.PI * 2 - Math.PI / 2;
+      hub.set(cid, { x: VW / 2 + Math.cos(a) * VW * 0.3, y: VH / 2 + Math.sin(a) * VH * 0.3 });
+    }
+  });
+
+  // Relax hubs apart: pairwise floor = both islands' discs + a void gap, so every
+  // constellation reads as its own place even when the embeddings sit cramped.
+  for (let it = 0; it < 120; it++) {
+    for (let i = 0; i < cidList.length; i++) for (let j = i + 1; j < cidList.length; j++) {
+      const a = hub.get(cidList[i])!, b = hub.get(cidList[j])!;
+      const need = (discR.get(cidList[i]) ?? 170) + (discR.get(cidList[j]) ?? 170) + 170;
+      const dx = a.x - b.x, dy = a.y - b.y, d = Math.hypot(dx, dy) || 0.01;
+      if (d < need) { const push = (need - d) * 0.5, nx = dx / d, ny = dy / d; a.x += nx * push; a.y += ny * push; b.x -= nx * push; b.y -= ny * push; }
+    }
+  }
+
+  graphNodes.filter((n) => n.kind === "Cluster").forEach((n) => {
+    const cid = parseInt(String(n.id).split(":")[1], 10);
+    const h = hub.get(cid);
+    if (h) pos[String(n.id)] = { ...h };
+  });
+
+  // Members keep their embedding shape, scaled into the island; coordless ones
+  // take golden-angle spiral slots (organic fill, never a lattice).
+  for (const [cid, arr] of byCluster) {
+    const h = hub.get(cid)!;
+    const R = discR.get(cid)!;
+    const withXY = arr.filter(hasXY);
+    let cpx = 0, cpy = 0;
+    for (const m of withXY) { cpx += m.x!; cpy += m.y!; }
+    cpx /= Math.max(1, withXY.length); cpy /= Math.max(1, withXY.length);
+    let maxD = 0;
+    for (const m of withXY) maxD = Math.max(maxD, Math.hypot(m.x! - cpx, m.y! - cpy));
+    const k = maxD > 1e-9 ? (R * 0.8) / maxD : 0;
+    let slot = 0;
+    for (const m of arr) {
+      if (hasXY(m) && k > 0) {
+        pos[String(m.id)] = { x: h.x + (m.x! - cpx) * k, y: h.y + (m.y! - cpy) * k };
+      } else {
+        const a = slot * GOLDEN, r = R * 0.82 * Math.sqrt((slot + 0.6) / Math.max(1, arr.length));
+        pos[String(m.id)] = { x: h.x + Math.cos(a) * r, y: h.y + Math.sin(a) * r };
+        slot++;
+      }
+    }
+  }
+
+  // Lone lessons sit at their own embedding spot — their place in the map is real.
+  let lone = 0;
+  for (const n of lessons) {
+    if (n.cluster_id != null) continue;
+    if (hasXY(n) && valid.length >= 2) { pos[String(n.id)] = toWorld(n.x!, n.y!); }
+    else { const a = lone * GOLDEN; pos[String(n.id)] = { x: VW / 2 + Math.cos(a) * VW * 0.36, y: VH / 2 + Math.sin(a) * VH * 0.36 }; lone++; }
+  }
+
+  // Collision relax over ALL lessons (the old pass only separated same-cluster
+  // pairs, so island edges could overlap) + clearance around every hub so its
+  // name has room to breathe.
+  const ids = lessons.map((n) => String(n.id));
+  const MIND = 95, HUBD = 130;
+  for (let it = 0; it < 80; it++) {
+    for (let i = 0; i < ids.length; i++) for (let j = i + 1; j < ids.length; j++) {
+      const pa = pos[ids[i]], pb = pos[ids[j]];
+      if (!pa || !pb) continue;
+      const dx = pa.x - pb.x, dy = pa.y - pb.y, d = Math.sqrt(dx * dx + dy * dy + 0.01);
+      if (d < MIND) { const push = (MIND - d) * 0.45, nx = dx / d, ny = dy / d; pa.x += nx * push; pa.y += ny * push; pb.x -= nx * push; pb.y -= ny * push; }
+    }
+    for (const idStr of ids) {
+      const p = pos[idStr];
+      if (!p) continue;
+      for (const cid of cidList) {
+        const h = hub.get(cid)!;
+        const dx = p.x - h.x, dy = p.y - h.y, d = Math.hypot(dx, dy) || 0.01;
+        if (d < HUBD) { p.x += (dx / d) * (HUBD - d); p.y += (dy / d) * (HUBD - d); }
+      }
+    }
+  }
+
+  // Evidence rides just outside its lesson, away from the hub.
+  graphNodes.filter((n) => n.kind === "Evidence").forEach((n) => {
+    const pid = String(n.id).split(":")[1], p = pos[pid], parent = graphNodes.find((x) => x.kind === "Lesson" && String(x.id) === pid);
+    if (!p || !parent) { pos[String(n.id)] = { x: VW / 2, y: VH / 2 }; return; }
+    const h = parent.cluster_id != null ? hub.get(parent.cluster_id) : undefined;
+    if (!h) { pos[String(n.id)] = { x: p.x + 48, y: p.y }; return; }
+    const dx = p.x - h.x, dy = p.y - h.y, d = Math.hypot(dx, dy) || 1;
+    pos[String(n.id)] = { x: p.x + (dx / d) * 48, y: p.y + (dy / d) * 48 };
+  });
+
+  // Tags hover near the lessons that carry them — not a pile in the centre.
+  graphNodes.filter((n) => n.kind === "Tag").forEach((n, i) => {
+    const carriers = graphEdges.filter((e) => e.type === "TAGGED_WITH" && String(e.target) === String(n.id)).map((e) => pos[String(e.source)]).filter((p): p is { x: number; y: number } => !!p);
+    const a = i * GOLDEN;
+    if (carriers.length) {
+      let mx = 0, my = 0;
+      for (const c of carriers) { mx += c.x; my += c.y; }
+      pos[String(n.id)] = { x: mx / carriers.length + Math.cos(a) * 72, y: my / carriers.length + Math.sin(a) * 72 };
+    } else {
+      pos[String(n.id)] = { x: VW / 2 + Math.cos(a) * 220, y: VH / 2 + Math.sin(a) * 220 };
+    }
+  });
+
+  // Fit the relaxed layout back into the canvas (centred, uniform scale) so the
+  // initial view always frames the whole map.
+  let bx0 = Infinity, by0 = Infinity, bx1 = -Infinity, by1 = -Infinity;
+  for (const key in pos) { const p = pos[key]; bx0 = Math.min(bx0, p.x); by0 = Math.min(by0, p.y); bx1 = Math.max(bx1, p.x); by1 = Math.max(by1, p.y); }
+  if (isFinite(bx0)) {
+    const m = 150, bw = Math.max(1, bx1 - bx0), bh = Math.max(1, by1 - by0);
+    const s = Math.min(1.1, (VW - 2 * m) / bw, (VH - 2 * m) / bh);
+    const ox = (VW - bw * s) / 2, oy = (VH - bh * s) / 2;
+    for (const key in pos) { const p = pos[key]; p.x = ox + (p.x - bx0) * s; p.y = oy + (p.y - by0) * s; }
+    // The fit can compress a crowded layout below readable spacing — a short
+    // post-fit touch-up restores a floor between lessons, clamped to canvas.
+    if (s < 0.9) {
+      for (let it = 0; it < 30; it++) for (let i = 0; i < ids.length; i++) for (let j = i + 1; j < ids.length; j++) {
+        const pa = pos[ids[i]], pb = pos[ids[j]];
+        if (!pa || !pb) continue;
+        const dx = pa.x - pb.x, dy = pa.y - pb.y, d = Math.sqrt(dx * dx + dy * dy + 0.01);
+        if (d < 74) {
+          const push = (74 - d) * 0.4, nx = dx / d, ny = dy / d;
+          pa.x = Math.min(VW - 110, Math.max(110, pa.x + nx * push)); pa.y = Math.min(VH - 110, Math.max(110, pa.y + ny * push));
+          pb.x = Math.min(VW - 110, Math.max(110, pb.x - nx * push)); pb.y = Math.min(VH - 110, Math.max(110, pb.y - ny * push));
+        }
+      }
+    }
+  }
+  return pos;
+}
+
+// ── SVG Glyphs ───────────────────────────────────────────────────────────────
+
+function GlyphFor({ kind, color, r = 16, selected = false }: { kind: GraphNodeKind; color: string; r?: number; selected?: boolean }) {
+  const stroke = selected ? "#ffffff" : color, strokeW = selected ? 2.5 : 1.5, fill = `${color}30`;
+  if (kind === "Cluster") { const pts = Array.from({ length: 6 }, (_, i) => { const a = (Math.PI / 3) * i - Math.PI / 2; return `${Math.cos(a) * r},${Math.sin(a) * r}`; }).join(" "); return <polygon points={pts} fill={fill} stroke={stroke} strokeWidth={strokeW} />; }
+  if (kind === "Evidence") return <rect x={-r} y={-r} width={r * 2} height={r * 2} rx={r * 0.35} fill={fill} stroke={stroke} strokeWidth={strokeW} />;
+  if (kind === "Tag") return <polygon points={`0,${-r} ${r},0 0,${r} ${-r},0`} fill={fill} stroke={stroke} strokeWidth={strokeW} />;
+  return <circle r={r} fill={fill} stroke={stroke} strokeWidth={strokeW} />;
+}
+
+// ── Property Inspector ───────────────────────────────────────────────────────
+
+function Inspector({ node, neighbors, onClose, onJump, onDelete, deleting }: { node: GraphNode; neighbors: Array<{ other: GraphNode; type: GraphRelType; dir: "in" | "out"; similarity?: number }>; onClose: () => void; onJump: (id: string | number) => void; onDelete: (id: number) => void; deleting: boolean }) {
+  const color = nodeColor(node);
+  const cypher = cypherPathFor(node);
+  const [copied, setCopied] = useState(false);
+  const [confirmDelete, setConfirmDelete] = useState(false);
+  const props = useMemo(() => {
+    const out: Array<[string, string | number]> = [];
+    if (node.kind === "Lesson") { out.push(["id", node.id as number], ["title", nodeLabel(node)]); if (node.cluster_id != null) out.push(["cluster_id", node.cluster_id]); if (node.weight) out.push(["weight", node.weight]); if (node.source_type) out.push(["source_type", node.source_type]); if (node.source_ref) out.push(["source_ref", node.source_ref]); if (node.created_at) out.push(["created_at", node.created_at.slice(0, 10)]); if (node.tags?.length) out.push(["tags", node.tags.join(", ")]); }
+    else if (node.kind === "Cluster") { out.push(["id", String(node.id).split(":")[1] || String(node.id)]); if (node.constellation) out.push(["constellation", node.constellation]); if (node.theme) out.push(["theme", node.theme]); if (node.color) out.push(["color", node.color]); }
+    else if (node.kind === "Evidence") { out.push(["id", String(node.id)]); if (node.source_type) out.push(["source_type", node.source_type]); if (node.source_ref) out.push(["source_ref", node.source_ref]); if (node.created_at) out.push(["created_at", node.created_at.slice(0, 10)]); }
+    else if (node.kind === "Tag") { out.push(["id", String(node.id)], ["name", node.label]); }
+    return out;
+  }, [node]);
+  return (
+    <div className="p-6">
+      <div className="flex items-start justify-between gap-3">
+        <div className="min-w-0">
+          <div className="flex items-center gap-2 mb-1">
+            <span className="h-4 w-4 flex items-center justify-center"><svg viewBox="-10 -10 20 20" className="h-full w-full"><GlyphFor kind={node.kind} color={color} r={8} selected /></svg></span>
+            <span className="text-[9px] uppercase tracking-[0.22em] font-headline" style={{ color }}>:{node.kind}</span>
+          </div>
+          <div className="font-serif italic text-[22px] leading-snug">{node.kind === "Lesson" ? `\u201C${node.text}\u201D` : nodeLabel(node)}</div>
+        </div>
+        <button type="button" onClick={onClose} className="h-7 w-7 rounded-full hover:bg-white/10 text-[#64748B] hover:text-white flex items-center justify-center shrink-0 text-lg leading-none">&times;</button>
+      </div>
+      {node.kind === "Lesson" && node.context && <p className="mt-4 text-[12px] text-[#94A3B8] leading-relaxed">{node.context}</p>}
+      <div className="mt-6 rounded-lg border border-white/[0.08] bg-black/40">
+        <div className="flex items-center justify-between px-3 py-2 border-b border-white/[0.06]">
+          <span className="text-[9px] uppercase tracking-[0.22em] text-[#7C6BF0] font-headline">Cypher</span>
+          <button type="button" onClick={() => { const c = navigator.clipboard; if (!c) return; c.writeText(cypher).then(() => { setCopied(true); setTimeout(() => setCopied(false), 1400); }).catch(() => {}); }} className="text-[10px] text-[#94A3B8] hover:text-white">{copied ? "copied \u2713" : "copy"}</button>
+        </div>
+        <pre className="p-3 text-[11px] leading-relaxed overflow-x-auto" style={{ fontFamily: "var(--font-mono, monospace)", color: "#CBD5E1" }}>{cypher}</pre>
+      </div>
+      <div className="mt-5">
+        <div className="text-[9px] uppercase tracking-[0.22em] text-[#64748B] mb-2 font-headline">Properties</div>
+        <div className="rounded-lg border border-white/[0.06] overflow-hidden">
+          {props.map(([k, v], i) => (<div key={k} className={`flex items-start gap-3 px-3 py-2 text-[11px] ${i !== props.length - 1 ? "border-b border-white/[0.04]" : ""}`}><span className="text-[#64748B] w-24 shrink-0" style={{ fontFamily: "var(--font-mono, monospace)" }}>{k}</span><span className="text-[#E2E8F0] min-w-0 break-words" style={{ fontFamily: "var(--font-mono, monospace)" }}>{String(v ?? "\u2014")}</span></div>))}
+        </div>
+      </div>
+      {neighbors.length > 0 && (<div className="mt-5">
+        <div className="flex items-center justify-between mb-2"><span className="text-[9px] uppercase tracking-[0.22em] text-[#64748B] font-headline">Relationships</span><span className="text-[9px] text-[#64748B]">{neighbors.length}</span></div>
+        <div className="space-y-1">{neighbors.map((nb, i) => { const relC = REL_COLORS[nb.type]; const oC = nodeColor(nb.other); return (
+          <button key={`nb-${i}`} type="button" onClick={() => onJump(nb.other.id)} className="w-full text-left rounded-lg border border-white/[0.06] hover:border-white/20 bg-white/[0.02] hover:bg-white/[0.05] px-3 py-2 flex items-center gap-2 transition group">
+            <span className="text-[9px] shrink-0" style={{ color: relC, fontFamily: "var(--font-mono, monospace)" }}>{nb.dir === "out" ? "\u2192" : "\u2190"} :{nb.type}{nb.similarity ? `:${nb.similarity.toFixed(2)}` : ""}</span>
+            <span className="h-3 w-px bg-white/10 mx-1" /><span className="h-2 w-2 rounded-full shrink-0" style={{ backgroundColor: oC }} />
+            <span className="text-[11px] text-[#CBD5E1] group-hover:text-white truncate min-w-0 flex-1">{nodeLabel(nb.other)}</span>
+          </button>); })}</div>
+      </div>)}
+      {node.kind === "Lesson" && (<div className="mt-6 pt-5 border-t border-white/[0.06]">
+        {!confirmDelete ? (
+          <button type="button" onClick={() => setConfirmDelete(true)} className="w-full rounded-lg border border-[#F87171]/30 text-[#F87171] hover:bg-[#F87171]/10 px-3 py-2.5 text-[10px] uppercase tracking-[0.22em] font-headline transition">Remove from constellation</button>
+        ) : (
+          <div className="rounded-lg border border-[#F87171]/30 bg-[#F87171]/[0.06] p-3">
+            <p className="text-[12px] text-[#E2E8F0] leading-relaxed mb-3">Delete this lesson permanently? This can&rsquo;t be undone.</p>
+            <div className="flex gap-2">
+              <button type="button" disabled={deleting} onClick={() => onDelete(node.id as number)} className="flex-1 rounded-lg bg-[#F87171] text-[#04070b] px-3 py-2 text-[10px] uppercase tracking-[0.22em] font-headline hover:bg-[#FCA5A5] disabled:opacity-50 transition">{deleting ? "Deleting…" : "Delete"}</button>
+              <button type="button" disabled={deleting} onClick={() => setConfirmDelete(false)} className="flex-1 rounded-lg border border-white/10 text-[#94A3B8] hover:text-white hover:border-white/20 px-3 py-2 text-[10px] uppercase tracking-[0.22em] font-headline transition">Cancel</button>
+            </div>
+          </div>
+        )}
+      </div>)}
+    </div>
+  );
+}
+
+// ── Main Page ────────────────────────────────────────────────────────────────
+
+const EMPTY_CONSTELLATION: ConstellationData = { nodes: [], edges: [], affinity_edges: [], clusters: [] };
+
+export default function ConstellationPage() {
+  const { data: rawData = EMPTY_CONSTELLATION, isLoading, error: queryError } = useConstellationQuery();
+  const { data: pendingLessons = [] } = usePendingLessonsQuery();
+  const deleteLesson = useDeleteLessonMutation();
+  const loading = isLoading;
+  const error = queryError instanceof Error ? queryError.message : queryError ? "Failed to load constellation." : "";
+  const pendingCount = pendingLessons.length;
+
+  // Gated "exploration mode" (Phase-1 beta — hidden unless opted in). See lib/constellation-game/flag.
+  const [playEnabled, setPlayEnabled] = useState(false);
+  useEffect(() => setPlayEnabled(isPlayEnabled()), []);
+
+  const effectiveData = useMemo(() => {
+    if (rawData.clusters.length > 0 || !(rawData.nodes.length > 0 && rawData.nodes.every((n) => n.cluster_id == null))) return rawData;
+    const { clusters, clusterMap } = clusterByTags(rawData.nodes);
+    return { ...rawData, nodes: rawData.nodes.map((n) => { const cid = clusterMap.get(n.id); return cid != null ? { ...n, cluster_id: cid } : n; }), clusters };
+  }, [rawData]);
+
+  const graphData = useMemo(() => buildGraphData(effectiveData), [effectiveData]);
+  const [kindFilter, setKindFilter] = useState<Set<GraphNodeKind>>(new Set(["Lesson", "Cluster"]));
+  const [relFilter, setRelFilter] = useState<Set<GraphRelType>>(new Set(["IN_CLUSTER", "SIMILAR_TO", "REFINES"]));
+  const [simThreshold] = useState(0.5);
+  const [isolated, setIsolated] = useState<string | null>(null);
+  const [showHint, setShowHint] = useState(false);
+  const dismissHint = useCallback(() => {
+    setShowHint(false);
+    try { window.localStorage.setItem("nbhd_constellation_hint_dismissed", "1"); } catch { /* private mode */ }
+  }, []);
+  // Orientation hint: show once per device (until dismissed), then auto-retire it
+  // so it never sits persistently over the search bar on return visits / mobile.
+  useEffect(() => {
+    try {
+      if (window.localStorage.getItem("nbhd_constellation_hint_dismissed") !== "1") setShowHint(true);
+    } catch {
+      setShowHint(true);
+    }
+  }, []);
+  useEffect(() => {
+    if (!showHint) return;
+    const t = setTimeout(dismissHint, 8000);
+    return () => clearTimeout(t);
+  }, [showHint, dismissHint]);
+
+  const visibleNodes = useMemo(() => {
+    let list = graphData.nodes.filter((n) => kindFilter.has(n.kind));
+    if (isolated) {
+      const isoCid = parseInt(String(isolated).split(":")[1], 10);
+      list = list.filter((n) => {
+        if (n.kind === "Cluster") return String(n.id) === String(isolated);
+        if (n.kind === "Lesson") return n.cluster_id === isoCid;
+        if (n.kind === "Evidence") { const p = graphData.nodes.find((x) => x.kind === "Lesson" && x.id === parseInt(String(n.id).split(":")[1], 10)); return p?.cluster_id === isoCid; }
+        if (n.kind === "Tag") return graphData.edges.some((e) => e.type === "TAGGED_WITH" && String(e.target) === String(n.id) && graphData.nodes.some((x) => x.kind === "Lesson" && x.id === e.source && x.cluster_id === isoCid));
+        return false;
+      });
+    }
+    return list;
+  }, [kindFilter, isolated, graphData]);
+
+  const visibleIds = useMemo(() => new Set(visibleNodes.map((n) => String(n.id))), [visibleNodes]);
+  const visibleEdges = useMemo(() => graphData.edges.filter((e) => relFilter.has(e.type) && visibleIds.has(String(e.source)) && visibleIds.has(String(e.target)) && !(e.type === "SIMILAR_TO" && (e.similarity || 0) < simThreshold)), [relFilter, visibleIds, simThreshold, graphData.edges]);
+
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  const baseLayout = useMemo(() => layoutGraph(visibleNodes, visibleEdges, effectiveData.clusters), [visibleNodes.length, visibleEdges.length, effectiveData.clusters]);
+  const [positions, setPositions] = useState<Record<string, { x: number; y: number }>>(baseLayout);
+  useEffect(() => { setPositions(baseLayout); }, [baseLayout]);
+
+  const stageRef = useRef<HTMLElement>(null);
+  const [stageSize, setStageSize] = useState({ w: 0, h: 0 });
+  const [pan, setPan] = useState({ x: 0, y: 0 });
+  const [zoom, setZoom] = useState(0.85);
+  const dragRef = useRef<{ mode: "pan" | "node"; x: number; y: number; px: number; py: number; moved: number; nodeId?: string; offsetX?: number; offsetY?: number; sx?: number; sy?: number } | null>(null);
+
+  // Measure stage — multiple strategies to guarantee non-zero dimensions
+  useEffect(() => {
+    function measure() {
+      const el = stageRef.current;
+      if (el) { const r = el.getBoundingClientRect(); if (r.width > 0 && r.height > 0) { setStageSize({ w: r.width, h: r.height }); return; } }
+      setStageSize({ w: Math.max(400, window.innerWidth - 48), h: Math.max(400, window.innerHeight - 200) });
+    }
+    measure();
+    const t1 = setTimeout(measure, 50), t2 = setTimeout(measure, 200);
+    let ro: ResizeObserver | null = null;
+    if (stageRef.current) { ro = new ResizeObserver(measure); ro.observe(stageRef.current); }
+    window.addEventListener("resize", measure);
+    return () => { clearTimeout(t1); clearTimeout(t2); ro?.disconnect(); window.removeEventListener("resize", measure); };
+  }, []);
+
+  const [selectedId, setSelectedId] = useState<string | number | null>(null);
+  const [hover, setHover] = useState<string | number | null>(null);
+  const [query, setQuery] = useState("");
+  const baseScale = stageSize.w && stageSize.h ? Math.min(stageSize.w / VW, stageSize.h / VH) : 1;
+  const scale = baseScale * zoom;
+  const screenToWorld = useCallback((sx: number, sy: number) => ({ x: (sx - stageSize.w / 2 - pan.x) / scale + VW / 2, y: (sy - stageSize.h / 2 - pan.y) / scale + VH / 2 }), [stageSize.w, stageSize.h, scale, pan.x, pan.y]);
+
+  // Focus = the selected node, or (desktop) the hovered one. Focusing lights up
+  // a node's neighbourhood and quiets everything else — the single best tool
+  // against hairball reading.
+  const focusId = selectedId ?? hover;
+  const focusAdj = useMemo(() => {
+    if (focusId == null) return null;
+    // VISIBLE edges only — a node connected solely through a hidden tag/evidence
+    // edge shouldn't brighten (or count toward the label budget below).
+    const s = new Set<string>();
+    for (const e of visibleEdges) {
+      if (String(e.source) === String(focusId)) s.add(String(e.target));
+      else if (String(e.target) === String(focusId)) s.add(String(e.source));
+    }
+    return s;
+  }, [focusId, visibleEdges]);
+
+  // Shared pointer logic for mouse + touch
+  const pinchRef = useRef<{ d0: number; z0: number } | null>(null);
+
+  function pointerDown(cx: number, cy: number, target: EventTarget) {
+    if ((target as HTMLElement).closest("[data-no-drag]")) return;
+    const nodeEl = (target as SVGElement).closest("[data-graphnode]");
+    if (nodeEl) {
+      const nid = nodeEl.getAttribute("data-node-id") || "";
+      const sw = screenToWorld(cx, cy);
+      const p = positions[nid] || { x: 0, y: 0 };
+      dragRef.current = { mode: "node", nodeId: nid, offsetX: p.x - sw.x, offsetY: p.y - sw.y, moved: 0, sx: cx, sy: cy, x: cx, y: cy, px: pan.x, py: pan.y };
+    } else {
+      dragRef.current = { mode: "pan", x: cx, y: cy, px: pan.x, py: pan.y, moved: 0 };
+    }
+  }
+  function pointerMove(cx: number, cy: number) {
+    const d = dragRef.current; if (!d) return;
+    if (d.mode === "pan") {
+      const dx = cx - d.x, dy = cy - d.y;
+      d.moved = Math.max(d.moved, Math.hypot(dx, dy));
+      setPan({ x: d.px + dx, y: d.py + dy });
+    } else if (d.mode === "node" && d.nodeId) {
+      const dx = cx - (d.sx || 0), dy = cy - (d.sy || 0);
+      d.moved = Math.max(d.moved, Math.hypot(dx, dy));
+      if (d.moved > 3) {
+        const w = screenToWorld(cx, cy);
+        setPositions((prev) => ({ ...prev, [d.nodeId!]: { x: w.x + (d.offsetX || 0), y: w.y + (d.offsetY || 0) } }));
+      }
+    }
+  }
+  function pointerUp() {
+    const d = dragRef.current; dragRef.current = null; if (!d) return;
+    if (d.mode === "pan" && d.moved < 4) {
+      if (selectedId) setSelectedId(null);
+      else if (isolated) setIsolated(null);
+    } else if (d.mode === "node" && d.moved < 3 && d.nodeId) {
+      const n = graphData.nodes.find((x) => String(x.id) === String(d.nodeId));
+      if (!n) return;
+      if (n.kind === "Cluster") { setIsolated((prev) => (prev === d.nodeId! ? null : d.nodeId!)); setSelectedId(d.nodeId!); }
+      else setSelectedId(d.nodeId!);
+    }
+  }
+
+  // Mouse events
+  function onMouseDown(e: React.MouseEvent) { pointerDown(e.clientX, e.clientY, e.target); }
+  function onMouseMove(e: React.MouseEvent) { pointerMove(e.clientX, e.clientY); }
+  function onMouseUp() { pointerUp(); }
+  function onWheel(e: React.WheelEvent) { e.preventDefault(); setZoom((z) => Math.max(0.3, Math.min(3, z * Math.exp(-e.deltaY * 0.0015)))); }
+
+  // Touch events — single finger drags/taps, two fingers pinch-zoom
+  function onTouchStart(e: React.TouchEvent) {
+    if (e.touches.length === 2) {
+      // Pinch start
+      const dx = e.touches[0].clientX - e.touches[1].clientX;
+      const dy = e.touches[0].clientY - e.touches[1].clientY;
+      pinchRef.current = { d0: Math.hypot(dx, dy), z0: zoom };
+      dragRef.current = null;
+      return;
+    }
+    if (e.touches.length === 1) {
+      const t = e.touches[0];
+      pointerDown(t.clientX, t.clientY, t.target);
+    }
+  }
+  function onTouchMove(e: React.TouchEvent) {
+    e.preventDefault(); // prevent scroll
+    if (e.touches.length === 2 && pinchRef.current) {
+      const dx = e.touches[0].clientX - e.touches[1].clientX;
+      const dy = e.touches[0].clientY - e.touches[1].clientY;
+      const d = Math.hypot(dx, dy);
+      const ratio = d / pinchRef.current.d0;
+      setZoom(Math.max(0.3, Math.min(3, pinchRef.current.z0 * ratio)));
+      return;
+    }
+    if (e.touches.length === 1) {
+      pointerMove(e.touches[0].clientX, e.touches[0].clientY);
+    }
+  }
+  function onTouchEnd(e: React.TouchEvent) {
+    if (pinchRef.current && e.touches.length < 2) { pinchRef.current = null; return; }
+    if (e.touches.length === 0) pointerUp();
+  }
+  function toggleKind(k: GraphNodeKind) { setKindFilter((s) => { const n = new Set(s); n.has(k) ? n.delete(k) : n.add(k); return n; }); setSelectedId(null); if (k === "Cluster" && kindFilter.has(k)) setIsolated(null); }
+  function toggleRel(r: GraphRelType) { setRelFilter((s) => { const n = new Set(s); n.has(r) ? n.delete(r) : n.add(r); return n; }); }
+  const selected = selectedId ? graphData.nodes.find((n) => String(n.id) === String(selectedId)) ?? null : null;
+  const results = useMemo(() => { if (!query.trim()) return []; const q = query.toLowerCase(); return visibleNodes.filter((n) => nodeLabel(n).toLowerCase().includes(q) || (n.text || "").toLowerCase().includes(q) || String(n.id).includes(q)).slice(0, 8); }, [query, visibleNodes]);
+  function focusNode(id: string | number) {
+    const p = positions[String(id)];
+    if (!p) {
+      // Target is hidden by the current kind/rel filters (e.g. an Evidence/Tag
+      // neighbour shown in the Inspector), or by cluster isolation (a cross-cluster
+      // neighbour clicked from the Relationships panel). Reveal it so the next layout
+      // pass gives it a position, then select it — instead of silently no-op'ing.
+      const target = graphData.nodes.find((n) => String(n.id) === String(id));
+      if (!target) return;
+      // If isolation is active and the target lives outside the isolated cluster,
+      // lift isolation so visibleNodes will include it after the next render.
+      if (isolated) {
+        const isoCid = parseInt(String(isolated).split(":")[1], 10);
+        const inCluster =
+          target.kind === "Cluster"
+            ? String(target.id) === String(isolated)
+            : target.kind === "Lesson"
+            ? target.cluster_id === isoCid
+            : false;
+        if (!inCluster) setIsolated(null);
+      }
+      setKindFilter((s) => (s.has(target.kind) ? s : new Set([...s, target.kind])));
+      const rels = graphData.edges.filter((e) => String(e.source) === String(id) || String(e.target) === String(id)).map((e) => e.type);
+      if (rels.length) setRelFilter((s) => { const n = new Set(s); rels.forEach((r) => n.add(r)); return n; });
+      setSelectedId(id);
+      return;
+    }
+    setPan({ x: -(p.x - VW / 2) * baseScale * 1.4, y: -(p.y - VH / 2) * baseScale * 1.4 }); setZoom(1.4); setSelectedId(id);
+  }
+  const neighbors = useMemo(() => { if (!selected) return []; return graphData.edges.filter((e) => String(e.source) === String(selected.id) || String(e.target) === String(selected.id)).map((e) => { const oid = String(e.source) === String(selected.id) ? e.target : e.source; const dir: "in" | "out" = String(e.source) === String(selected.id) ? "out" : "in"; const other = graphData.nodes.find((n) => String(n.id) === String(oid)); return other ? { other, type: e.type, dir, similarity: e.similarity } : null; }).filter((x): x is NonNullable<typeof x> => x != null); }, [selected, graphData]);
+
+  if (error) return <div className="rounded-panel border border-rose-border bg-rose-bg px-3 py-2 text-sm text-rose-text">{error}</div>;
+  if (loading) return <div className="flex items-center justify-center py-20"><p className="text-sm text-ink-muted">Loading your constellation...</p></div>;
+
+  return (
+    <div className="flex flex-col flex-1 -mt-4 relative text-[#E2E8F0]" style={{ background: "#04070b", minHeight: "calc(100vh - 120px)" }}>
+      {/* Stage — flex child for real dimensions */}
+      <section ref={stageRef} className="flex-1 relative overflow-hidden min-h-[500px] cursor-grab active:cursor-grabbing select-none"
+        onMouseDown={onMouseDown} onMouseMove={onMouseMove} onMouseUp={onMouseUp} onMouseLeave={onMouseUp} onWheel={onWheel}
+        onTouchStart={onTouchStart} onTouchMove={onTouchMove} onTouchEnd={onTouchEnd}
+        style={{ touchAction: "none" }}>
+        <div className="absolute inset-0 pointer-events-none" style={{ background: "radial-gradient(ellipse 80% 60% at 35% 40%, rgba(124,107,240,0.06) 0%, transparent 55%), radial-gradient(ellipse 70% 50% at 75% 65%, rgba(78,205,196,0.05) 0%, transparent 55%), radial-gradient(circle at 50% 100%, rgba(232,180,184,0.04) 0%, transparent 60%), #04070b" }} />
+        <div className="absolute inset-0 pointer-events-none opacity-[0.04]" style={{ backgroundImage: "linear-gradient(#7C6BF0 1px, transparent 1px), linear-gradient(90deg, #7C6BF0 1px, transparent 1px)", backgroundSize: `${48 * zoom}px ${48 * zoom}px`, backgroundPosition: `${pan.x}px ${pan.y}px` }} />
+
+        {/* Header */}
+        <div data-no-drag className="absolute top-0 left-0 right-0 z-30 px-4 sm:px-6 pt-4 pb-3 flex items-start gap-3 flex-wrap">
+          <div className="min-w-0">
+            <div className="flex items-center gap-2"><span className="text-[10px] uppercase tracking-[0.24em] text-[#7C6BF0] font-headline">Constellation Graph</span></div>
+            <div className="mt-1 flex items-center gap-4 text-[11px] text-[#64748B]">
+              <span><span className="text-white">{visibleNodes.length}</span> nodes</span>
+              <span><span className="text-white">{visibleEdges.length}</span> relationships</span>
+              {pendingCount > 0 && <Link href="/constellation/pending" className="rounded-full border border-[#7C6BF0]/40 bg-[#7C6BF0]/10 px-2.5 py-0.5 text-[10px] font-semibold text-[#9B8DF5] hover:bg-[#7C6BF0]/20 transition">{pendingCount} waiting</Link>}
+            </div>
+          </div>
+          <div className="flex-1 min-w-[200px] max-w-[420px] relative">
+            <div className="rounded-xl border border-white/10 bg-black/50 backdrop-blur-xl px-3 py-2 flex items-center gap-2">
+              <svg width="14" height="14" viewBox="0 0 24 24" fill="none" className="text-[#7C6BF0] shrink-0"><circle cx="11" cy="11" r="7" stroke="currentColor" strokeWidth="2"/><path d="M16 16l4.5 4.5" stroke="currentColor" strokeWidth="2" strokeLinecap="round"/></svg>
+              <input value={query} onChange={(e) => setQuery(e.target.value)} placeholder="Search lessons, clusters, tags..." className="flex-1 bg-transparent outline-none text-[12px] text-white placeholder:text-[#475569]" style={{ fontFamily: "var(--font-mono, monospace)" }} />
+              {query && <button type="button" onClick={() => setQuery("")} className="text-[#64748B] hover:text-white text-[10px]">clear</button>}
+            </div>
+            {results.length > 0 && (<div className="absolute left-0 right-0 top-full mt-1 rounded-xl border border-white/10 bg-black/85 backdrop-blur-xl overflow-hidden z-40">
+              {results.map((n) => { const c = nodeColor(n); return (<button key={String(n.id)} type="button" onClick={() => { focusNode(n.id); setQuery(""); }} className="w-full text-left px-3 py-2 hover:bg-white/[0.04] flex items-center gap-2 border-b border-white/[0.04] last:border-0">
+                <span className="h-1.5 w-1.5 rounded-full shrink-0" style={{ backgroundColor: c, boxShadow: `0 0 6px ${c}` }} />
+                <span className="text-[9px] uppercase tracking-[0.2em] text-[#64748B] w-16 shrink-0 font-headline">{n.kind}</span>
+                <span className="text-[11px] text-white truncate flex-1">{nodeLabel(n)}</span>
+              </button>); })}
+            </div>)}
+          </div>
+          {/* Mobile Play entry — the toolbar below (with the desktop Play link) is
+              hidden on phones, so surface a tappable Play CTA here on small screens. */}
+          {playEnabled && (
+            <Link
+              href="/constellation/play"
+              title="Fly your galaxy (beta)"
+              className="sm:hidden order-last ml-auto flex items-center gap-1.5 min-h-[44px] px-4 rounded-full border border-accent/40 bg-accent/15 text-accent text-[11px] uppercase tracking-wider font-headline"
+            >
+              <svg width="11" height="11" viewBox="0 0 10 10" fill="none" aria-hidden="true"><path d="M2 1.4l6.2 3.6L2 8.6z" fill="currentColor" /></svg>Play
+            </Link>
+          )}
+          <div className="hidden sm:flex items-center gap-1 rounded-full border border-white/10 bg-black/50 backdrop-blur-xl p-1">
+            <button type="button" onClick={() => setZoom((z) => Math.max(0.3, z * 0.8))} className="h-7 w-7 rounded-full hover:bg-white/10 text-[#94A3B8] hover:text-white flex items-center justify-center" aria-label="Zoom out">&minus;</button>
+            <span className="text-[10px] text-[#64748B] w-10 text-center tabular-nums" style={{ fontFamily: "var(--font-mono, monospace)" }}>{(zoom * 100).toFixed(0)}%</span>
+            <button type="button" onClick={() => setZoom((z) => Math.min(3, z * 1.25))} className="h-7 w-7 rounded-full hover:bg-white/10 text-[#94A3B8] hover:text-white flex items-center justify-center" aria-label="Zoom in">+</button>
+            <span className="h-4 w-px bg-white/10 mx-0.5" />
+            <button type="button" onClick={() => setPositions(baseLayout)} title="Relayout" className="px-2.5 h-7 rounded-full hover:bg-white/10 text-[#94A3B8] hover:text-white text-[10px] uppercase tracking-wider flex items-center gap-1.5 font-headline">
+              <svg width="11" height="11" viewBox="0 0 24 24" fill="none" aria-hidden="true"><path d="M21 12a9 9 0 0 1-9 9 9 9 0 0 1-6.36-2.64L3 16" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" /><path d="M3 21v-5h5" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" /><path d="M3 12a9 9 0 0 1 9-9 9 9 0 0 1 6.36 2.64L21 8" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" /><path d="M21 3v5h-5" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" /></svg>Relayout</button>
+            {playEnabled && (
+              <Link href="/constellation/play" title="Fly your galaxy (beta)" className="px-2.5 h-7 rounded-full text-accent hover:text-accent-hover hover:bg-accent/15 text-[10px] uppercase tracking-wider flex items-center gap-1.5 font-headline">
+                <svg width="10" height="10" viewBox="0 0 10 10" fill="none" aria-hidden="true"><path d="M2 1.4l6.2 3.6L2 8.6z" fill="currentColor" /></svg>Play
+              </Link>
+            )}
+            <button type="button" onClick={() => { setPan({ x: 0, y: 0 }); setZoom(0.85); setSelectedId(null); setIsolated(null); }} className="px-2.5 h-7 rounded-full hover:bg-white/10 text-[#94A3B8] hover:text-white text-[10px] uppercase tracking-wider font-headline">Reset view</button>
+          </div>
+        </div>
+
+        {/* Hint / isolation breadcrumb */}
+        {(isolated || showHint) && (<div data-no-drag className="absolute top-[72px] sm:top-[76px] left-4 sm:left-6 z-30 flex items-center gap-2 flex-wrap">
+          {isolated && (() => { const isoNode = graphData.nodes.find((n) => String(n.id) === String(isolated)); if (!isoNode) return null; const c = isoNode.color || KIND_COLORS.Cluster; return (
+            <button type="button" onClick={() => setIsolated(null)} className="group flex items-center gap-2 pl-2 pr-2.5 h-7 rounded-full border bg-black/70 backdrop-blur-xl hover:bg-white/10 transition" style={{ borderColor: c + "66" }}>
+              <svg width="10" height="10" viewBox="0 0 10 10" className="text-[#94A3B8] group-hover:text-white" aria-hidden="true"><path d="M3 3l4 4M7 3l-4 4" stroke="currentColor" strokeWidth="1.2" strokeLinecap="round" /></svg>
+              <span className="text-[9px] uppercase tracking-[0.22em] font-headline" style={{ color: c }}>Focused</span>
+              <span className="text-[11px] text-white font-serif italic">{isoNode.constellation || isoNode.label}</span>
+            </button>); })()}
+          {showHint && !isolated && (<div className="hidden sm:flex items-center gap-2 pl-2.5 pr-2 h-7 rounded-full border border-white/10 bg-black/60 backdrop-blur-xl text-[10px] text-[#94A3B8]">
+            <span style={{ fontFamily: "var(--font-mono, monospace)" }}>Similar thoughts sit near each other &middot; hover to trace connections &middot; click a cluster to focus</span>
+            <button type="button" onClick={dismissHint} className="ml-1 text-[#64748B] hover:text-white px-1">&times;</button>
+          </div>)}
+        </div>)}
+
+        {/* SVG graph \u2014 one transformed world group, so panning moves a single
+            attribute instead of re-deriving every node/edge coordinate. */}
+        {stageSize.w > 0 && (<svg className="absolute inset-0 w-full h-full" style={{ overflow: "visible" }}>
+          <defs>
+            <marker id="arrow-REFINES" viewBox="0 -5 10 10" refX={9} refY={0} markerUnits="userSpaceOnUse" markerWidth={12 / scale} markerHeight={12 / scale} orient="auto"><path d="M0,-4 L9,0 L0,4" fill={REL_COLORS.REFINES} opacity="0.75" /></marker>
+            {HALO_COLORS.map((c) => (<radialGradient key={`h-${c}`} id={`halo-${c.slice(1)}`}><stop offset="0%" stopColor={c} stopOpacity="0.35" /><stop offset="55%" stopColor={c} stopOpacity="0.10" /><stop offset="100%" stopColor={c} stopOpacity="0" /></radialGradient>))}
+          </defs>
+          <g transform={`translate(${stageSize.w / 2 + pan.x} ${stageSize.h / 2 + pan.y}) scale(${scale}) translate(${-VW / 2} ${-VH / 2})`}>
+          <g>{visibleEdges.map((e, i) => {
+            const sP = positions[String(e.source)], tP = positions[String(e.target)]; if (!sP || !tP) return null;
+            // In-cluster spokes wear their constellation's hue; the rest keep legend colours.
+            const cidT = e.type === "IN_CLUSTER" ? parseInt(String(e.target).split(":")[1], 10) : NaN;
+            const color = Number.isNaN(cidT) ? REL_COLORS[e.type] || "#64748B" : clusterColor(cidT);
+            const isTouching = focusId != null && (String(e.source) === String(focusId) || String(e.target) === String(focusId));
+            const dimmed = focusId != null && !isTouching;
+            // Quiet by default, loud on focus: the web of links is context, not content.
+            const base = e.type === "SIMILAR_TO" ? 0.12 + (e.similarity || 0.5) * 0.22 : e.type === "IN_CLUSTER" ? 0.32 : 0.6;
+            const op = dimmed ? 0.05 : isTouching ? 0.95 : base;
+            const dx = tP.x - sP.x, dy = tP.y - sP.y, d = Math.hypot(dx, dy) || 1;
+            const nx = -dy / d, ny = dx / d;
+            // Long similarity bridges bow AROUND space instead of cutting through
+            // islands \u2014 distance-proportional curvature is what kills the hairball.
+            const bow = (e.type === "SIMILAR_TO" ? Math.min(300, d * 0.22) + ((i * 7) % 24) : 14) * ((i % 2) * 2 - 1);
+            const qx = (sP.x + tP.x) / 2 + nx * bow, qy = (sP.y + tP.y) / 2 + ny * bow;
+            return (<g key={`e-${i}`} style={{ transition: "opacity 200ms", opacity: op }}>
+              <path d={`M ${sP.x} ${sP.y} Q ${qx} ${qy} ${tP.x} ${tP.y}`} fill="none" stroke={color} strokeWidth={isTouching ? 2 : 1.2} vectorEffect="non-scaling-stroke" strokeDasharray={e.type === "TAGGED_WITH" ? `${2 / scale} ${4 / scale}` : e.type === "REFINES" ? `${6 / scale} ${3 / scale}` : undefined} markerEnd={e.type === "REFINES" ? "url(#arrow-REFINES)" : undefined} />
+              {selectedId != null && isTouching && (<g transform={`translate(${qx} ${qy}) scale(${1 / scale})`}><rect x={-e.type.length * 3.2 - 1} y={-7} width={e.type.length * 6.4 + 2} height={14} rx={4} fill="#04070b" opacity="0.85" /><text y={3} textAnchor="middle" fill={color} fontSize="9" style={{ fontFamily: "var(--font-mono, monospace)", letterSpacing: "0.08em" }}>{e.type}{e.type === "SIMILAR_TO" && e.similarity ? `:${e.similarity.toFixed(2)}` : ""}</text></g>)}
+            </g>);
+          })}</g>
+          <g>{visibleNodes.map((n) => {
+            const p = positions[String(n.id)]; if (!p) return null;
+            const color = nodeColor(n), r = nodeRadius(n);
+            const isSel = String(selectedId) === String(n.id);
+            const isFocal = focusId != null && String(focusId) === String(n.id);
+            const isNeighbor = !isFocal && (focusAdj?.has(String(n.id)) ?? false);
+            const dimmed = focusId != null && !isFocal && !isNeighbor;
+            const label = nodeLabel(n);
+            // Label budget: the focal node always; its neighbours only when
+            // tracing a LESSON's few links (\u22645). A focused cluster never
+            // captions members \u2014 even a 4-lesson island piles labels onto the
+            // hover card; the card (name \u00b7 count \u00b7 tags) is the cluster's voice.
+            const clusterFocus = focusId != null && String(focusId).startsWith("c:");
+            const smallHood = (focusAdj?.size ?? 0) <= 5;
+            const showLabel = isFocal || (isNeighbor && smallHood && !clusterFocus) || zoom >= 1.25;
+            const maxLen = isFocal || isNeighbor ? 40 : 22;
+            // Ambient labels alternate above/below so side-by-side nodes collide less.
+            const above = !isFocal && !isNeighbor && typeof n.id === "number" && n.id % 2 === 0;
+            const k = Math.max(0.7, Math.min(1.4, zoom * 0.95)) / scale; // constant on-screen size
+            return (<g key={`n-${n.id}`} transform={`translate(${p.x} ${p.y}) scale(${k})`} data-graphnode data-node-id={String(n.id)} style={{ cursor: "grab", opacity: dimmed ? 0.25 : 1, transition: "opacity 200ms" }} onMouseEnter={() => setHover(n.id)} onMouseLeave={() => setHover(null)}>
+              {(n.kind === "Lesson" || n.kind === "Cluster") && <circle r={r * (n.kind === "Cluster" ? 2.6 : 2.2)} fill={`url(#halo-${color.slice(1)})`} opacity={isFocal || isNeighbor ? 1 : 0.65} />}
+              <GlyphFor kind={n.kind} color={color} r={r} selected={isSel} />
+              {n.kind === "Cluster" ? (
+                <g>
+                  <text y={r + 24} textAnchor="middle" fill={color} fontSize={isFocal ? 15 : 14} className="font-serif" fontStyle="italic" opacity={dimmed ? 0.35 : isFocal ? 1 : 0.92} style={{ letterSpacing: "0.04em" }}>{label}</text>
+                  {/* What this constellation is about \u2014 instead of captioning every member. */}
+                  {isFocal && (n.count || n.tags?.length) ? (
+                    <text y={r + 42} textAnchor="middle" fill="#94A3B8" fontSize="10" className="font-headline" style={{ letterSpacing: "0.06em" }}>
+                      {[n.count ? `${n.count} ${n.count === 1 ? "lesson" : "lessons"}` : "", ...(n.tags ?? []).slice(0, 3)].filter(Boolean).join("  \u00b7  ")}
+                    </text>
+                  ) : null}
+                </g>
+              ) : showLabel && (
+                <g transform={`translate(0 ${above ? -(r + 12) : r + 14})`}><rect x={-(Math.min(label.length, maxLen) * 3.2) - 4} y={-9} width={Math.min(label.length, maxLen) * 6.4 + 8} height={16} rx={4} fill="#04070b" opacity={isSel ? 0.95 : 0.6} stroke={isSel ? color : "transparent"} strokeWidth="0.5" /><text textAnchor="middle" y="3" fill={isSel ? "#fff" : "#CBD5E1"} fontSize="10" className={n.kind === "Lesson" ? "font-serif" : "font-headline"} fontStyle={n.kind === "Lesson" ? "italic" : "normal"}>{label.length > maxLen ? label.slice(0, maxLen - 2) + "\u2026" : label}</text></g>
+              )}
+            </g>);
+          })}</g>
+          </g>
+        </svg>)}
+
+        {/* Legend */}
+        <div data-no-drag className="absolute left-4 bottom-4 z-30 rounded-xl border border-white/10 bg-black/70 backdrop-blur-xl p-3 text-[11px] max-w-[240px] hidden sm:block">
+          <div className="text-[9px] uppercase tracking-[0.22em] text-[#64748B] mb-2 font-headline">Labels</div>
+          <div className="space-y-1.5 mb-3">{ALL_KINDS.map((k) => { const c = KIND_COLORS[k]; const on = kindFilter.has(k); return (
+            <button key={k} type="button" onClick={() => toggleKind(k)} className="w-full flex items-center gap-2 text-left group">
+              <span className="h-3.5 w-3.5 flex items-center justify-center shrink-0"><svg viewBox="-10 -10 20 20" className="h-full w-full"><GlyphFor kind={k} color={c} r={7.5} selected={false} /></svg></span>
+              <span className="text-[10px]" style={{ fontFamily: "var(--font-mono, monospace)", color: on ? c : "#475569" }}>:{k}</span>
+              <span className={`ml-auto text-[9px] ${on ? "text-[#94A3B8]" : "text-[#475569]"}`}>{graphData.nodes.filter((x) => x.kind === k).length}</span>
+            </button>); })}</div>
+          <div className="text-[9px] uppercase tracking-[0.22em] text-[#64748B] mb-2 font-headline">Relationships</div>
+          <div className="space-y-1.5">{ALL_RELS.map((r) => { const c = REL_COLORS[r]; const on = relFilter.has(r); return (
+            <button key={r} type="button" onClick={() => toggleRel(r)} className="w-full flex items-center gap-2 text-left group">
+              <span className="w-5 h-[2px] rounded-full shrink-0" style={{ background: c, opacity: on ? 1 : 0.3, boxShadow: on ? `0 0 4px ${c}` : "none" }} />
+              <span className="text-[10px]" style={{ fontFamily: "var(--font-mono, monospace)", color: on ? c : "#475569" }}>:{r}</span>
+            </button>); })}</div>
+        </div>
+
+        {/* Inspector */}
+        {selected && (<aside data-no-drag className="absolute md:relative right-0 top-0 bottom-0 z-30 w-full sm:w-[380px] md:w-[400px] border-l border-white/[0.08] bg-[#06090e]/95 backdrop-blur-2xl overflow-y-auto animate-slide-in" style={{ boxShadow: "-24px 0 60px rgba(0,0,0,0.5)" }}>
+          <Inspector key={String(selected.id)} node={selected} neighbors={neighbors} onClose={() => setSelectedId(null)} onJump={focusNode} onDelete={(id) => deleteLesson.mutate(id, { onSuccess: () => setSelectedId(null) })} deleting={deleteLesson.isPending} />
+        </aside>)}
+
+        {/* Empty state */}
+        {effectiveData.nodes.length === 0 && (<div className="absolute inset-0 flex items-center justify-center z-20 pointer-events-none"><div className="text-center max-w-sm px-4">
+          <p className="text-lg font-headline font-bold text-white">Your constellation begins here</p>
+          <p className="mt-2 text-sm text-[#94A3B8]">As you chat with your assistant, lessons will appear as nodes in your personal graph.</p>
+        </div></div>)}
+
+        <style jsx>{`@keyframes slide-in { from { transform: translateX(24px); opacity: 0; } to { transform: translateX(0); opacity: 1; } } .animate-slide-in { animation: slide-in 260ms ease-out both; }`}</style>
+      </section>
+    </div>
+  );
+}

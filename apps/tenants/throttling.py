@@ -1,0 +1,235 @@
+"""DRF throttle classes for PAT-authed traffic and PAT minting.
+
+External callers (YardTalk, future skills) push to NU under a PAT.
+Throttle by PAT id so a single noisy app cannot exhaust a user's budget
+across all their tokens, and so revoking one bad token isolates blast
+radius.
+"""
+
+from __future__ import annotations
+
+import hashlib
+
+from rest_framework.throttling import SimpleRateThrottle
+
+
+class _PATScopedThrottle(SimpleRateThrottle):
+    """Throttle a PAT-authed request keyed by PAT id.
+
+    Returns None for non-PAT auth so JWT/UI traffic is not throttled here.
+    """
+
+    def get_cache_key(self, request, view):
+        pat = getattr(request, "auth_pat", None)
+        if pat is None:
+            return None
+        return self.cache_format % {"scope": self.scope, "ident": str(pat.id)}
+
+
+class PATSessionIngestMinuteThrottle(_PATScopedThrottle):
+    scope = "pat_session_minute"
+    rate = "60/minute"
+
+
+class PATSessionIngestDayThrottle(_PATScopedThrottle):
+    scope = "pat_session_day"
+    rate = "5000/day"
+
+
+class UserPATMintHourThrottle(SimpleRateThrottle):
+    """Throttle PAT minting per user (JWT-authed UI path)."""
+
+    scope = "user_pat_mint_hour"
+    rate = "10/hour"
+
+    def get_cache_key(self, request, view):
+        if not request.user or not request.user.is_authenticated:
+            return None
+        return self.cache_format % {"scope": self.scope, "ident": str(request.user.pk)}
+
+
+class _UserScopedThrottle(SimpleRateThrottle):
+    """Throttle a JWT-authed request keyed by user id."""
+
+    def get_cache_key(self, request, view):
+        if not request.user or not request.user.is_authenticated:
+            return None
+        return self.cache_format % {"scope": self.scope, "ident": str(request.user.pk)}
+
+
+class ChatLocalTurnHourThrottle(_UserScopedThrottle):
+    """On-device turn records are human-paced (one per chat exchange); this
+    only has to stop a runaway client from minting unbounded rows on a
+    budget-exempt endpoint."""
+
+    scope = "chat_local_turn_hour"
+    rate = "240/hour"
+
+
+class ChatContextHourThrottle(_UserScopedThrottle):
+    """The context digest renders every envelope section per call; clients
+    cache it for 15 minutes, so even multi-device use stays tiny."""
+
+    scope = "chat_context_hour"
+    rate = "120/hour"
+
+
+class ChatMessageSendHourThrottle(_UserScopedThrottle):
+    """Bounds the chat SEND path (POST /chat/messages/) per user. Each send
+    enqueues an OpenClaw turn and may now carry up to ~13.6 MB of base64
+    attachment, so a runaway/abusive client must not be able to hammer the
+    shared control plane or rack up model spend. Applied to POST only — the GET
+    ?since= poll on the same view is a cheap read clients hit every ~30s and
+    MUST NOT be throttled. Generous for real chat (rapid-fire follow-ups coalesce
+    downstream); the budget gate is the real spend ceiling, this is the abuse
+    ceiling."""
+
+    scope = "chat_message_send_hour"
+    rate = "300/hour"
+
+
+class SiriRespondMinuteThrottle(_UserScopedThrottle):
+    """The Tier-2 fast responder calls a model on every request (platform ZDR
+    key, platform-absorbed cost). Human voice pacing is a few per minute; this
+    only stops a runaway client from racking up model spend or hammering
+    OpenRouter."""
+
+    scope = "siri_respond_minute"
+    rate = "30/minute"
+
+
+class SiriStatusMinuteThrottle(_UserScopedThrottle):
+    """The status snapshot is a deterministic no-LLM read, but still bound it
+    so a stuck client can't poll it in a tight loop."""
+
+    scope = "siri_status_minute"
+    rate = "60/minute"
+
+
+class PushTestMinuteThrottle(_UserScopedThrottle):
+    """The self-service test-push probe sends a real APNs request to the user's
+    own device(s). Human use is a tap or two to verify delivery; this stops a
+    client from using it to hammer APNs or spam a device."""
+
+    scope = "push_test_minute"
+    rate = "10/minute"
+
+
+class AuthorizeMintMinuteThrottle(_UserScopedThrottle):
+    """The web→app PKCE begin endpoint mints a one-time code for the
+    authenticated SPA user. One mint per sign-up tap; this only stops a runaway
+    client from flooding the table."""
+
+    scope = "authorize_mint_minute"
+    rate = "30/minute"
+
+
+class ExchangeMinuteThrottle(SimpleRateThrottle):
+    """The web→app PKCE exchange endpoint is ``AllowAny`` (the code is the
+    bearer of trust), so throttle per client IP. Honour the Container Apps
+    proxy header, matching ``auth_views._client_ip``."""
+
+    scope = "exchange_minute"
+    rate = "30/minute"
+
+    def get_cache_key(self, request, view):
+        forwarded = request.META.get("HTTP_X_FORWARDED_FOR", "")
+        if forwarded:
+            ident = forwarded.split(",")[0].strip()
+        else:
+            ident = request.META.get("REMOTE_ADDR", "")
+        return self.cache_format % {"scope": self.scope, "ident": ident or "anon"}
+
+
+class _AppleIpThrottle(SimpleRateThrottle):
+    """Apple endpoints keyed by Container Apps' trusted rightmost XFF hop."""
+
+    def get_cache_key(self, request, view):
+        forwarded = request.META.get("HTTP_X_FORWARDED_FOR", "")
+        if forwarded:
+            # Container Apps appends instead of overwriting XFF and guarantees
+            # only the rightmost address. Earlier values are client-spoofable.
+            ident = forwarded.rsplit(",", 1)[-1].strip()
+        else:
+            ident = request.META.get("REMOTE_ADDR", "")
+        return self.cache_format % {"scope": self.scope, "ident": ident or "anon"}
+
+
+class AppleBeginMinuteThrottle(_AppleIpThrottle):
+    scope = "apple_begin_minute"
+    rate = "30/minute"
+
+
+class AppleBeginDayThrottle(_AppleIpThrottle):
+    scope = "apple_begin_day"
+    rate = "200/day"
+
+
+class AppleCompleteMinuteThrottle(_AppleIpThrottle):
+    scope = "apple_complete_minute"
+    rate = "10/minute"
+
+
+class AppleCompleteDayThrottle(_AppleIpThrottle):
+    scope = "apple_complete_day"
+    rate = "50/day"
+
+
+class AppleNativeMinuteThrottle(_AppleIpThrottle):
+    scope = "apple_native_minute"
+    rate = "10/minute"
+
+
+class AppleNativeDayThrottle(_AppleIpThrottle):
+    scope = "apple_native_day"
+    rate = "50/day"
+
+
+class AppleLinkMinuteThrottle(_UserScopedThrottle):
+    scope = "apple_link_minute"
+    rate = "10/minute"
+
+
+class AppleLinkDayThrottle(_UserScopedThrottle):
+    scope = "apple_link_day"
+    rate = "20/day"
+
+
+class LoginIpThrottle(SimpleRateThrottle):
+    """Per-client-IP throttle for the ``AllowAny`` login endpoint — caps how
+    fast one source can guess credentials (credential stuffing). Honours the
+    Container Apps proxy header, matching ``auth_views._client_ip``.
+
+    Rates are deliberately burst-friendly (a minute window, not an hour) so a
+    household-NAT IP or a user fumbling their password isn't locked out for
+    long; tune down if abuse appears.
+    """
+
+    scope = "login_ip"
+    rate = "30/minute"
+
+    def get_cache_key(self, request, view):
+        forwarded = request.META.get("HTTP_X_FORWARDED_FOR", "")
+        ident = forwarded.split(",")[0].strip() if forwarded else request.META.get("REMOTE_ADDR", "")
+        return self.cache_format % {"scope": self.scope, "ident": ident or "anon"}
+
+
+class LoginEmailThrottle(SimpleRateThrottle):
+    """Per-email throttle for login — caps guesses against ONE account even when
+    an attacker rotates source IPs (what the per-IP throttle alone misses). The
+    email is hashed so raw addresses never land in cache keys. Minute window
+    keeps it tolerant of a legitimately struggling user.
+    """
+
+    scope = "login_email"
+    rate = "10/minute"
+
+    def get_cache_key(self, request, view):
+        try:
+            email = (request.data.get("email") or "").strip().lower()
+        except Exception:  # noqa: BLE001 — malformed body: skip throttle, the view will 400 it
+            return None
+        if not email:
+            return None
+        ident = hashlib.sha256(email.encode("utf-8")).hexdigest()[:32]
+        return self.cache_format % {"scope": self.scope, "ident": ident}

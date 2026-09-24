@@ -1,0 +1,645 @@
+"use client";
+
+import { useEffect, useMemo, useState } from "react";
+
+import {
+  useCompleteWorkoutMutation,
+  useDeleteWorkoutMutation,
+  useScheduleWindowQuery,
+  useSkipWorkoutMutation,
+} from "@/lib/queries";
+import type { FuelWorkout, WorkoutCategory } from "@/lib/types";
+import { StatusPill } from "@/components/status-pill";
+import { SkelBar } from "@/components/ui/skeleton";
+import { CATEGORIES } from "./category-meta";
+
+interface ScheduleWeekProps {
+  onAddSession: (date: string) => void;
+  onOpenWorkout: (id: string) => void;
+}
+
+const DAY_LABEL_LONG = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"];
+const DAY_LABEL_SHORT = ["M", "T", "W", "T", "F", "S", "S"];
+
+function isoDate(d: Date): string {
+  return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`;
+}
+
+function nextSevenDays(): { iso: string; date: Date }[] {
+  const today = new Date();
+  today.setHours(0, 0, 0, 0);
+  const out: { iso: string; date: Date }[] = [];
+  for (let i = 0; i < 7; i++) {
+    const d = new Date(today);
+    d.setDate(d.getDate() + i);
+    out.push({ iso: isoDate(d), date: d });
+  }
+  return out;
+}
+
+function formatTime(scheduledAt: string | null): string | null {
+  if (!scheduledAt) return null;
+  const d = new Date(scheduledAt);
+  return d.toLocaleTimeString(undefined, { hour: "numeric", minute: "2-digit" });
+}
+
+export function ScheduleWeek({ onAddSession, onOpenWorkout }: ScheduleWeekProps) {
+  const { data, isLoading, isPending } = useScheduleWindowQuery("7d");
+
+  const days = useMemo(() => nextSevenDays(), []);
+  const todayIso = days[0].iso;
+
+  const byDate = useMemo(() => {
+    const m: Record<string, FuelWorkout[]> = {};
+    for (const w of data || []) {
+      (m[w.date] ||= []).push(w);
+    }
+    // Sort each day's sessions by scheduled_at (nulls last) then created_at
+    for (const iso in m) {
+      m[iso].sort((a, b) => {
+        const aTime = a.scheduled_at ? new Date(a.scheduled_at).getTime() : Number.POSITIVE_INFINITY;
+        const bTime = b.scheduled_at ? new Date(b.scheduled_at).getTime() : Number.POSITIVE_INFINITY;
+        if (aTime !== bTime) return aTime - bTime;
+        return new Date(a.created_at).getTime() - new Date(b.created_at).getTime();
+      });
+    }
+    return m;
+  }, [data]);
+
+  // First "planned" session in chronological order — what's coming next
+  // (or what's overdue, when scheduled_at is in the past).
+  const nextUp = useMemo(() => {
+    const planned = (data || []).filter((w) => w.status === "planned");
+    planned.sort((a, b) => {
+      const aTime = a.scheduled_at ? new Date(a.scheduled_at).getTime() : Date.parse(a.date);
+      const bTime = b.scheduled_at ? new Date(b.scheduled_at).getTime() : Date.parse(b.date);
+      return aTime - bTime;
+    });
+    return planned[0];
+  }, [data]);
+
+  return (
+    <div className="space-y-3">
+      {nextUp ? (
+        <NextUpBanner workout={nextUp} onOpen={() => onOpenWorkout(nextUp.id)} />
+      ) : isPending ? (
+        <NextUpSkeleton />
+      ) : null}
+
+      <div className="flex items-center justify-between gap-3">
+        <h2 className="font-headline text-base sm:text-lg font-semibold text-ink">Next 7 days</h2>
+        {isLoading && data && (
+          <span className="font-mono text-[10px] uppercase tracking-[0.18em] text-ink-faint">syncing…</span>
+        )}
+      </div>
+
+      {/* Mobile: today card + compact rows for the rest of the week. All 7 days visible at once. */}
+      <div className="space-y-2 sm:hidden">
+        <DayCard
+          iso={days[0].iso}
+          date={days[0].date}
+          sessions={byDate[days[0].iso] || []}
+          isToday
+          onAddSession={onAddSession}
+          onOpenWorkout={onOpenWorkout}
+        />
+        {days.slice(1).map(({ iso, date }) => (
+          <DayRow
+            key={iso}
+            iso={iso}
+            date={date}
+            sessions={byDate[iso] || []}
+            onAddSession={onAddSession}
+            onOpenWorkout={onOpenWorkout}
+          />
+        ))}
+      </div>
+
+      {/* sm: 2-up; lg: 3-up; xl+: 4-up. All 7 days visible in 2 rows at xl. */}
+      <div className="hidden sm:grid sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4 gap-3">
+        {days.map(({ iso, date }) => (
+          <DayCard
+            key={iso}
+            iso={iso}
+            date={date}
+            sessions={byDate[iso] || []}
+            isToday={iso === todayIso}
+            onAddSession={onAddSession}
+            onOpenWorkout={onOpenWorkout}
+          />
+        ))}
+      </div>
+    </div>
+  );
+}
+
+interface DayCardProps {
+  iso: string;
+  date: Date;
+  sessions: FuelWorkout[];
+  isToday: boolean;
+  onAddSession: (iso: string) => void;
+  onOpenWorkout: (id: string) => void;
+}
+
+function DayCard({ iso, date, sessions, isToday, onAddSession, onOpenWorkout }: DayCardProps) {
+  const dow = (date.getDay() + 6) % 7; // Mon = 0
+  return (
+    <article
+      className={`rounded-panel border border-border bg-card/95 backdrop-blur-md p-4 shadow-panel ${
+        isToday ? "ring-1 ring-accent/30" : ""
+      }`}
+    >
+      <header className="flex items-baseline justify-between gap-2 mb-3">
+        <div className="flex items-baseline gap-2 min-w-0">
+          <span
+            className={`font-mono text-[10px] uppercase tracking-[0.2em] ${
+              isToday ? "text-accent" : "text-ink-faint"
+            }`}
+          >
+            <span>{DAY_LABEL_LONG[dow]}</span>
+          </span>
+          <span className="font-headline text-base font-semibold text-ink">{date.getDate()}</span>
+          {isToday && (
+            <span className="font-mono text-[10px] uppercase tracking-[0.18em] text-accent">today</span>
+          )}
+        </div>
+        <button
+          type="button"
+          aria-label={`Add a session on ${date.toDateString()}`}
+          onClick={() => onAddSession(iso)}
+          className="-mr-1.5 inline-flex h-8 w-8 items-center justify-center rounded-full text-ink-faint transition hover:bg-surface-hover hover:text-ink active:scale-95"
+        >
+          <svg viewBox="0 0 24 24" className="h-4 w-4" fill="none" stroke="currentColor" strokeWidth="2">
+            <path d="M12 5v14M5 12h14" strokeLinecap="round" />
+          </svg>
+        </button>
+      </header>
+
+      <div className="space-y-2">
+        {sessions.length === 0 ? (
+          <button
+            type="button"
+            onClick={() => onAddSession(iso)}
+            className="block w-full rounded-lg border border-dashed border-border px-3 py-3 text-xs text-ink-faint transition hover:bg-surface-hover hover:text-ink"
+          >
+            Rest day · tap to add
+          </button>
+        ) : (
+          sessions.map((s, i) => (
+            <SessionCard
+              key={s.id}
+              workout={s}
+              onOpen={() => onOpenWorkout(s.id)}
+              autoFocus={isToday && i === 0}
+            />
+          ))
+        )}
+      </div>
+    </article>
+  );
+}
+
+interface DayRowProps {
+  iso: string;
+  date: Date;
+  sessions: FuelWorkout[];
+  onAddSession: (iso: string) => void;
+  onOpenWorkout: (id: string) => void;
+}
+
+function DayRow({ iso, date, sessions, onAddSession, onOpenWorkout }: DayRowProps) {
+  const dow = (date.getDay() + 6) % 7;
+  const first = sessions[0];
+  const empty = !first;
+  const cat = first ? CATEGORIES[first.category as WorkoutCategory] ?? CATEGORIES.other : null;
+  const time = first?.scheduled_at ? formatTime(first.scheduled_at) : null;
+  const isDone = first?.status === "done";
+
+  const handleClick = () => {
+    if (empty) onAddSession(iso);
+    else onOpenWorkout(first.id);
+  };
+
+  return (
+    <button
+      type="button"
+      onClick={handleClick}
+      aria-label={
+        empty
+          ? `Add a session on ${date.toDateString()}`
+          : `Open ${first.activity} on ${date.toDateString()}`
+      }
+      className="group w-full flex items-center gap-3 rounded-lg border border-border bg-surface-elevated/70 px-3 py-2.5 text-left transition hover:border-border-strong hover:bg-surface-hover min-h-[56px]"
+    >
+      <div className="flex flex-col items-center justify-center w-10 shrink-0 leading-none">
+        <span className="font-mono text-[9px] uppercase tracking-[0.15em] text-ink-faint">
+          {DAY_LABEL_LONG[dow]}
+        </span>
+        <span className="mt-1 font-headline text-base font-semibold text-ink">
+          {date.getDate()}
+        </span>
+      </div>
+      {cat && (
+        <span
+          className="h-9 w-0.5 rounded-full shrink-0"
+          style={{ background: cat.accent, opacity: 0.7 }}
+          aria-hidden="true"
+        />
+      )}
+      <div className={`flex-1 min-w-0 ${isDone ? "opacity-60" : ""}`}>
+        {empty ? (
+          <span className="text-sm text-ink-faint">Rest day</span>
+        ) : (
+          <>
+            <div className="flex items-center gap-2 min-w-0">
+              {time && (
+                <span className="font-mono text-[10px] uppercase tracking-[0.1em] text-ink-faint shrink-0">
+                  {time}
+                </span>
+              )}
+              <span className="truncate text-sm font-medium text-ink">{first.activity}</span>
+            </div>
+            <div className="text-[11px] text-ink-muted mt-0.5 flex items-center gap-1.5 flex-wrap">
+              <span className="capitalize">{first.category}</span>
+              {first.duration_minutes && <span>· {first.duration_minutes}m</span>}
+              {sessions.length > 1 && <span>· +{sessions.length - 1} more</span>}
+            </div>
+          </>
+        )}
+      </div>
+      {empty ? (
+        <svg
+          viewBox="0 0 24 24"
+          className="shrink-0 h-4 w-4 text-ink-faint group-hover:text-ink"
+          fill="none"
+          stroke="currentColor"
+          strokeWidth="2"
+          aria-hidden="true"
+        >
+          <path d="M12 5v14M5 12h14" strokeLinecap="round" />
+        </svg>
+      ) : (
+        <svg
+          viewBox="0 0 24 24"
+          className="shrink-0 h-3.5 w-3.5 text-ink-faint group-hover:text-ink"
+          fill="none"
+          stroke="currentColor"
+          strokeWidth="1.8"
+          aria-hidden="true"
+        >
+          <path d="m9 18 6-6-6-6" />
+        </svg>
+      )}
+    </button>
+  );
+}
+
+function NextUpSkeleton() {
+  return (
+    <section
+      aria-busy="true"
+      role="status"
+      aria-label="Loading next workout"
+      className="rounded-panel border border-border bg-card/95 p-4 sm:p-5 shadow-panel backdrop-blur-md relative overflow-hidden"
+      style={{ borderLeftWidth: "3px", borderLeftColor: "rgba(226,232,240,0.15)" }}
+    >
+      <div className="flex items-start gap-4 sm:items-center sm:justify-between flex-col sm:flex-row">
+        <div className="min-w-0 w-full sm:w-auto">
+          <div className="flex items-center gap-2 mb-2">
+            <SkelBar className="h-3 w-14" />
+            <SkelBar className="h-3 w-24" />
+          </div>
+          <SkelBar className="h-6 w-2/3 sm:w-72" />
+          <div className="mt-2 flex items-center gap-3">
+            <SkelBar className="h-3 w-16" />
+            <SkelBar className="h-3 w-12" />
+          </div>
+        </div>
+        <div className="flex w-full sm:w-auto items-center gap-2 shrink-0">
+          <SkelBar className="h-11 flex-1 sm:w-28" />
+          <SkelBar className="h-11 w-20" />
+          <SkelBar className="h-11 w-20 hidden sm:block" />
+        </div>
+      </div>
+    </section>
+  );
+}
+
+interface NextUpBannerProps {
+  workout: FuelWorkout;
+  onOpen: () => void;
+}
+
+function formatRelative(scheduledAt: string | null, fallbackDate: string, now: number): string {
+  const target = scheduledAt
+    ? new Date(scheduledAt).getTime()
+    : new Date(fallbackDate + "T00:00:00").getTime();
+  const diffMs = target - now;
+  const diffMin = Math.round(diffMs / 60_000);
+  if (diffMin < -120) {
+    const d = new Date(target);
+    return `was ${d.toLocaleString(undefined, { weekday: "short", hour: "numeric", minute: "2-digit" })}`;
+  }
+  if (diffMin < 0) return "overdue";
+  if (diffMin < 5) return "starting soon";
+  if (diffMin < 60) return `in ${diffMin} min`;
+  const target_d = new Date(target);
+  const today = new Date(now);
+  const isToday =
+    target_d.getFullYear() === today.getFullYear() &&
+    target_d.getMonth() === today.getMonth() &&
+    target_d.getDate() === today.getDate();
+  if (isToday) {
+    return `today at ${target_d.toLocaleTimeString(undefined, { hour: "numeric", minute: "2-digit" })}`;
+  }
+  const tomorrow = new Date(today);
+  tomorrow.setDate(tomorrow.getDate() + 1);
+  const isTomorrow =
+    target_d.getFullYear() === tomorrow.getFullYear() &&
+    target_d.getMonth() === tomorrow.getMonth() &&
+    target_d.getDate() === tomorrow.getDate();
+  if (isTomorrow) {
+    return `tomorrow at ${target_d.toLocaleTimeString(undefined, { hour: "numeric", minute: "2-digit" })}`;
+  }
+  return target_d.toLocaleString(undefined, {
+    weekday: "short",
+    hour: "numeric",
+    minute: "2-digit",
+  });
+}
+
+function NextUpBanner({ workout, onOpen }: NextUpBannerProps) {
+  const [now, setNow] = useState(() => Date.now());
+  useEffect(() => {
+    // Re-render every 30s so the relative time stays accurate without
+    // refetching the whole window.
+    const id = window.setInterval(() => setNow(Date.now()), 30_000);
+    return () => window.clearInterval(id);
+  }, []);
+
+  const skip = useSkipWorkoutMutation();
+  const complete = useCompleteWorkoutMutation();
+
+  // Brief "✓ Done" confirmation that survives the cache invalidation +
+  // workout-prop swap, so the user gets explicit feedback that the click took.
+  const [justCompleted, setJustCompleted] = useState<FuelWorkout | null>(null);
+  useEffect(() => {
+    if (!justCompleted) return;
+    const id = window.setTimeout(() => setJustCompleted(null), 1400);
+    return () => window.clearTimeout(id);
+  }, [justCompleted]);
+
+  const display = justCompleted ?? workout;
+  const cat = CATEGORIES[display.category as WorkoutCategory] ?? CATEGORIES.other;
+  const relative = formatRelative(display.scheduled_at, display.date, now);
+  const isOverdue = relative === "overdue" || relative.startsWith("was ");
+
+  const onComplete = () => {
+    const target = workout;
+    complete.mutate(
+      { id: target.id },
+      {
+        onSuccess: () => setJustCompleted({ ...target, status: "done" }),
+      },
+    );
+  };
+
+  return (
+    <section
+      aria-label="Next workout"
+      className="
+        rounded-panel border border-border bg-card/95 p-4 sm:p-5 shadow-panel backdrop-blur-md
+        relative overflow-hidden hover:border-border-strong transition-colors
+      "
+      style={{
+        // accent stripe along the left edge in the category color
+        borderLeftWidth: "3px",
+        borderLeftColor: cat.accent,
+      }}
+    >
+      {/* Full-card tap target — sits beneath the action buttons so they keep working.
+          Disabled during the post-complete flash so the user can't accidentally
+          re-open the completed workout while it's animating out. */}
+      {!justCompleted && (
+        <button
+          type="button"
+          onClick={onOpen}
+          aria-label={`View ${workout.activity}`}
+          className="absolute inset-0 z-0 rounded-panel focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-[-2px] focus-visible:outline-accent"
+        />
+      )}
+      <div className="relative z-10 flex items-start gap-4 sm:items-center sm:justify-between flex-col sm:flex-row pointer-events-none">
+        <div className="min-w-0">
+          <div className="flex items-center gap-2 mb-1.5">
+            <span className="font-mono text-[10px] uppercase tracking-[0.22em] text-accent">
+              Next up
+            </span>
+            <span
+              className={`font-mono text-[10px] uppercase tracking-[0.18em] ${
+                isOverdue ? "text-status-amber-text" : "text-ink-faint"
+              }`}
+            >
+              · {relative}
+            </span>
+          </div>
+          <h3 className="font-headline text-xl font-semibold text-ink truncate">
+            {display.activity}
+          </h3>
+          <div className="mt-1 flex flex-wrap items-center gap-x-3 gap-y-1 text-xs text-ink-muted">
+            <span className="capitalize">{cat.label}</span>
+            {display.duration_minutes && <span>· {display.duration_minutes} min</span>}
+          </div>
+        </div>
+
+        <div className="flex w-full sm:w-auto items-center gap-2 shrink-0 pointer-events-auto">
+          {justCompleted ? (
+            <div
+              role="status"
+              aria-live="polite"
+              className="flex-1 sm:flex-none rounded-full bg-status-emerald text-status-emerald-text px-4 py-2.5 text-sm font-semibold min-h-[44px] flex items-center justify-center gap-2 animate-reveal"
+            >
+              <svg viewBox="0 0 24 24" className="h-4 w-4" fill="none" stroke="currentColor" strokeWidth="3" aria-hidden="true">
+                <path d="M5 12l5 5L20 7" strokeLinecap="round" strokeLinejoin="round" />
+              </svg>
+              Done
+            </div>
+          ) : (
+            <>
+              <button
+                type="button"
+                onClick={onComplete}
+                disabled={complete.isPending}
+                className="glow-purple flex-1 sm:flex-none rounded-full bg-accent px-4 py-2.5 text-sm font-semibold text-white transition-all hover:brightness-110 active:scale-[0.98] disabled:opacity-50 min-h-[44px] flex items-center justify-center"
+              >
+                {complete.isPending ? "Completing…" : "Complete"}
+              </button>
+              <button
+                type="button"
+                onClick={() => {
+                  const reason = window.prompt("Skip reason (optional):") || "";
+                  skip.mutate({ id: workout.id, reason });
+                }}
+                disabled={skip.isPending}
+                className="rounded-full border border-border bg-transparent px-4 py-2.5 text-sm font-medium text-ink-muted transition hover:bg-surface-hover hover:text-ink active:scale-95 disabled:opacity-50 min-h-[44px]"
+              >
+                Skip
+              </button>
+              <button
+                type="button"
+                onClick={onOpen}
+                className="rounded-full border border-border bg-transparent px-4 py-2.5 text-sm font-medium text-ink-muted transition hover:bg-surface-hover hover:text-ink active:scale-95 min-h-[44px] hidden sm:inline-flex"
+              >
+                View
+              </button>
+            </>
+          )}
+        </div>
+      </div>
+    </section>
+  );
+}
+
+interface SessionCardProps {
+  workout: FuelWorkout;
+  onOpen: () => void;
+  autoFocus?: boolean;
+}
+
+function SessionCard({ workout, onOpen }: SessionCardProps) {
+  const time = formatTime(workout.scheduled_at);
+  const cat = CATEGORIES[workout.category as WorkoutCategory] ?? CATEGORIES.other;
+  const accentBorder = { borderLeftColor: cat.accent };
+
+  return (
+    <div
+      className="group relative flex items-center gap-2.5 rounded-lg border border-border border-l-2 bg-surface/60 pl-3 pr-1 py-2 transition hover:bg-surface-hover"
+      style={accentBorder}
+    >
+      <button
+        type="button"
+        onClick={onOpen}
+        className="flex flex-1 min-w-0 flex-col items-start text-left min-h-[44px]"
+      >
+        <div className="flex items-baseline gap-2 min-w-0">
+          {time && (
+            <span className="font-mono text-[11px] uppercase tracking-[0.1em] text-ink-faint shrink-0">
+              {time}
+            </span>
+          )}
+          <span className="truncate text-sm font-medium text-ink">{workout.activity}</span>
+        </div>
+        <div className="mt-0.5 flex items-center gap-2 text-[11px] text-ink-muted">
+          <span className="capitalize">{workout.category}</span>
+          {workout.duration_minutes && <span>· {workout.duration_minutes}m</span>}
+          {workout.status !== "planned" && <StatusPill status={workout.status} size="sm" />}
+        </div>
+      </button>
+      <SessionMenu workout={workout} />
+    </div>
+  );
+}
+
+function SessionMenu({ workout }: { workout: FuelWorkout }) {
+  const [open, setOpen] = useState(false);
+  const skip = useSkipWorkoutMutation();
+  const complete = useCompleteWorkoutMutation();
+  const del = useDeleteWorkoutMutation();
+
+  const close = () => setOpen(false);
+  const action = async (fn: () => Promise<unknown>) => {
+    try {
+      await fn();
+    } finally {
+      close();
+    }
+  };
+
+  return (
+    <div className="relative">
+      <button
+        type="button"
+        aria-label="Session actions"
+        aria-expanded={open}
+        onClick={() => setOpen((o) => !o)}
+        className="inline-flex h-9 w-9 items-center justify-center rounded-full text-ink-faint transition hover:bg-surface-hover hover:text-ink"
+      >
+        <svg viewBox="0 0 24 24" className="h-4 w-4" fill="currentColor" aria-hidden="true">
+          <circle cx="5" cy="12" r="1.5" />
+          <circle cx="12" cy="12" r="1.5" />
+          <circle cx="19" cy="12" r="1.5" />
+        </svg>
+      </button>
+      {open && (
+        <>
+          {/* Click-away */}
+          <button
+            type="button"
+            aria-label="Dismiss menu"
+            className="fixed inset-0 z-10 cursor-default"
+            onClick={close}
+          />
+          <div
+            role="menu"
+            className="absolute right-0 top-full z-20 mt-1 min-w-[180px] rounded-xl border border-border bg-surface-elevated shadow-panel backdrop-blur-md"
+          >
+            {workout.status === "planned" && (
+              <>
+                <MenuItem
+                  onSelect={() =>
+                    action(() => complete.mutateAsync({ id: workout.id }))
+                  }
+                  disabled={complete.isPending}
+                  label="Mark complete"
+                />
+                <MenuItem
+                  onSelect={() => {
+                    const reason = window.prompt("Skip reason (optional):") || "";
+                    void action(() => skip.mutateAsync({ id: workout.id, reason }));
+                  }}
+                  disabled={skip.isPending}
+                  label="Skip…"
+                />
+              </>
+            )}
+            <MenuItem
+              onSelect={() => {
+                if (window.confirm(`Delete "${workout.activity}"?`)) {
+                  void action(() => del.mutateAsync(workout.id));
+                }
+              }}
+              disabled={del.isPending}
+              label="Delete"
+              tone="rose"
+            />
+          </div>
+        </>
+      )}
+    </div>
+  );
+}
+
+function MenuItem({
+  onSelect,
+  label,
+  disabled,
+  tone,
+}: {
+  onSelect: () => void;
+  label: string;
+  disabled?: boolean;
+  tone?: "rose";
+}) {
+  const toneCls = tone === "rose" ? "text-rose-text hover:bg-rose-bg" : "text-ink hover:bg-surface-hover";
+  return (
+    <button
+      type="button"
+      role="menuitem"
+      onClick={onSelect}
+      disabled={disabled}
+      className={`block w-full px-3 py-2.5 text-left text-sm transition disabled:opacity-50 ${toneCls}`}
+    >
+      {label}
+    </button>
+  );
+}

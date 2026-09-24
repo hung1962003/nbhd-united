@@ -1,0 +1,186 @@
+"""Platform issue report tests."""
+
+from __future__ import annotations
+
+import uuid
+
+from django.test import TestCase, override_settings
+from django.urls import reverse
+from rest_framework.test import APIClient
+
+from apps.tenants.models import Tenant, User
+from apps.tenants.test_utils import seed_internal_key
+
+from .models import PlatformIssueLog
+
+# Shared internal key used across all tests (mirrors production architecture)
+_TEST_INTERNAL_KEY = "test-internal-key"
+
+
+def _make_tenant() -> Tenant:
+    """Create a tenant for testing."""
+    uid = uuid.uuid4().hex[:8]
+    user = User.objects.create_user(
+        username=f"test-{uid}",
+        email=f"test-{uid}@example.com",
+        password="testpass123",
+    )
+    tenant = Tenant.objects.create(
+        id=uuid.uuid4(),
+        user=user,
+    )
+    return tenant
+
+
+def _report_url(tenant_id: uuid.UUID) -> str:
+    return reverse("runtime-platform-issue-report", kwargs={"tenant_id": tenant_id})
+
+
+def _auth_headers(tenant: Tenant) -> dict:
+    return {
+        "HTTP_X_NBHD_INTERNAL_KEY": _TEST_INTERNAL_KEY,
+        "HTTP_X_NBHD_TENANT_ID": str(tenant.id),
+    }
+
+
+@override_settings(NBHD_INTERNAL_API_KEY=_TEST_INTERNAL_KEY)
+class PlatformIssueReportTests(TestCase):
+    def setUp(self):
+        self.client = APIClient()
+        self.tenant = _make_tenant()
+        seed_internal_key(self.tenant)
+        self.url = _report_url(self.tenant.id)
+        self.headers = _auth_headers(self.tenant)
+        self.valid_payload = {
+            "category": "tool_error",
+            "severity": "medium",
+            "tool_name": "web_search",
+            "summary": "Tool timed out after 30s",
+        }
+
+    def test_successful_report(self):
+        resp = self.client.post(self.url, self.valid_payload, format="json", **self.headers)
+        self.assertEqual(resp.status_code, 201)
+        data = resp.json()
+        self.assertEqual(data["status"], "logged")
+        self.assertTrue(uuid.UUID(data["id"]))
+        self.assertEqual(PlatformIssueLog.objects.count(), 1)
+        issue = PlatformIssueLog.objects.first()
+        self.assertEqual(issue.category, "tool_error")
+        self.assertEqual(issue.severity, "medium")
+        self.assertEqual(issue.tool_name, "web_search")
+        self.assertEqual(issue.tenant, self.tenant)
+
+    def test_invalid_auth(self):
+        headers = {
+            "HTTP_X_NBHD_INTERNAL_KEY": "wrong-key",
+            "HTTP_X_NBHD_TENANT_ID": str(self.tenant.id),
+        }
+        resp = self.client.post(self.url, self.valid_payload, format="json", **headers)
+        self.assertIn(resp.status_code, [401, 403])
+        self.assertEqual(PlatformIssueLog.objects.count(), 0)
+
+    def test_missing_auth(self):
+        resp = self.client.post(self.url, self.valid_payload, format="json")
+        self.assertIn(resp.status_code, [401, 403])
+
+    def test_rate_limiting(self):
+        # Create 10 issues directly in DB
+        for i in range(10):
+            PlatformIssueLog.objects.create(
+                tenant=self.tenant,
+                category="other",
+                summary=f"Issue {i}",
+            )
+        resp = self.client.post(self.url, self.valid_payload, format="json", **self.headers)
+        self.assertEqual(resp.status_code, 429)
+        self.assertIn("Rate limit", resp.json()["detail"])
+
+    def test_deduplication(self):
+        # First report succeeds
+        resp = self.client.post(self.url, self.valid_payload, format="json", **self.headers)
+        self.assertEqual(resp.status_code, 201)
+
+        # Second identical report is deduplicated
+        resp = self.client.post(self.url, self.valid_payload, format="json", **self.headers)
+        self.assertEqual(resp.status_code, 200)
+        self.assertTrue(resp.json()["deduplicated"])
+        self.assertEqual(PlatformIssueLog.objects.count(), 1)
+
+    def test_missing_required_fields(self):
+        resp = self.client.post(self.url, {}, format="json", **self.headers)
+        self.assertEqual(resp.status_code, 400)
+        self.assertIn("summary", resp.json())
+
+    def test_summary_max_length(self):
+        payload = {**self.valid_payload, "summary": "x" * 501}
+        resp = self.client.post(self.url, payload, format="json", **self.headers)
+        self.assertEqual(resp.status_code, 400)
+        self.assertIn("summary", resp.json())
+
+    def test_no_dedup_without_tool_name(self):
+        """Without tool_name, dedup doesn't apply — both reports created."""
+        payload = {k: v for k, v in self.valid_payload.items() if k != "tool_name"}
+        resp1 = self.client.post(self.url, payload, format="json", **self.headers)
+        self.assertEqual(resp1.status_code, 201)
+        resp2 = self.client.post(self.url, payload, format="json", **self.headers)
+        self.assertEqual(resp2.status_code, 201)
+        self.assertEqual(PlatformIssueLog.objects.count(), 2)
+
+    def _set_entity_map(self, entity_map: dict) -> None:
+        self.tenant.pii_entity_map = entity_map
+        self.tenant.save(update_fields=["pii_entity_map"])
+
+    def test_known_pii_redacted_at_write(self):
+        """summary/detail persist with known PII swapped for its placeholder —
+        the agent claimed 'no user PII' but a name slipped in anyway."""
+        self._set_entity_map({"[PERSON_1]": {"name": "Jay Haughton"}})
+        payload = {
+            "category": "tool_error",
+            "severity": "medium",
+            "tool_name": "web_search",
+            "summary": "web_search failed while helping Jay Haughton",
+            "detail": "Jay Haughton asked twice and it errored",
+        }
+        resp = self.client.post(self.url, payload, format="json", **self.headers)
+        self.assertEqual(resp.status_code, 201)
+        issue = PlatformIssueLog.objects.get(id=resp.json()["id"])
+        self.assertNotIn("Jay Haughton", issue.summary)
+        self.assertNotIn("Jay Haughton", issue.detail)
+        self.assertIn("[PERSON_1]", issue.summary)
+        self.assertIn("[PERSON_1]", issue.detail)
+
+    def test_no_new_placeholders_minted_from_issue_text(self):
+        """Reuse-only: an unknown name in issue text must NOT be minted into the
+        tenant map (map-hygiene protection)."""
+        self._set_entity_map({"[PERSON_1]": {"name": "Jay Haughton"}})
+        payload = {
+            "category": "other",
+            "severity": "low",
+            "tool_name": "calendar",
+            "summary": "calendar sync broke for Bob Newcomer",
+        }
+        resp = self.client.post(self.url, payload, format="json", **self.headers)
+        self.assertEqual(resp.status_code, 201)
+        self.tenant.refresh_from_db()
+        # Map unchanged — no [PERSON_2] coined from "Bob Newcomer".
+        self.assertEqual(self.tenant.pii_entity_map, {"[PERSON_1]": {"name": "Jay Haughton"}})
+        issue = PlatformIssueLog.objects.get(id=resp.json()["id"])
+        self.assertIn("Bob Newcomer", issue.summary)  # left verbatim, not masked
+
+    def test_log_line_uses_redacted_summary(self):
+        """The INFO log line must carry the already-redacted summary, never the
+        raw value (this line ships to Log Analytics)."""
+        self._set_entity_map({"[PERSON_1]": {"name": "Jay Haughton"}})
+        payload = {
+            "category": "tool_error",
+            "severity": "medium",
+            "tool_name": "web_search",
+            "summary": "web_search failed while helping Jay Haughton",
+        }
+        with self.assertLogs("apps.platform_logs.views", level="INFO") as cm:
+            resp = self.client.post(self.url, payload, format="json", **self.headers)
+        self.assertEqual(resp.status_code, 201)
+        blob = "\n".join(cm.output)
+        self.assertNotIn("Jay Haughton", blob)
+        self.assertIn("[PERSON_1]", blob)

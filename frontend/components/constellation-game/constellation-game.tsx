@@ -1,0 +1,293 @@
+"use client";
+
+import { useEffect, useRef } from "react";
+
+import "./constellation-game.css";
+import type { GalaxyData } from "@/lib/constellation-game/encounter-logic";
+import { mountGalaxyGame } from "@/lib/constellation-game/galaxy-scene";
+import type { Wormhole } from "@/lib/types";
+
+/**
+ * Mounts the Phaser galaxy game (canvas) plus its DOM overlay shell. This whole
+ * component is dynamic-imported (ssr:false) by the /constellation/play route, so
+ * Phaser lands in a lazy chunk and never weighs down the rest of the app.
+ *
+ * The overlay markup carries the `cg-*` ids the scene drives; the scene queries
+ * them within this subtree (no global ids), so they can't collide with the app.
+ *
+ * `wormholes` + `initialWarp` (the ?friend= deep-link) drive the Neighborhood
+ * warp layer (PR3): empty/undefined unless friends_enabled, so the game is
+ * identical to before for everyone else.
+ */
+export function ConstellationGame({
+  galaxy,
+  wormholes,
+  initialWarp,
+}: {
+  galaxy: GalaxyData;
+  wormholes?: Wormhole[];
+  initialWarp?: string | null;
+}) {
+  const rootRef = useRef<HTMLDivElement>(null);
+  const canvasRef = useRef<HTMLDivElement>(null);
+  const pendingInitialWarpRef = useRef(initialWarp);
+
+  useEffect(() => {
+    const host = canvasRef.current;
+    const root = rootRef.current;
+    if (!host || !root) return;
+
+    let game: ReturnType<typeof mountGalaxyGame> | null = null;
+    let disposed = false;
+    let remounting = false;
+    let restoredWhileHidden = false;
+
+    // iOS Safari / WKWebView routinely DROPS the WebGL context on backgrounding,
+    // device lock, or memory pressure (a documented iOS 16.7–17+ regression).
+    // Phaser preventDefaults the loss and tries to restore — but our textures are
+    // generated on the GPU at runtime (makeTextures → generateTexture) with no
+    // CPU-side source, so Phaser physically cannot re-upload them and the scene
+    // comes back BLACK. A clean remount re-runs create()/makeTextures() and is the
+    // only reliable recovery. (Losing the ship's position is fine after a
+    // backgrounding-induced loss.)
+    const scheduleRemount = () => {
+      if (disposed || remounting) return;
+      remounting = true;
+      // Defer so Phaser's own (synchronous) restore handler finishes first.
+      setTimeout(() => {
+        remounting = false;
+        if (!disposed) mount();
+      }, 0);
+    };
+
+    const onRestored = () => {
+      if (document.hidden) {
+        // Timers may be suspended in the background. Remember the completed
+        // restore explicitly because Phaser clears renderer.contextLost before
+        // emitting restorewebgl, then rebuild as soon as the tab is visible.
+        restoredWhileHidden = true;
+        return;
+      }
+      scheduleRemount();
+    };
+
+    const onVisibility = () => {
+      if (!game || disposed) return;
+      if (document.hidden) {
+        // Backgrounded: stop the render loop (battery, and shrinks the window in
+        // which iOS reaps the GL context).
+        game.loop.sleep();
+      } else {
+        game.loop.wake();
+        // Rebuild after either a completed hidden restore or a loss that is still
+        // outstanding. The latter preserves the fallback when no restore arrived.
+        const r = game.renderer;
+        const needsRecovery = restoredWhileHidden || ("contextLost" in r && r.contextLost);
+        restoredWhileHidden = false;
+        if (needsRecovery) scheduleRemount();
+      }
+    };
+
+    const mount = () => {
+      if (game) {
+        game.renderer.off("restorewebgl", onRestored);
+        try {
+          game.destroy(true);
+        } catch {
+          // The old canvas/context may already be gone — destroy is best-effort.
+        }
+      }
+      game = mountGalaxyGame(host, root, galaxy, {
+        wormholes,
+        initialWarp: pendingInitialWarpRef.current,
+      });
+      // The deep link belongs to the user's first arrival, not context-recovery
+      // remounts (or later galaxy refreshes within this component instance).
+      pendingInitialWarpRef.current = undefined;
+      game.renderer.on("restorewebgl", onRestored);
+    };
+
+    mount();
+    document.addEventListener("visibilitychange", onVisibility);
+
+    return () => {
+      disposed = true;
+      document.removeEventListener("visibilitychange", onVisibility);
+      if (game) {
+        game.renderer.off("restorewebgl", onRestored);
+        game.destroy(true);
+        game = null;
+      }
+    };
+    // wormholes/initialWarp are read once at mount; remounting the whole game on
+    // every wormholes refetch would tear down flight state, so they're
+    // intentionally omitted from deps (the game pulls fresh friend galaxies live).
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [galaxy]);
+
+  return (
+    <div ref={rootRef} className="cg-root">
+      <div ref={canvasRef} className="cg-canvas" aria-hidden="true" />
+
+      <div id="cg-help" className="cg-help">
+        {/* CSS swaps these by pointer type — coarse/touch devices can't press keys. */}
+        <span className="cg-help-keys">
+          <b>WASD / arrows</b> fly &nbsp;·&nbsp; <b>S</b> brake &nbsp;·&nbsp; <b>E</b> land &nbsp;·&nbsp; <b>M</b> map &nbsp;·&nbsp; <b>Esc</b> back
+        </span>
+        <span className="cg-help-touch">
+          <b>Drag</b> to fly &nbsp;·&nbsp; <b>tap</b> a star to travel &nbsp;·&nbsp; <b>Map</b> to survey
+        </span>
+      </div>
+      <button id="cg-land-btn" className="cg-land-btn" type="button">🛸 Land here</button>
+
+      {/* survey / map mode: toggle, hint, and the "fly here" confirm */}
+      <button id="cg-map-btn" className="cg-map-btn" type="button">🗺 Map</button>
+      <div id="cg-map-hint" className="cg-map-hint" role="status">
+        Drag to look around &nbsp;·&nbsp; scroll / pinch to zoom &nbsp;·&nbsp; tap a star to set a course
+      </div>
+      <div id="cg-map-confirm" className="cg-map-confirm">
+        <span id="cg-map-confirm-name" className="cg-map-confirm-name">—</span>
+        <div className="cg-map-confirm-actions">
+          <button id="cg-map-cancel" type="button">Cancel</button>
+          <button id="cg-map-fly" className="cg-primary" type="button">Fly here →</button>
+        </div>
+      </div>
+
+      {/* ambient co-pilot toast — a throttled nudge when you linger somewhere */}
+      <div id="cg-copilot-toast" className="cg-copilot-toast" role="status" aria-live="polite" />
+
+      {/* landing panel */}
+      <div id="cg-panel" className="cg-overlay" role="dialog" aria-modal="true">
+        <div className="cg-card">
+          <div className="cg-row">
+            <span className="cg-badge" id="cg-p-badge">radiant</span>
+            <span className="cg-cluster" id="cg-p-cluster">—</span>
+          </div>
+          <h1 id="cg-p-text">—</h1>
+          {/* provenance — where this lesson came from (its origin note + source), so
+              adding your own notes has something to anchor to */}
+          <div className="cg-provenance" id="cg-p-context" style={{ display: "none" }} />
+          <div className="cg-meta" id="cg-p-meta" />
+          <div className="cg-tags" id="cg-p-tags" />
+          <div className="cg-note" id="cg-p-note" style={{ display: "none" }} />
+          <div className="cg-copilot">
+            <div className="cg-who"><span className="cg-dot" /> Your co-pilot</div>
+            {/* loading: the co-pilot "reads" your path — constellation dots twinkle,
+                then the real line fades in (no optimistic text that mutates as you read) */}
+            <div className="cg-loading" id="cg-p-copilot-loading" aria-hidden="true">
+              <span className="cg-loading-stars"><i>✦</i><i>✦</i><i>✦</i></span>
+              <span className="cg-loading-label">charting…</span>
+            </div>
+            <div className="cg-line" id="cg-p-copilot" aria-live="polite" />
+          </div>
+          {/* your notes — free-text context you add to this star (saved as you go) */}
+          <div className="cg-notes">
+            <div className="cg-notes-head" id="cg-p-notes-head">Your notes</div>
+            <div id="cg-p-notes-list" className="cg-notes-list" />
+            <textarea
+              id="cg-p-note-input"
+              className="cg-note-input"
+              rows={2}
+              maxLength={2000}
+              aria-label="Add a note to this star"
+              placeholder="Add a note or some context for this star — in your own words…"
+            />
+            <div className="cg-note-actions">
+              <button id="cg-p-note-save" className="cg-note-save" type="button">Save note</button>
+            </div>
+          </div>
+          <div className="cg-actions">
+            <button id="cg-p-point" className="cg-point" type="button" style={{ display: "none" }}>
+              Show me where →
+            </button>
+            <button id="cg-p-deepen" className="cg-deepen" type="button">✦ Go deeper</button>
+            <button id="cg-p-close" type="button">Back to flight</button>
+            <button id="cg-p-close2" className="cg-primary" type="button">Got it</button>
+          </div>
+        </div>
+      </div>
+
+      {/* tutoring — the 5-phase "go deeper" conversation that grows a star */}
+      <div id="cg-tutor" className="cg-tutor-overlay" role="dialog" aria-modal="true" aria-labelledby="cg-tutor-star">
+        <div className="cg-tutor-card">
+          <div className="cg-tutor-head">
+            <div className="cg-tutor-titles">
+              <div className="cg-who"><span className="cg-dot" /> Exploring with your co-pilot</div>
+              <div className="cg-tutor-star" id="cg-tutor-star">—</div>
+            </div>
+            <div className="cg-tutor-progress">
+              <div className="cg-tutor-pips" id="cg-tutor-pips" aria-hidden="true" />
+              <span className="cg-tutor-phase" id="cg-tutor-phase">—</span>
+            </div>
+          </div>
+          <div className="cg-tutor-thread" id="cg-tutor-thread" aria-live="polite" />
+          <div className="cg-tutor-compose">
+            <textarea
+              id="cg-tutor-input"
+              className="cg-tutor-input"
+              rows={2}
+              maxLength={5000}
+              aria-label="Your reply to the co-pilot"
+              placeholder="Reply in your own words…"
+            />
+            <button id="cg-tutor-send" className="cg-primary cg-tutor-send" type="button">Send</button>
+          </div>
+          <div className="cg-tutor-actions">
+            <button id="cg-tutor-skip" type="button">Skip phase</button>
+            <button id="cg-tutor-end" type="button">End session</button>
+          </div>
+        </div>
+      </div>
+
+      {/* ── Wormholes & warp (PR3) — friend-galaxy chrome, shown only while the
+          co-resident FriendGalaxyScene is active (.cg-in-friend on the root) ── */}
+      {/* one-shot warp bloom (matches the WarpIn accent glow on the play page) */}
+      <div id="cg-warp-flash" className="cg-warp-flash" aria-hidden="true" />
+      {/* banner naming whose galaxy you're in, tinted by their hue */}
+      <div id="cg-friend-banner" className="cg-friend-banner" role="status" />
+      {/* always-visible return-home beacon */}
+      <button id="cg-return-home" className="cg-return-home" type="button">↩ Return home</button>
+      {/* land button (touch) inside a friend galaxy */}
+      <button id="cg-friend-land-btn" className="cg-land-btn cg-friend-land-btn" type="button">🛸 Land here</button>
+      {/* read-only spark sheet — title / text / tags + "bring it home" (adopt) */}
+      <div id="cg-friend-sheet" className="cg-overlay cg-friend-sheet" role="dialog" aria-modal="true" aria-labelledby="cg-fs-text">
+        <div className="cg-card">
+          <div className="cg-row">
+            <span className="cg-badge cg-fs-badge">shared spark</span>
+            <span className="cg-cluster" id="cg-fs-cluster">—</span>
+          </div>
+          <h1 id="cg-fs-text">—</h1>
+          <div className="cg-tags" id="cg-fs-tags" />
+          <p className="cg-fs-note">A read-only visit — nothing here changes their galaxy.</p>
+          <div className="cg-actions">
+            <button id="cg-fs-adopt" className="cg-primary" type="button">✦ Bring it home</button>
+            <button id="cg-fs-close" type="button">Back to flight</button>
+          </div>
+        </div>
+      </div>
+
+      {/* nega-self encounter sheet */}
+      <div id="cg-encounter" className="cg-encounter" role="dialog" aria-modal="true" aria-labelledby="cg-enc-name">
+        <div className="cg-enc-card">
+          <div className="cg-enc-portrait" aria-hidden="true">
+            <div className="cg-shadow-wrap">
+              <svg className="cg-shadow" viewBox="0 0 120 120" width="92" height="92">
+                <polygon points="16,60 98,26 82,60 98,94" fill="#1c0a15" stroke="#ff4d7e" strokeWidth="2.5" strokeLinejoin="round" />
+                <polygon points="32,60 88,42 78,60 88,78" fill="#330e22" />
+                <circle className="cg-eye" cx="36" cy="60" r="6" fill="#ff2d55" />
+              </svg>
+            </div>
+          </div>
+          <div className="cg-enc-who"><span className="cg-dot" /> <span id="cg-enc-name">Your shadow</span></div>
+          <div id="cg-enc-taunt" className="cg-enc-taunt">—</div>
+          <div className="cg-enc-prompt">Fire back with a truth you&apos;ve earned</div>
+          <div id="cg-enc-choices" className="cg-enc-choices" />
+          <div id="cg-enc-outcome" className="cg-enc-outcome" />
+          <div className="cg-enc-actions">
+            <button id="cg-enc-skip" className="cg-enc-skip" type="button">Not today — slip past</button>
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+}

@@ -1,0 +1,118 @@
+"use client";
+
+import { RefObject } from "react";
+import { SERVICE_ICONS } from "@/components/service-icon";
+import type { PromptEditorHandle } from "@/components/prompt-editor";
+
+/* ------------------------------------------------------------------ */
+/*  Chip data                                                          */
+/* ------------------------------------------------------------------ */
+
+export interface CapabilityChip {
+  id: string;
+  icon: string;
+  iconUrl?: string;
+  tag: string;          // text inserted as [tag]
+  group: "integration" | "skill" | "builtin";
+  requiresConnection?: boolean;
+  provider?: string;    // integration provider key for connection check
+}
+
+const INTEGRATION_CHIPS: CapabilityChip[] = [
+  { id: "google", icon: "🔗", iconUrl: SERVICE_ICONS["google"], tag: "Google", group: "integration", requiresConnection: true, provider: "google" },
+  { id: "reddit", icon: "🔴", iconUrl: SERVICE_ICONS["reddit"], tag: "Reddit", group: "integration", requiresConnection: true, provider: "reddit" },
+];
+
+const SKILL_CHIPS: CapabilityChip[] = [
+  { id: "daily-journal", icon: "📝", tag: "Daily Journal", group: "skill" },
+  { id: "weekly-review", icon: "📊", tag: "Weekly Review", group: "skill" },
+  { id: "pkm", icon: "🧠", tag: "PKM", group: "skill" },
+];
+
+const BUILTIN_CHIPS: CapabilityChip[] = [
+  { id: "web-search", icon: "🌐", tag: "Web Search", group: "builtin" },
+  { id: "weather", icon: "🌤️", tag: "Weather", group: "builtin" },
+  { id: "news", icon: "📰", tag: "News", group: "builtin" },
+  { id: "memory", icon: "💡", tag: "Memory", group: "builtin" },
+];
+
+const CHIP_GROUPS: { label: string; chips: CapabilityChip[] }[] = [
+  { label: "Integrations", chips: INTEGRATION_CHIPS },
+  { label: "Skills", chips: SKILL_CHIPS },
+  { label: "Built-in", chips: BUILTIN_CHIPS },
+];
+
+/* ------------------------------------------------------------------ */
+/*  Component                                                          */
+/* ------------------------------------------------------------------ */
+
+interface CapabilityChipsProps {
+  message: string;
+  editorRef: RefObject<PromptEditorHandle | null>;
+  onInsertTag: (tag: string) => void;
+  connectedProviders: Set<string>;
+}
+
+export function CapabilityChips({
+  message,
+  onInsertTag,
+  connectedProviders,
+}: CapabilityChipsProps) {
+  return (
+    <div className="space-y-2">
+      <p className="text-xs font-medium text-ink-muted">Add to prompt</p>
+
+      {CHIP_GROUPS.map((group) => (
+        <div key={group.label} className="space-y-1.5 sm:space-y-0 sm:flex sm:flex-wrap sm:items-center sm:gap-2">
+          <span className="text-xs text-ink-faint block sm:w-20 sm:shrink-0">{group.label}</span>
+          <div className="flex flex-wrap gap-2">
+            {group.chips.map((chip) => {
+              const isActive = message.includes(`[${chip.tag}]`);
+              const isDisconnected = chip.requiresConnection && !connectedProviders.has(chip.provider!);
+
+              return (
+                <button
+                  key={chip.id}
+                  type="button"
+                  disabled={isDisconnected}
+                  onClick={() => !isDisconnected && onInsertTag(chip.tag)}
+                  className={[
+                    "inline-flex items-center gap-1.5 rounded-full border px-3.5 py-2 text-sm transition min-h-[44px]",
+                    isDisconnected
+                      ? "border-border text-ink-faint opacity-65 cursor-not-allowed"
+                      : isActive
+                        ? "border-accent bg-accent/10 text-accent"
+                        : "border-border text-ink-muted hover:border-border-strong hover:text-ink",
+                  ].join(" ")}
+                  title={isDisconnected ? `Connect ${chip.tag} in Settings → Integrations` : chip.tag}
+                >
+                  {chip.iconUrl ? (
+                    // eslint-disable-next-line @next/next/no-img-element
+                    <img
+                      src={chip.iconUrl}
+                      alt=""
+                      className="h-4 w-4 rounded-sm object-contain"
+                      onError={(e) => { (e.target as HTMLImageElement).style.display = "none"; }}
+                    />
+                  ) : (
+                    <span className="text-sm leading-none">{chip.icon}</span>
+                  )}
+                  {chip.tag}
+                  {isDisconnected && (
+                    <a
+                      href="/settings/integrations"
+                      className="text-xs text-accent hover:underline"
+                      onClick={(e) => e.stopPropagation()}
+                    >
+                      connect
+                    </a>
+                  )}
+                </button>
+              );
+            })}
+          </div>
+        </div>
+      ))}
+    </div>
+  );
+}
